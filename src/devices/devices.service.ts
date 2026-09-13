@@ -8,8 +8,10 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { QueryFailedError, Repository } from 'typeorm';
 import { randomInt } from 'crypto';
 import { CreateDeviceDto } from './dto/create-device.dto';
+import { DeviceResponseDto } from './dto/device-response.dto';
 import { UpdateDeviceDto } from './dto/update-device.dto';
 import { Device } from './entities/device.entity';
+import { DevicePresenceService } from './presence/device-presence.service';
 
 /** Forma minima del error que devuelve el driver de PostgreSQL. */
 interface PostgresError {
@@ -29,9 +31,11 @@ export class DevicesService {
   constructor(
     @InjectRepository(Device)
     private readonly deviceRepository: Repository<Device>,
+
+    private readonly devicePresenceService: DevicePresenceService,
   ) {}
 
-  async create(createDeviceDto: CreateDeviceDto): Promise<Device> {
+  async create(createDeviceDto: CreateDeviceDto): Promise<DeviceResponseDto> {
     for (
       let attempt = 1;
       attempt <= DevicesService.PUBLIC_ID_MAX_ATTEMPTS;
@@ -43,7 +47,7 @@ export class DevicesService {
       });
 
       try {
-        return await this.deviceRepository.save(device);
+        return this.toResponse(await this.deviceRepository.save(device));
       } catch (error) {
         // La unicidad la garantiza Postgres; si chocamos, reintentamos con otro publicId.
         const isRetriableCollision =
@@ -59,11 +63,23 @@ export class DevicesService {
     );
   }
 
-  findAll(): Promise<Device[]> {
-    return this.deviceRepository.find({ order: { createdAt: 'DESC' } });
+  async findAll(): Promise<DeviceResponseDto[]> {
+    const devices = await this.deviceRepository.find({
+      order: { createdAt: 'DESC' },
+    });
+
+    return devices.map((device) => this.toResponse(device));
   }
 
-  async findOne(id: string): Promise<Device> {
+  async findOne(id: string): Promise<DeviceResponseDto> {
+    return this.toResponse(await this.findEntity(id));
+  }
+
+  /**
+   * Dispositivo como entidad, para el resto de servicios del modulo.
+   * La API administrativa usa `findOne`, que ademas resuelve la presencia.
+   */
+  async findEntity(id: string): Promise<Device> {
     const device = await this.deviceRepository.findOneBy({ id });
 
     if (!device) throw new NotFoundException(`Device with id ${id} not found`);
@@ -71,7 +87,10 @@ export class DevicesService {
     return device;
   }
 
-  async update(id: string, updateDeviceDto: UpdateDeviceDto): Promise<Device> {
+  async update(
+    id: string,
+    updateDeviceDto: UpdateDeviceDto,
+  ): Promise<DeviceResponseDto> {
     // preload solo aplica los campos presentes en el DTO.
     const device = await this.deviceRepository.preload({
       id,
@@ -80,6 +99,30 @@ export class DevicesService {
 
     if (!device) throw new NotFoundException(`Device with id ${id} not found`);
 
+    const updated = await this.save(device);
+
+    // Un socket ya abierto no vuelve a comprobar la autorizacion por si mismo:
+    // si el dispositivo queda deshabilitado hay que cerrar sus conexiones ahora
+    // y no esperar a que venza su Device JWT.
+    if (!updated.isActive) this.devicePresenceService.disconnectDevice(id);
+
+    return this.toResponse(updated);
+  }
+
+  /**
+   * Anade a la respuesta la presencia en tiempo real.
+   *
+   * `isOnline` se calcula en cada lectura desde `DevicePresenceService`: es
+   * estado de conexion, no una columna de la base de datos.
+   */
+  private toResponse(device: Device): DeviceResponseDto {
+    return DeviceResponseDto.fromEntity(
+      device,
+      this.devicePresenceService.isOnline(device.id),
+    );
+  }
+
+  private async save(device: Device): Promise<Device> {
     try {
       return await this.deviceRepository.save(device);
     } catch (error) {

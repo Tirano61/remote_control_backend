@@ -26,6 +26,15 @@ export interface DeviceLoginResponse extends DeviceIdentityResponse {
 }
 
 /**
+ * Resultado de autenticar un Device JWT: el dispositivo y la credencial
+ * concreta con la que se autentico.
+ */
+export interface AuthenticatedDevice {
+  device: Device;
+  credentialId: string;
+}
+
+/**
  * Autenticacion propia del dispositivo.
  *
  * Deliberadamente separada de `AuthService`: un dispositivo no es un `User`,
@@ -99,10 +108,45 @@ export class DeviceAuthService {
   /**
    * Comprobaciones que hace la estrategia con cada peticion del dispositivo.
    *
-   * Que el JWT sea criptograficamente valido no alcanza: el dispositivo puede
-   * haber sido desactivado o haberse re-enrolado despues de emitirse el token.
+   * Passport ya verifico la firma y el vencimiento del token, asi que aqui solo
+   * queda revalidar el estado actual.
    */
   async validateToken(payload: DeviceJwtPayload): Promise<Device> {
+    const { device } = await this.authorizePayload(payload);
+
+    return device;
+  }
+
+  /**
+   * Autentica un Device JWT recibido fuera de Passport, como el del handshake
+   * de Socket.IO.
+   *
+   * Es el mismo camino que usa la estrategia HTTP, con la verificacion de firma
+   * y vencimiento por delante: asi las reglas de autorizacion del dispositivo
+   * no se duplican entre transportes.
+   */
+  async authenticateToken(token: string): Promise<AuthenticatedDevice> {
+    let payload: DeviceJwtPayload;
+
+    try {
+      // Firmado con DEVICE_JWT_SECRET: un token de usuario/tecnico no verifica.
+      payload = await this.jwtService.verifyAsync<DeviceJwtPayload>(token);
+    } catch {
+      throw new UnauthorizedException('Token not valid');
+    }
+
+    return this.authorizePayload(payload);
+  }
+
+  /**
+   * Estado actual del dispositivo detras de un Device JWT ya verificado.
+   *
+   * Que el token sea criptograficamente valido no alcanza: el dispositivo puede
+   * haber sido desactivado o haberse re-enrolado despues de emitirse.
+   */
+  private async authorizePayload(
+    payload: DeviceJwtPayload,
+  ): Promise<AuthenticatedDevice> {
     const { sub, tokenType, credentialId } = payload;
 
     if (tokenType !== DEVICE_TOKEN_TYPE)
@@ -121,7 +165,7 @@ export class DeviceAuthService {
     if (!credential || credential.id !== credentialId)
       throw new UnauthorizedException('Token not valid');
 
-    return device;
+    return { device, credentialId: credential.id };
   }
 
   /** Informacion minima del dispositivo autenticado. */

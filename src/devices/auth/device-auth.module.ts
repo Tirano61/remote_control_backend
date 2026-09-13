@@ -36,7 +36,14 @@ import { DeviceJwtStrategy } from './strategies/device-jwt.strategy';
       }),
     }),
   ],
-  // DeviceCredentialsService lo necesita el enrolamiento para emitir la credencial.
-  exports: [DeviceCredentialsService, DeviceJwtStrategy, PassportModule],
+  // DeviceCredentialsService lo necesita el enrolamiento para emitir la
+  // credencial; DeviceAuthService, el gateway, para validar el Device JWT del
+  // handshake con las mismas reglas que en HTTP. El JwtService sigue sin salir.
+  exports: [
+    DeviceAuthService,
+    DeviceCredentialsService,
+    DeviceJwtStrategy,
+    PassportModule,
+  ],
 })
 export class DeviceAuthModule {}
