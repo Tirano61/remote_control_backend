@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { AuthModule } from './auth/auth.module';
 import { ConfigModule } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { DevicesModule } from './devices/devices.module';
 
 
 
@@ -21,6 +22,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 			extra: {}
 		}),
 		AuthModule,
+		DevicesModule,
 
 
 	],
