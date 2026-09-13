@@ -22,6 +22,15 @@ export enum SupportRequestStatus {
 
   /** El usuario cancelo la solicitud. Terminal. */
   CANCELLED = 'CANCELLED',
+
+  /**
+   * La asistencia autorizada llego a una sesion remota y esa sesion se cerro.
+   * Terminal.
+   *
+   * Ningun cliente puede pedir esta transicion: la escribe unicamente el cierre
+   * de una `RemoteSession`, en la misma transaccion que la cierra.
+   */
+  COMPLETED = 'COMPLETED',
 }
 
 /**
@@ -37,4 +46,8 @@ export const ACTIVE_SUPPORT_REQUEST_STATUSES: readonly SupportRequestStatus[] =
 
 /** Estados terminales: la solicitud ya no puede volver a cambiar. */
 export const TERMINAL_SUPPORT_REQUEST_STATUSES: readonly SupportRequestStatus[] =
-  [SupportRequestStatus.REJECTED, SupportRequestStatus.CANCELLED];
+  [
+    SupportRequestStatus.REJECTED,
+    SupportRequestStatus.CANCELLED,
+    SupportRequestStatus.COMPLETED,
+  ];

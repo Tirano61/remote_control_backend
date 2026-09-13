@@ -1,3 +1,4 @@
+import { User } from '../../auth/entities/user.entity';
 import { SupportRequest } from '../entities/support-request.entity';
 import { SupportRequestStatus } from '../enums/support-request-status.enum';
 
@@ -6,18 +7,27 @@ import { SupportRequestStatus } from '../enums/support-request-status.enum';
  *
  * Solo informacion publica razonable: identifica a la persona que atiende, sin
  * email (es su identificador de acceso), roles ni ningun dato de la cuenta.
+ *
+ * Es tambien la representacion que usan `RemoteSession` y los eventos de sesion
+ * remota: un unico criterio de que se publica de un tecnico, en un unico sitio.
  */
 export class SupportRequestTechnicianDto {
   id: string;
 
   name: string;
 
+  /** Relacion obligatoria, como la de `RemoteSession.technician`. */
+  static fromTechnician(technician: User): SupportRequestTechnicianDto {
+    return { id: technician.id, name: technician.fullName };
+  }
+
+  /** Relacion opcional: `null` mientras la solicitud no tenga tecnico. */
   static fromEntity(
     technician: SupportRequest['technician'],
   ): SupportRequestTechnicianDto | null {
     if (!technician) return null;
 
-    return { id: technician.id, name: technician.fullName };
+    return SupportRequestTechnicianDto.fromTechnician(technician);
   }
 }
 
