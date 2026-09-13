@@ -1,20 +1,28 @@
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { ValidationPipe } from '@nestjs/common';
+import {
+	resolveHttpCorsOrigins,
+	resolveSocketIoCorsOrigins,
+} from './config/cors.config';
+import { SocketIoAdapter } from './config/socket-io.adapter';
 
 async function bootstrap() {
 	const app = await NestFactory.create(AppModule);
+	// Sin CORS_ORIGINS se usan los mismos orígenes de desarrollo de siempre.
 	app.enableCors({
-		origin: [
-			'http://localhost:49371',   // puerto del servidor dev Flutter (ajusta)
-			'http://127.0.0.1:59074',
-			'http://localhost:8080',
-			'http://localhost:5678',   // otros orígenes que uses
-		],
+		origin: resolveHttpCorsOrigins(),
 		methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
 		allowedHeaders: 'Content-Type, Authorization, Accept, Origin, X-Requested-With',
 		credentials: true,
 	});
+
+	// Socket.IO tiene su propio CORS, que no se hereda del de HTTP y es del
+	// servidor entero, no de cada namespace. Lo necesita sobre todo la Flutter
+	// Web del técnico (/technicians); las tablets no son un navegador.
+	app.useWebSocketAdapter(
+		new SocketIoAdapter(app, resolveSocketIoCorsOrigins()),
+	);
 
 	app.useGlobalPipes(
 		new ValidationPipe({

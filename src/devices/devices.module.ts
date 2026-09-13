@@ -11,6 +11,7 @@ import { DeviceEnrollment } from './entities/device-enrollment.entity';
 import { Device } from './entities/device.entity';
 import { DevicePresenceModule } from './presence/device-presence.module';
 import { DeviceRealtimeModule } from './realtime/device-realtime.module';
+import { SignalingModule } from '../signaling/signaling.module';
 
 @Module({
   controllers: [DevicesController, DeviceEnrollmentController],
@@ -28,6 +29,10 @@ import { DeviceRealtimeModule } from './realtime/device-realtime.module';
     // Salida de eventos hacia las tablets: el gateway registra en ella su
     // namespace para que otros modulos puedan emitir sin depender de el.
     DeviceRealtimeModule,
+    // Signaling de WebRTC: el gateway es el extremo "dispositivo" y delega en
+    // `SignalingService` toda la validacion y el relay. La dependencia va solo
+    // en este sentido; `SignalingModule` no conoce `DevicesModule`.
+    SignalingModule,
   ],
   exports: [TypeOrmModule, DevicesService],
 })

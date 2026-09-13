@@ -2,18 +2,16 @@ import { PassportStrategy } from "@nestjs/passport";
 import { ExtractJwt, Strategy } from "passport-jwt";
 import { User } from "../entities/user.entity";
 import { JWTPayloadInterface } from "../interfaces/jwt-payload.interface";
-import { InjectRepository } from "@nestjs/typeorm";
-import { Repository } from "typeorm";
 import { ConfigService } from '@nestjs/config';
-import { Injectable, UnauthorizedException } from "@nestjs/common";
+import { Injectable } from "@nestjs/common";
+import { AuthService } from "../auth.service";
 
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy( Strategy ){
 
     constructor(
-        @InjectRepository( User )
-        private readonly userRepository: Repository<User>,
+        private readonly authService: AuthService,
 
         configService: ConfigService
     ){
@@ -28,17 +26,11 @@ export class JwtStrategy extends PassportStrategy( Strategy ){
     }
 
     /// Esta funcion se va a llamar si la el token no ha expirado, y la firma es correcta
-    async validate( payload: JWTPayloadInterface ): Promise<User> {
-        
-        const { id } = payload;
-        const user = await this.userRepository.findOneBy({ id });
+    /// Las comprobaciones viven en AuthService para que HTTP y Socket.IO usen
+    /// exactamente las mismas: usuario existente y activo.
+    validate( payload: JWTPayloadInterface ): Promise<User> {
 
-        if( !user )
-            throw new UnauthorizedException('Token not valid');
-        if(!user.isActive )
-            throw new UnauthorizedException('User is inactive, talk with an admin ');
+        return this.authService.validateJwtPayload( payload );
 
-        return user;
-        
     }
 }
