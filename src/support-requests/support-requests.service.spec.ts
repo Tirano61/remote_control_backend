@@ -583,6 +583,54 @@ describe('SupportRequestsService', () => {
     });
   });
 
+  describe('estado COMPLETED', () => {
+    /**
+     * `COMPLETED` lo escribe unicamente el cierre de una `RemoteSession`, en su
+     * propia transaccion: ningun metodo de este servicio lo produce y no hay
+     * endpoint que lo permita. Aqui solo se comprueba que, una vez escrito, se
+     * comporta como estado terminal.
+     */
+    const seedCompleted = async (): Promise<string> => {
+      const id = await seedRequest(deviceA, SupportRequestStatus.ACCEPTED);
+
+      repository.rows[0].status = SupportRequestStatus.COMPLETED;
+
+      return id;
+    };
+
+    it('no deja cancelar una solicitud ya completada', async () => {
+      const id = await seedCompleted();
+
+      await expect(service.cancelByDevice(id, deviceA)).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+
+      expect(statusOf(id)).toBe(SupportRequestStatus.COMPLETED);
+    });
+
+    it('no deja reasignar una solicitud ya completada', async () => {
+      const id = await seedCompleted();
+
+      await expect(service.assign(id, technicianB)).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+
+      expect(repository.rows[0].technicianId).toBe(technicianA.id);
+    });
+
+    it('deja de contar como activa y el dispositivo puede abrir otra', async () => {
+      await seedCompleted();
+
+      await expect(service.findCurrentForDevice(deviceA.id)).resolves.toEqual({
+        supportRequest: null,
+      });
+
+      await expect(service.createForDevice(deviceA)).resolves.toMatchObject({
+        status: SupportRequestStatus.WAITING,
+      });
+    });
+  });
+
   describe('consultas del tecnico', () => {
     it('lista filtrando por estado y de la mas antigua a la mas nueva', async () => {
       const first = await seedRequest(deviceA);

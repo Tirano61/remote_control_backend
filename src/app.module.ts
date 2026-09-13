@@ -3,6 +3,7 @@ import { AuthModule } from './auth/auth.module';
 import { ConfigModule } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { DevicesModule } from './devices/devices.module';
+import { RemoteSessionsModule } from './remote-sessions/remote-sessions.module';
 import { SupportRequestsModule } from './support-requests/support-requests.module';
 
 
@@ -25,6 +26,7 @@ import { SupportRequestsModule } from './support-requests/support-requests.modul
 		AuthModule,
 		DevicesModule,
 		SupportRequestsModule,
+		RemoteSessionsModule,
 
 
 	],
