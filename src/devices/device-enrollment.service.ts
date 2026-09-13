@@ -11,6 +11,7 @@ import { DevicesService } from './devices.service';
 import { Device } from './entities/device.entity';
 import { DeviceEnrollment } from './entities/device-enrollment.entity';
 import { DeviceCredentialsService } from './auth/device-credentials.service';
+import { DevicePresenceService } from './presence/device-presence.service';
 
 /** Respuesta del endpoint administrativo: el codigo viaja una unica vez. */
 export interface EnrollmentCodeResponse {
@@ -63,6 +64,7 @@ export class DeviceEnrollmentService {
     private readonly dataSource: DataSource,
     private readonly devicesService: DevicesService,
     private readonly deviceCredentialsService: DeviceCredentialsService,
+    private readonly devicePresenceService: DevicePresenceService,
   ) {}
 
   /**
@@ -75,7 +77,7 @@ export class DeviceEnrollmentService {
   async createEnrollmentCode(
     deviceId: string,
   ): Promise<EnrollmentCodeResponse> {
-    const device = await this.devicesService.findOne(deviceId);
+    const device = await this.devicesService.findEntity(deviceId);
 
     if (!device.isActive)
       throw new BadRequestException(
@@ -133,6 +135,11 @@ export class DeviceEnrollmentService {
     );
 
     if (!activation) throw new UnauthorizedException('Invalid activation');
+
+    // La transaccion ya esta confirmada: la credencial anterior quedo revocada,
+    // asi que los sockets autenticados con ella dejan de estar autorizados y se
+    // cierran. La tablet volvera a conectarse con su credencial nueva.
+    this.devicePresenceService.disconnectDevice(activation.deviceId);
 
     return activation;
   }

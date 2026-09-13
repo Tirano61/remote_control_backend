@@ -33,6 +33,7 @@ export class DevicesController {
     return this.devicesService.create(createDeviceDto);
   }
 
+  /** Incluye `isOnline`, la presencia en tiempo real de cada dispositivo. */
   @Get()
   findAll() {
     return this.devicesService.findAll();
@@ -43,6 +44,7 @@ export class DevicesController {
     return this.devicesService.findOne(id);
   }
 
+  /** Al dejar el dispositivo inactivo se cierran sus conexiones abiertas. */
   @Patch(':id')
   update(
     @Param('id', ParseUUIDPipe) id: string,
