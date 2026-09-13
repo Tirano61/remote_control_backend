@@ -25,6 +25,8 @@ import { JwtStrategy } from './strategies/jwt.strategy';
     }),
   ],
   // Exportado para que otros modulos puedan usar @Auth() en sus rutas.
-  exports: [TypeOrmModule, JwtStrategy, PassportModule, JwtModule],
+  // AuthService sale ademas para reutilizar la validacion del JWT de usuario
+  // fuera de HTTP (autenticacion del socket del tecnico).
+  exports: [TypeOrmModule, AuthService, JwtStrategy, PassportModule, JwtModule],
 })
 export class AuthModule {}

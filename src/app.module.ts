@@ -4,6 +4,7 @@ import { ConfigModule } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { DevicesModule } from './devices/devices.module';
 import { RemoteSessionsModule } from './remote-sessions/remote-sessions.module';
+import { SignalingModule } from './signaling/signaling.module';
 import { SupportRequestsModule } from './support-requests/support-requests.module';
 
 
@@ -27,6 +28,7 @@ import { SupportRequestsModule } from './support-requests/support-requests.modul
 		DevicesModule,
 		SupportRequestsModule,
 		RemoteSessionsModule,
+		SignalingModule,
 
 
 	],

@@ -13,6 +13,9 @@ import {
   DeviceJwtPayload,
 } from '../auth/interfaces/device-jwt-payload.interface';
 import { DevicesService } from '../devices.service';
+import { RemoteSession } from '../../remote-sessions/entities/remote-session.entity';
+import { SignalingRealtimeService } from '../../signaling/realtime/signaling-realtime.service';
+import { SignalingService } from '../../signaling/signaling.service';
 import { DeviceCredential } from '../entities/device-credential.entity';
 import { Device } from '../entities/device.entity';
 import { DevicePresenceService } from '../presence/device-presence.service';
@@ -156,6 +159,15 @@ describe('DevicesGateway (Socket.IO)', () => {
         DeviceAuthService,
         DeviceCredentialsService,
         DevicesService,
+        // El gateway es ademas el extremo "dispositivo" del signaling. Estas
+        // pruebas no lo ejercitan (para eso esta `signaling.spec.ts`), pero sus
+        // dependencias tienen que poder resolverse.
+        SignalingService,
+        SignalingRealtimeService,
+        {
+          provide: getRepositoryToken(RemoteSession),
+          useValue: { findOne: () => Promise.resolve(null) },
+        },
         { provide: getRepositoryToken(Device), useValue: deviceRepository },
         {
           provide: getRepositoryToken(DeviceCredential),

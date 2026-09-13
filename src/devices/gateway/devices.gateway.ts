@@ -1,11 +1,34 @@
 import { Logger } from '@nestjs/common';
 import {
+  ConnectedSocket,
+  MessageBody,
   OnGatewayConnection,
   OnGatewayDisconnect,
   OnGatewayInit,
+  SubscribeMessage,
   WebSocketGateway,
 } from '@nestjs/websockets';
 import type { DefaultEventsMap, Namespace, Socket } from 'socket.io';
+import {
+  JoinRemoteSessionAck,
+  joinRejected,
+  relayRejected,
+  SignalingErrorCode,
+  SignalingRelayAck,
+} from '../../signaling/interfaces/signaling-ack.interface';
+import {
+  SignalingIdentity,
+  SignalingParticipant,
+  SignalingSocketData,
+} from '../../signaling/interfaces/signaling-participant.interface';
+import { SignalingRealtimeService } from '../../signaling/realtime/signaling-realtime.service';
+import {
+  REMOTE_SESSION_JOIN_EVENT,
+  WEBRTC_ANSWER_EVENT,
+  WEBRTC_ICE_CANDIDATE_EVENT,
+  WEBRTC_OFFER_EVENT,
+} from '../../signaling/signaling.events';
+import { SignalingService } from '../../signaling/signaling.service';
 import { DeviceAuthService } from '../auth/device-auth.service';
 import { DevicePresenceService } from '../presence/device-presence.service';
 import {
@@ -34,7 +57,7 @@ export interface DeviceSocketContext {
   publicId: string;
 }
 
-interface DeviceSocketData {
+interface DeviceSocketData extends SignalingSocketData {
   device?: DeviceSocketContext;
 }
 
@@ -57,8 +80,12 @@ type DeviceNamespace = Namespace<
  *
  * Mantiene la presencia (quien esta conectado y como cerrarle la conexion) y
  * registra el namespace en `DeviceRealtimeService`, que es por donde el resto
- * de modulos hace llegar eventos a una tablet. Las sesiones remotas y el
- * signaling llegaran en pasos posteriores.
+ * de modulos hace llegar eventos a una tablet.
+ *
+ * Es ademas el extremo "dispositivo" del signaling de WebRTC: los eventos
+ * `remote-session:join` y `webrtc:*` se delegan integros en `SignalingService`,
+ * que es quien valida la sesion y retransmite. Aqui no se interpreta ninguna
+ * SDP ni ningun candidato ICE.
  */
 @WebSocketGateway({ namespace: DEVICES_NAMESPACE })
 export class DevicesGateway
@@ -73,6 +100,8 @@ export class DevicesGateway
     private readonly deviceAuthService: DeviceAuthService,
     private readonly devicePresenceService: DevicePresenceService,
     private readonly deviceRealtimeService: DeviceRealtimeService,
+    private readonly signalingService: SignalingService,
+    private readonly signalingRealtimeService: SignalingRealtimeService,
   ) {}
 
   /**
@@ -85,6 +114,10 @@ export class DevicesGateway
     // A partir de aqui otros modulos pueden emitir eventos a un dispositivo sin
     // conocer este gateway ni Socket.IO.
     this.deviceRealtimeService.bind(namespace);
+
+    // Mismo mecanismo para el signaling: registra este namespace para que el
+    // relay pueda alcanzar la room de la sesion en el lado del dispositivo.
+    this.signalingRealtimeService.bindDeviceNamespace(namespace);
 
     namespace.use((socket, next) => {
       void this.authenticate(socket).then(
@@ -138,6 +171,77 @@ export class DevicesGateway
     this.logger.log(
       `Device disconnected: ${context.publicId}${isOffline ? ' (OFFLINE)' : ''}`,
     );
+  }
+
+  /**
+   * La tablet entra en la sesion remota que ya autorizo.
+   *
+   * Es obligatorio antes de enviar cualquier `webrtc:*`. La sesion tiene que ser
+   * suya: se compara contra el `deviceId` del token, no contra nada del payload.
+   */
+  @SubscribeMessage(REMOTE_SESSION_JOIN_EVENT)
+  handleJoinRemoteSession(
+    @ConnectedSocket() client: DeviceSocket,
+    @MessageBody() payload: unknown,
+  ): Promise<JoinRemoteSessionAck> {
+    const identity = this.identityOf(client);
+
+    if (!identity)
+      return Promise.resolve(joinRejected(SignalingErrorCode.UNAUTHORIZED));
+
+    return this.signalingService.join(client, identity, payload);
+  }
+
+  @SubscribeMessage(WEBRTC_OFFER_EVENT)
+  handleOffer(
+    @ConnectedSocket() client: DeviceSocket,
+    @MessageBody() payload: unknown,
+  ): Promise<SignalingRelayAck> {
+    const identity = this.identityOf(client);
+
+    if (!identity)
+      return Promise.resolve(relayRejected(SignalingErrorCode.UNAUTHORIZED));
+
+    return this.signalingService.relayOffer(client, identity, payload);
+  }
+
+  @SubscribeMessage(WEBRTC_ANSWER_EVENT)
+  handleAnswer(
+    @ConnectedSocket() client: DeviceSocket,
+    @MessageBody() payload: unknown,
+  ): Promise<SignalingRelayAck> {
+    const identity = this.identityOf(client);
+
+    if (!identity)
+      return Promise.resolve(relayRejected(SignalingErrorCode.UNAUTHORIZED));
+
+    return this.signalingService.relayAnswer(client, identity, payload);
+  }
+
+  @SubscribeMessage(WEBRTC_ICE_CANDIDATE_EVENT)
+  handleIceCandidate(
+    @ConnectedSocket() client: DeviceSocket,
+    @MessageBody() payload: unknown,
+  ): Promise<SignalingRelayAck> {
+    const identity = this.identityOf(client);
+
+    if (!identity)
+      return Promise.resolve(relayRejected(SignalingErrorCode.UNAUTHORIZED));
+
+    return this.signalingService.relayIceCandidate(client, identity, payload);
+  }
+
+  /**
+   * Identidad con la que el signaling autoriza: la del Device JWT validado.
+   *
+   * Nunca se construye con datos del payload del evento.
+   */
+  private identityOf(client: DeviceSocket): SignalingIdentity | null {
+    const context = client.data.device;
+
+    if (!context) return null;
+
+    return { participant: SignalingParticipant.DEVICE, id: context.deviceId };
   }
 
   /**

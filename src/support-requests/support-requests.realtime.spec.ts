@@ -23,6 +23,9 @@ import {
   DEVICES_NAMESPACE,
   DevicesGateway,
 } from '../devices/gateway/devices.gateway';
+import { RemoteSession } from '../remote-sessions/entities/remote-session.entity';
+import { SignalingRealtimeService } from '../signaling/realtime/signaling-realtime.service';
+import { SignalingService } from '../signaling/signaling.service';
 import { SupportRequest } from './entities/support-request.entity';
 import { SupportRequestStatus } from './enums/support-request-status.enum';
 import {
@@ -220,6 +223,13 @@ describe('support:assigned (Socket.IO)', () => {
         DeviceAuthService,
         DeviceCredentialsService,
         SupportRequestsService,
+        // Dependencias de signaling del gateway: no se ejercitan aqui.
+        SignalingService,
+        SignalingRealtimeService,
+        {
+          provide: getRepositoryToken(RemoteSession),
+          useValue: { findOne: () => Promise.resolve(null) },
+        },
         { provide: getRepositoryToken(Device), useValue: deviceRepository },
         {
           provide: getRepositoryToken(DeviceCredential),

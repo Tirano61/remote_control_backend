@@ -73,6 +73,47 @@ export class AuthService {
     };
   }
 
+  /**
+   * Comprobaciones que hay detrás de un JWT de usuario ya verificado.
+   *
+   * Es la única fuente de verdad de "este token identifica a un usuario válido":
+   * la usan tanto la estrategia de Passport (HTTP) como la autenticación del
+   * socket del técnico, así que las reglas no se duplican entre transportes.
+   */
+  async validateJwtPayload( payload: JWTPayloadInterface ): Promise<User> {
+
+    const { id } = payload;
+    const user = await this.userRepository.findOneBy({ id });
+
+    if( !user )
+      throw new UnauthorizedException('Token not valid');
+
+    if( !user.isActive )
+      throw new UnauthorizedException('User is inactive, talk with an admin ');
+
+    return user;
+  }
+
+  /**
+   * Autentica un JWT de usuario recibido fuera de Passport, como el del
+   * handshake de Socket.IO.
+   *
+   * Verifica firma y vencimiento y después revalida el estado actual del
+   * usuario: el mismo camino que sigue la estrategia HTTP.
+   */
+  async authenticateToken( token: string ): Promise<User> {
+
+    let payload: JWTPayloadInterface;
+
+    try {
+      payload = await this.jwtService.verifyAsync<JWTPayloadInterface>( token );
+    } catch {
+      throw new UnauthorizedException('Token not valid');
+    }
+
+    return this.validateJwtPayload( payload );
+  }
+
   private getJwtToken(payload: JWTPayloadInterface){
     const token = this.jwtService.sign( payload );
     return token;
