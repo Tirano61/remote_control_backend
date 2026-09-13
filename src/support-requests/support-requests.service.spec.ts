@@ -2,12 +2,19 @@ import { ConflictException, NotFoundException } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { randomUUID } from 'crypto';
-import { FindOperator, QueryFailedError, Repository } from 'typeorm';
+import {
+  DataSource,
+  FindOperator,
+  QueryFailedError,
+  Repository,
+} from 'typeorm';
 import { User } from '../auth/entities/user.entity';
 import { ValidRoles } from '../auth/interfaces/valid-roles';
 import { Device } from '../devices/entities/device.entity';
 import { DevicePresenceService } from '../devices/presence/device-presence.service';
 import { DeviceRealtimeService } from '../devices/realtime/device-realtime.service';
+import { RemoteSession } from '../remote-sessions/entities/remote-session.entity';
+import { RemoteSessionStatus } from '../remote-sessions/enums/remote-session-status.enum';
 import {
   ACTIVE_SUPPORT_REQUEST_INDEX,
   SupportRequest,
@@ -32,8 +39,12 @@ import {
  * - el UPDATE condicionado al estado actual, que devuelve cuantas filas
  *   cambiaron y es lo que decide las carreras entre dos tecnicos.
  *
- * Lo que NO se prueba aqui es que PostgreSQL cree realmente ese indice ni que
- * resuelva la concurrencia real entre conexiones: eso necesita el motor.
+ * La cancelacion, ademas, corre dentro de una transaccion que bloquea la fila
+ * de la solicitud. El doble de `DataSource` ejecuta la funcion sin transaccion,
+ * sin lock y sin rollback, asi que aqui solo se cubre la REGLA (una solicitud
+ * con sesion viva no se cancela). La carrera real `cancel` contra
+ * `createRemoteSession` se cubre en `remote-sessions.service.spec.ts`, y el
+ * `SELECT ... FOR UPDATE` entre conexiones distintas necesita PostgreSQL.
  */
 
 const DEVICE_A_ID = '550e8400-e29b-41d4-a716-446655440000';
@@ -212,12 +223,42 @@ class FakeSupportRequestRepository {
   }
 }
 
+/**
+ * Sesiones remotas vistas desde este dominio.
+ *
+ * `SupportRequestsService` no crea ninguna: solo pregunta si la solicitud ya
+ * tiene una viva. Aqui se fabrican a mano; el encaje con el servicio real de
+ * sesiones se prueba en `remote-sessions.service.spec.ts`.
+ */
+class FakeRemoteSessionStore {
+  readonly rows: Pick<RemoteSession, 'supportRequestId' | 'status'>[] = [];
+
+  exists(options: {
+    where: {
+      supportRequestId: string;
+      status: FindOperator<RemoteSessionStatus>;
+    };
+  }): Promise<boolean> {
+    const { supportRequestId, status } = options.where;
+    const alive = status.value as unknown as RemoteSessionStatus[];
+
+    return Promise.resolve(
+      this.rows.some(
+        (row) =>
+          row.supportRequestId === supportRequestId &&
+          alive.includes(row.status),
+      ),
+    );
+  }
+}
+
 const devices: Record<string, Device> = {};
 const technicians: Record<string, User> = {};
 
 describe('SupportRequestsService', () => {
   let service: SupportRequestsService;
   let repository: FakeSupportRequestRepository;
+  let remoteSessions: FakeRemoteSessionStore;
   let emitToDevice: jest.Mock;
   let online: Set<string>;
 
@@ -263,8 +304,28 @@ describe('SupportRequestsService', () => {
     technicians[technicianB.id] = technicianB;
 
     repository = new FakeSupportRequestRepository();
+    remoteSessions = new FakeRemoteSessionStore();
     emitToDevice = jest.fn().mockReturnValue(true);
     online = new Set<string>([deviceA.id, deviceB.id]);
+
+    // `EntityManager` con lo justo que usa el servicio. `findOne` ignora el
+    // `lock`: sin conexiones reales no hay nada que bloquear.
+    const manager = {
+      createQueryBuilder: () => repository.createQueryBuilder(),
+      findOne: (entity: unknown, options: { where: Record<string, string> }) =>
+        entity === SupportRequest
+          ? repository.findOne(options)
+          : Promise.resolve(null),
+      exists: (
+        _entity: unknown,
+        options: {
+          where: {
+            supportRequestId: string;
+            status: FindOperator<RemoteSessionStatus>;
+          };
+        },
+      ) => remoteSessions.exists(options),
+    };
 
     const moduleRef = await Test.createTestingModule({
       providers: [
@@ -272,6 +333,14 @@ describe('SupportRequestsService', () => {
         {
           provide: getRepositoryToken(SupportRequest),
           useValue: repository as unknown as Repository<SupportRequest>,
+        },
+        {
+          provide: DataSource,
+          useValue: {
+            manager,
+            transaction: (runInTransaction: (m: unknown) => Promise<unknown>) =>
+              runInTransaction(manager),
+          },
         },
         {
           provide: DevicePresenceService,
@@ -580,6 +649,61 @@ describe('SupportRequestsService', () => {
       await expect(service.cancelByDevice(id, deviceA)).rejects.toBeInstanceOf(
         ConflictException,
       );
+    });
+
+    it('cancela una solicitud ACCEPTED que todavia no tiene sesion remota', async () => {
+      const id = await seedRequest(deviceA, SupportRequestStatus.ACCEPTED);
+
+      const cancelled = await service.cancelByDevice(id, deviceA);
+
+      // Mientras no exista sesion, el usuario puede retirar su autorizacion.
+      expect(cancelled.status).toBe(SupportRequestStatus.CANCELLED);
+      expect(cancelled.closedAt).toBeInstanceOf(Date);
+    });
+
+    it.each([RemoteSessionStatus.CONNECTING, RemoteSessionStatus.ACTIVE])(
+      'responde 409 y no cancela si ya hay una sesion remota en %s',
+      async (status) => {
+        const id = await seedRequest(deviceA, SupportRequestStatus.ACCEPTED);
+
+        // `ACTIVE` no lo produce todavia ningun endpoint: se prepara a mano.
+        remoteSessions.rows.push({ supportRequestId: id, status });
+
+        await expect(
+          service.cancelByDevice(id, deviceA),
+        ).rejects.toBeInstanceOf(ConflictException);
+
+        // La asistencia ya empezo: se termina cerrando la sesion, no aqui.
+        expect(statusOf(id)).toBe(SupportRequestStatus.ACCEPTED);
+        expect(repository.rows[0].closedAt).toBeNull();
+      },
+    );
+
+    it('cancela igualmente si la sesion de esa solicitud ya esta cerrada', async () => {
+      const id = await seedRequest(deviceA, SupportRequestStatus.ACCEPTED);
+
+      remoteSessions.rows.push({
+        supportRequestId: id,
+        status: RemoteSessionStatus.CLOSED,
+      });
+
+      // Una sesion cerrada no bloquea nada; solo las vivas.
+      await expect(service.cancelByDevice(id, deviceA)).resolves.toMatchObject({
+        status: SupportRequestStatus.CANCELLED,
+      });
+    });
+
+    it('no consulta las sesiones de otra solicitud', async () => {
+      const id = await seedRequest(deviceA, SupportRequestStatus.ACCEPTED);
+
+      remoteSessions.rows.push({
+        supportRequestId: randomUUID(),
+        status: RemoteSessionStatus.CONNECTING,
+      });
+
+      await expect(service.cancelByDevice(id, deviceA)).resolves.toMatchObject({
+        status: SupportRequestStatus.CANCELLED,
+      });
     });
   });
 

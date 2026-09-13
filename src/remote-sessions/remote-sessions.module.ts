@@ -18,7 +18,9 @@ import { RemoteSessionsService } from './remote-sessions.service';
  *
  * Registra `SupportRequest` en su propio `forFeature` en lugar de importar
  * `SupportRequestsModule`: solo necesita leer y completar la solicitud, no su
- * servicio, y asi los dos dominios no quedan acoplados.
+ * servicio, y asi los dos dominios no quedan acoplados. El registro aporta la
+ * metadata de la entidad; las consultas las hace el `EntityManager` de la
+ * transaccion, que es lo unico que sostiene el lock de la fila.
  */
 @Module({
   controllers: [DeviceRemoteSessionsController, RemoteSessionsController],
