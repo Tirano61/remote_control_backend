@@ -10,6 +10,7 @@ import { ActivateDeviceDto } from './dto/activate-device.dto';
 import { DevicesService } from './devices.service';
 import { Device } from './entities/device.entity';
 import { DeviceEnrollment } from './entities/device-enrollment.entity';
+import { DeviceCredentialsService } from './auth/device-credentials.service';
 
 /** Respuesta del endpoint administrativo: el codigo viaja una unica vez. */
 export interface EnrollmentCodeResponse {
@@ -19,12 +20,18 @@ export interface EnrollmentCodeResponse {
   expiresAt: Date;
 }
 
-/** Respuesta de la tablet al activarse. Todavia no incluye credenciales. */
+/**
+ * Respuesta de la tablet al activarse.
+ *
+ * `deviceSecret` viaja aqui y solo aqui: es la unica vez que el backend puede
+ * entregarlo. Si se pierde, hay que volver a enrolar el dispositivo.
+ */
 export interface DeviceActivationResponse {
   activated: true;
   deviceId: string;
   publicId: string;
   name: string | null;
+  deviceSecret: string;
 }
 
 /** Campos tecnicos que la tablet puede refrescar al activarse. */
@@ -46,12 +53,16 @@ export class DeviceEnrollmentService {
    * Hash de descarte. Se compara contra el cuando no hay enrolamiento
    * pendiente, para que el tiempo de respuesta no delate si el `publicId`
    * existe o si el dispositivo esta activo.
+   *
+   * Se calcula una sola vez, la primera vez que hace falta: con bcrypt
+   * asincrono ya no puede resolverse al cargar la clase.
    */
-  private static readonly DECOY_HASH = bcrypt.hashSync('000000', 10);
+  private decoyHash: Promise<string> | null = null;
 
   constructor(
     private readonly dataSource: DataSource,
     private readonly devicesService: DevicesService,
+    private readonly deviceCredentialsService: DeviceCredentialsService,
   ) {}
 
   /**
@@ -77,12 +88,18 @@ export class DeviceEnrollmentService {
       now.getTime() + DeviceEnrollmentService.CODE_TTL_MINUTES * 60_000,
     );
 
+    // Fuera de la transaccion: bcrypt tarda y no hay que retener la conexion.
+    const codeHash = await bcrypt.hash(
+      code,
+      DeviceEnrollmentService.BCRYPT_ROUNDS,
+    );
+
     await this.dataSource.transaction(async (manager) => {
       await this.revokePendingEnrollments(manager, device.id, now);
 
       const enrollment = manager.create(DeviceEnrollment, {
         deviceId: device.id,
-        codeHash: bcrypt.hashSync(code, DeviceEnrollmentService.BCRYPT_ROUNDS),
+        codeHash,
         expiresAt,
         usedAt: null,
         revokedAt: null,
@@ -131,20 +148,25 @@ export class DeviceEnrollmentService {
 
     // El publicId es un identificador, no una credencial: conocerlo no alcanza.
     if (!device || !device.isActive) {
-      this.burnVerificationTime(code);
+      await this.burnVerificationTime(code);
       return null;
     }
 
     const pending = await this.findPendingEnrollments(manager, device.id, now);
 
     if (pending.length === 0) {
-      this.burnVerificationTime(code);
+      await this.burnVerificationTime(code);
       return null;
     }
 
-    const enrollment = pending.find((candidate) =>
-      bcrypt.compareSync(code, candidate.codeHash),
-    );
+    let enrollment: DeviceEnrollment | undefined;
+
+    for (const candidate of pending) {
+      if (await bcrypt.compare(code, candidate.codeHash)) {
+        enrollment = candidate;
+        break;
+      }
+    }
 
     if (!enrollment) {
       await this.registerFailedAttempts(manager, pending, now);
@@ -168,11 +190,21 @@ export class DeviceEnrollmentService {
     if (Object.keys(technicalInfo).length > 0)
       await manager.update(Device, { id: device.id }, technicalInfo);
 
+    // Misma transaccion que consume el codigo: la credencial anterior queda
+    // revocada y la nueva emitida, o no ocurre ninguna de las dos cosas.
+    const { deviceSecret } =
+      await this.deviceCredentialsService.issueCredential(
+        manager,
+        device.id,
+        now,
+      );
+
     return {
       activated: true,
       deviceId: device.id,
       publicId: device.publicId,
       name: device.name,
+      deviceSecret,
     };
   }
 
@@ -262,7 +294,12 @@ export class DeviceEnrollmentService {
   }
 
   /** Iguala el costo de la respuesta cuando no hay nada que verificar. */
-  private burnVerificationTime(code: string): void {
-    bcrypt.compareSync(code, DeviceEnrollmentService.DECOY_HASH);
+  private async burnVerificationTime(code: string): Promise<void> {
+    this.decoyHash ??= bcrypt.hash(
+      '000000',
+      DeviceEnrollmentService.BCRYPT_ROUNDS,
+    );
+
+    await bcrypt.compare(code, await this.decoyHash);
   }
 }
