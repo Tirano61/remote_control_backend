@@ -71,9 +71,10 @@ export class RemoteSessionsService {
     @InjectRepository(RemoteSession)
     private readonly remoteSessionRepository: Repository<RemoteSession>,
 
-    @InjectRepository(SupportRequest)
-    private readonly supportRequestRepository: Repository<SupportRequest>,
-
+    // `SupportRequest` ya no se inyecta: todas sus lecturas y escrituras van
+    // por el `EntityManager` de la transaccion, que es lo unico que sostiene el
+    // lock. Un repositorio inyectado consultaria por otra conexion, fuera de
+    // ella.
     private readonly dataSource: DataSource,
 
     private readonly devicePresenceService: DevicePresenceService,
@@ -99,52 +100,59 @@ export class RemoteSessionsService {
   ): Promise<RemoteSessionResponseDto> {
     const { supportRequestId } = createRemoteSessionDto;
 
-    // La pertenencia va en el WHERE y no en un `if` posterior: la solicitud de
-    // otro tecnico se comporta como inexistente y no se confirma que exista.
-    const supportRequest = await this.supportRequestRepository.findOne({
-      where: { id: supportRequestId, technicianId: user.id },
-      relations: { device: true },
+    // Todo va en una transaccion que bloquea la fila de la solicitud: es el
+    // punto de serializacion con `SupportRequestsService.cancelByDevice`, que
+    // bloquea esa misma fila. Sin el lock, un SELECT previo podria ver
+    // `ACCEPTED` y crear la sesion justo mientras la tablet cancela, dejando
+    // una solicitud CANCELLED con una sesion CONNECTING.
+    const created = await this.dataSource.transaction(async (manager) => {
+      const supportRequest = await this.lockOwnedByTechnicianOrFail(
+        manager,
+        supportRequestId,
+        user.id,
+      );
+
+      // Solo una solicitud aceptada autoriza el control remoto: el usuario de
+      // la tablet tuvo que autorizar expresamente a ese tecnico. Si la
+      // cancelacion gano el lock, aqui ya se lee `CANCELLED`.
+      if (supportRequest.status !== SupportRequestStatus.ACCEPTED)
+        throw new ConflictException(
+          `Support request with id ${supportRequestId} was not accepted by the device`,
+        );
+
+      // Una tablet desconectada no puede establecer nada. La solicitud NO se
+      // toca: sigue ACCEPTED para que el tecnico reintente al reconectarse.
+      if (!this.devicePresenceService.isOnline(supportRequest.deviceId))
+        throw new ConflictException(
+          `Device with id ${supportRequest.deviceId} is offline`,
+        );
+
+      const remoteSession = this.remoteSessionRepository.create({
+        supportRequestId: supportRequest.id,
+        deviceId: supportRequest.deviceId,
+        technicianId: user.id,
+        status: RemoteSessionStatus.CONNECTING,
+        connectedAt: null,
+        endedAt: null,
+        endedBy: null,
+      });
+
+      const session = await this.save(manager, remoteSession);
+
+      // El tecnico es el usuario autenticado; el dispositivo se lee aparte
+      // porque la consulta bloqueante no puede arrastrar relaciones.
+      session.device = await manager.findOneByOrFail(Device, {
+        id: supportRequest.deviceId,
+      });
+      session.technician = user;
+
+      return session;
     });
 
-    if (!supportRequest)
-      throw new NotFoundException(
-        `Support request with id ${supportRequestId} not found`,
-      );
-
-    // Solo una solicitud aceptada autoriza el control remoto: el usuario de la
-    // tablet tuvo que autorizar expresamente a ese tecnico.
-    if (supportRequest.status !== SupportRequestStatus.ACCEPTED)
-      throw new ConflictException(
-        `Support request with id ${supportRequestId} was not accepted by the device`,
-      );
-
-    // Una tablet desconectada no puede establecer nada. La solicitud NO se
-    // toca: sigue ACCEPTED para que el tecnico reintente al reconectarse.
-    if (!this.devicePresenceService.isOnline(supportRequest.deviceId))
-      throw new ConflictException(
-        `Device with id ${supportRequest.deviceId} is offline`,
-      );
-
-    const remoteSession = this.remoteSessionRepository.create({
-      supportRequestId: supportRequest.id,
-      deviceId: supportRequest.deviceId,
-      technicianId: user.id,
-      status: RemoteSessionStatus.CONNECTING,
-      connectedAt: null,
-      endedAt: null,
-      endedBy: null,
-    });
-
-    const created = await this.save(remoteSession);
-
-    // Las relaciones ya estan resueltas: el dispositivo viene de la solicitud y
-    // el tecnico es el usuario autenticado. No hace falta releer nada.
-    created.device = supportRequest.device;
-    created.technician = user;
-
-    // Primero persistir, despues avisar. Si el evento no llega porque la tablet
-    // se desconecto justo despues de comprobar la presencia, la sesion sigue
-    // siendo valida: la recupera con GET /device/remote-sessions/current.
+    // Primero confirmar la transaccion, despues avisar: no se anuncia una
+    // sesion que todavia pudiera no existir. Si el evento no llega porque la
+    // tablet se desconecto justo despues de comprobar la presencia, la sesion
+    // sigue siendo valida: la recupera con GET /device/remote-sessions/current.
     this.notifyCreated(created);
 
     return this.toResponse(created);
@@ -232,8 +240,9 @@ export class RemoteSessionsService {
   /**
    * Cierra la sesion y completa su solicitud en una unica transaccion.
    *
-   * No puede quedar una sesion `CLOSED` con su solicitud todavia `ACCEPTED`:
-   * los dos UPDATE se confirman juntos o no se confirma ninguno.
+   * Los dos UPDATE se confirman juntos o no se confirma ninguno: no puede
+   * quedar una sesion `CLOSED` con su solicitud todavia `ACCEPTED`, ni una
+   * sesion cerrada cuya solicitud no haya podido pasar a `COMPLETED`.
    *
    * El cierre va condicionado al estado actual, asi que si el tecnico y el
    * dispositivo cierran a la vez solo uno hace la transicion; el segundo
@@ -265,13 +274,15 @@ export class RemoteSessionsService {
         endedAt,
       );
 
-      // La solicitud podria haber llegado a un estado terminal por otra via
-      // (una cancelacion del usuario mientras la sesion estaba CONNECTING).
-      // No se aborta el cierre por eso: la sesion tiene que poder terminar
-      // igualmente y la solicitud ya no esta activa.
+      // Una sesion viva implica una solicitud `ACCEPTED`: mientras exista la
+      // sesion, `cancelByDevice` no puede cerrarla. Que el UPDATE no afecte a
+      // exactamente una fila significa que el estado ya es inconsistente, asi
+      // que se aborta y se deshace tambien el cierre de la sesion. Antes solo
+      // se dejaba un `warn` y la sesion quedaba CLOSED sobre una solicitud que
+      // nunca llegaba a COMPLETED.
       if (!completed)
-        this.logger.warn(
-          `Support request ${remoteSession.supportRequestId} was not ACCEPTED when its remote session closed`,
+        throw new ConflictException(
+          `Support request with id ${remoteSession.supportRequestId} is not in a state that can complete the remote session`,
         );
     });
 
@@ -369,14 +380,49 @@ export class RemoteSessionsService {
   }
 
   /**
+   * Bloquea la fila de la solicitud del tecnico autenticado.
+   *
+   * Es el `SELECT ... FOR UPDATE` que serializa la creacion con la cancelacion
+   * desde la tablet, que bloquea esa misma fila. La pertenencia viaja en el
+   * WHERE y no en un `if` posterior: la solicitud de otro tecnico se comporta
+   * como inexistente y ni siquiera se bloquea.
+   *
+   * No se piden relaciones a proposito: TypeORM las resolveria con LEFT JOIN y
+   * PostgreSQL no admite `FOR UPDATE` sobre el lado nullable de un outer join.
+   */
+  private async lockOwnedByTechnicianOrFail(
+    manager: EntityManager,
+    id: string,
+    technicianId: string,
+  ): Promise<SupportRequest> {
+    const supportRequest = await manager.findOne(SupportRequest, {
+      where: { id, technicianId },
+      lock: { mode: 'pessimistic_write' },
+    });
+
+    if (!supportRequest)
+      throw new NotFoundException(`Support request with id ${id} not found`);
+
+    return supportRequest;
+  }
+
+  /**
    * Guarda la sesion traduciendo las restricciones de PostgreSQL.
    *
-   * Las dos unicidades las comprueba el motor y no un SELECT previo: dos
-   * peticiones simultaneas del mismo tecnico lo pasarian las dos.
+   * Las dos unicidades las comprueba el motor y no un SELECT previo: siguen
+   * siendo la segunda linea de defensa aunque ahora la solicitud este
+   * bloqueada, porque el lock ordena a los que compiten por esa fila y no a
+   * cualquier otro camino que pudiera abrir una sesion sobre el dispositivo.
+   *
+   * Va por el `EntityManager` de la transaccion: si la unicidad falla, el
+   * `ConflictException` la aborta y no queda nada a medias.
    */
-  private async save(remoteSession: RemoteSession): Promise<RemoteSession> {
+  private async save(
+    manager: EntityManager,
+    remoteSession: RemoteSession,
+  ): Promise<RemoteSession> {
     try {
-      return await this.remoteSessionRepository.save(remoteSession);
+      return await manager.save(RemoteSession, remoteSession);
     } catch (error) {
       const constraint = this.uniqueViolationConstraint(error);
 

@@ -7,11 +7,19 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, QueryFailedError, Repository } from 'typeorm';
+import {
+  DataSource,
+  EntityManager,
+  In,
+  QueryFailedError,
+  Repository,
+} from 'typeorm';
 import { User } from '../auth/entities/user.entity';
 import { Device } from '../devices/entities/device.entity';
 import { DevicePresenceService } from '../devices/presence/device-presence.service';
 import { DeviceRealtimeService } from '../devices/realtime/device-realtime.service';
+import { RemoteSession } from '../remote-sessions/entities/remote-session.entity';
+import { ACTIVE_REMOTE_SESSION_STATUSES } from '../remote-sessions/enums/remote-session-status.enum';
 import { QuerySupportRequestsDto } from './dto/query-support-requests.dto';
 import {
   CurrentSupportRequestResponseDto,
@@ -56,6 +64,8 @@ export class SupportRequestsService {
   constructor(
     @InjectRepository(SupportRequest)
     private readonly supportRequestRepository: Repository<SupportRequest>,
+
+    private readonly dataSource: DataSource,
 
     private readonly devicePresenceService: DevicePresenceService,
 
@@ -160,20 +170,67 @@ export class SupportRequestsService {
     );
   }
 
-  /** Cancelacion por el usuario desde cualquier estado activo. Terminal. */
-  cancelByDevice(
+  /**
+   * El usuario retira su autorizacion. Terminal.
+   *
+   * Cancelable desde `WAITING`, `ASSIGNED` y `ACCEPTED`, pero solo mientras la
+   * asistencia remota no haya empezado: una vez que existe una `RemoteSession`
+   * viva la solicitud deja de poder cancelarse y el usuario tiene que cortar
+   * por `POST /device/remote-sessions/:id/close`, que cierra sesion y solicitud
+   * a la vez. De lo contrario podria quedar una solicitud `CANCELLED` con una
+   * sesion `CONNECTING`, que es justo el estado que no debe existir.
+   *
+   * Toda la operacion va en una transaccion que bloquea la fila de la solicitud
+   * (`FOR UPDATE`): la creacion de la sesion bloquea esa misma fila, asi que
+   * cancelar y abrir sesion no pueden decidir a la vez sobre el mismo estado.
+   */
+  async cancelByDevice(
     id: string,
     device: Device,
   ): Promise<SupportRequestResponseDto> {
-    return this.runDeviceTransition(
-      id,
-      device,
-      ACTIVE_SUPPORT_REQUEST_STATUSES,
-      {
-        status: SupportRequestStatus.CANCELLED,
-        closedAt: new Date(),
-      },
-    );
+    await this.dataSource.transaction(async (manager) => {
+      const supportRequest = await this.lockOwnedByDeviceOrFail(
+        manager,
+        id,
+        device.id,
+      );
+
+      if (!ACTIVE_SUPPORT_REQUEST_STATUSES.includes(supportRequest.status))
+        throw new ConflictException(
+          `Support request with id ${id} cannot change from ${supportRequest.status} to ${SupportRequestStatus.CANCELLED}`,
+        );
+
+      // Solo `ACCEPTED` puede tener sesion: antes de aceptar no se crea
+      // ninguna, asi que en los demas estados la consulta sobraria.
+      if (
+        supportRequest.status === SupportRequestStatus.ACCEPTED &&
+        (await this.hasLiveRemoteSession(manager, id))
+      )
+        // Sin detalles internos: al usuario solo le interesa que la asistencia
+        // ya empezo y por donde tiene que terminarla.
+        throw new ConflictException(
+          `Remote assistance for support request with id ${id} already started, close the remote session instead`,
+        );
+
+      const cancelled = await this.applyTransition(
+        manager,
+        id,
+        ACTIVE_SUPPORT_REQUEST_STATUSES,
+        {
+          status: SupportRequestStatus.CANCELLED,
+          closedAt: new Date(),
+        },
+      );
+
+      // Con la fila bloqueada nadie ha podido moverla desde la comprobacion de
+      // arriba; queda como red de seguridad del UPDATE condicional.
+      if (!cancelled)
+        throw new ConflictException(
+          `Support request with id ${id} cannot change from ${supportRequest.status} to ${SupportRequestStatus.CANCELLED}`,
+        );
+    });
+
+    return SupportRequestResponseDto.forDevice(await this.findByIdOrFail(id));
   }
 
   // ---------------------------------------------------------------------------
@@ -225,6 +282,7 @@ export class SupportRequestsService {
       );
 
     const assigned = await this.applyTransition(
+      this.dataSource.manager,
       id,
       [SupportRequestStatus.WAITING],
       {
@@ -264,7 +322,12 @@ export class SupportRequestsService {
   ): Promise<SupportRequestResponseDto> {
     const supportRequest = await this.findOwnedByDeviceOrFail(id, device.id);
 
-    const applied = await this.applyTransition(id, from, changes);
+    const applied = await this.applyTransition(
+      this.dataSource.manager,
+      id,
+      from,
+      changes,
+    );
 
     if (!applied)
       throw new ConflictException(
@@ -275,18 +338,73 @@ export class SupportRequestsService {
   }
 
   /**
+   * Bloquea la fila de la solicitud del dispositivo autenticado.
+   *
+   * Es el `SELECT ... FOR UPDATE` que serializa esta transaccion con la
+   * creacion de la sesion remota, que bloquea la misma fila. La pertenencia
+   * viaja en el WHERE, igual que en `findOwnedByDeviceOrFail`: una solicitud
+   * ajena responde `404` y ni siquiera se bloquea.
+   *
+   * No se piden relaciones a proposito: TypeORM las resolveria con LEFT JOIN y
+   * PostgreSQL no admite `FOR UPDATE` sobre el lado nullable de un outer join.
+   */
+  private async lockOwnedByDeviceOrFail(
+    manager: EntityManager,
+    id: string,
+    deviceId: string,
+  ): Promise<SupportRequest> {
+    const supportRequest = await manager.findOne(SupportRequest, {
+      where: { id, deviceId },
+      lock: { mode: 'pessimistic_write' },
+    });
+
+    if (!supportRequest)
+      throw new NotFoundException(`Support request with id ${id} not found`);
+
+    return supportRequest;
+  }
+
+  /**
+   * Hay una sesion remota viva nacida de esta solicitud.
+   *
+   * DECISION: se consulta `RemoteSession` con el `EntityManager` de la
+   * transaccion en lugar de inyectar su repositorio o el `RemoteSessionsService`.
+   * Un repositorio inyectado ejecutaria la consulta en otra conexion, fuera de
+   * la transaccion que sostiene el lock, que es justo lo que hay que evitar; y
+   * depender del otro servicio acoplaria los dos dominios. `SupportRequestsModule`
+   * no importa `RemoteSessionsModule`: solo se usa la entidad, que ya esta
+   * registrada en el `DataSource`.
+   */
+  private hasLiveRemoteSession(
+    manager: EntityManager,
+    supportRequestId: string,
+  ): Promise<boolean> {
+    return manager.exists(RemoteSession, {
+      where: {
+        supportRequestId,
+        status: In([...ACTIVE_REMOTE_SESSION_STATUSES]),
+      },
+    });
+  }
+
+  /**
    * Cambio de estado condicionado al estado actual, en un unico UPDATE.
    *
-   * Es lo que evita las carreras: comprobacion y escritura ocurren en la misma
-   * sentencia, asi que dos peticiones simultaneas no pueden aplicar ambas la
-   * transicion. Devuelve `false` cuando otra llego antes.
+   * Comprobacion y escritura ocurren en la misma sentencia, asi que dos
+   * peticiones simultaneas no pueden aplicar ambas la transicion. Devuelve
+   * `false` cuando otra llego antes.
+   *
+   * Recibe el `EntityManager` para poder ejecutarse dentro de la transaccion de
+   * la cancelacion; el resto de transiciones pasan el manager del `DataSource`,
+   * que es el comportamiento de siempre.
    */
   private async applyTransition(
+    manager: EntityManager,
     id: string,
     from: readonly SupportRequestStatus[],
     changes: SupportRequestTransition,
   ): Promise<boolean> {
-    const result = await this.supportRequestRepository
+    const result = await manager
       .createQueryBuilder()
       .update(SupportRequest)
       .set(changes)

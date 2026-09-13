@@ -6,7 +6,7 @@ import { randomUUID } from 'crypto';
 import { Server } from 'http';
 import { AddressInfo } from 'net';
 import { io, Socket as ClientSocket } from 'socket.io-client';
-import { Repository } from 'typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { User } from '../auth/entities/user.entity';
 import { ValidRoles } from '../auth/interfaces/valid-roles';
 import { DeviceAuthService } from '../devices/auth/device-auth.service';
@@ -153,6 +153,16 @@ describe('support:assigned (Socket.IO)', () => {
     },
   };
 
+  /**
+   * `EntityManager` con lo justo que usa `assign`: el UPDATE condicional.
+   *
+   * El servicio lo pide al `DataSource` en lugar de al repositorio para poder
+   * ejecutar la cancelacion dentro de su transaccion; aqui no hay ninguna.
+   */
+  const entityManager = {
+    createQueryBuilder: () => supportRequestRepository.createQueryBuilder(),
+  };
+
   const signDeviceToken = (deviceId: string, credentialId: string): string =>
     deviceJwt.sign({
       sub: deviceId,
@@ -220,6 +230,7 @@ describe('support:assigned (Socket.IO)', () => {
           useValue:
             supportRequestRepository as unknown as Repository<SupportRequest>,
         },
+        { provide: DataSource, useValue: { manager: entityManager } },
       ],
     }).compile();
 

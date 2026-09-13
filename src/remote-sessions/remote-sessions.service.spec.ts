@@ -54,9 +54,14 @@ import {
  * - el UPDATE condicionado al estado actual, que devuelve cuantas filas cambio
  *   y es lo que decide los cierres simultaneos.
  *
- * Lo que NO se prueba aqui es que PostgreSQL cree realmente esos indices, ni el
- * aislamiento real de la transaccion de cierre: el doble de `DataSource`
- * ejecuta la funcion sin transaccion y sin rollback. Eso necesita el motor.
+ * - el lock de fila (`SELECT ... FOR UPDATE`) que serializa abrir una sesion
+ *   contra cancelar la solicitud, mediante una cola por id;
+ * - el rollback de la transaccion, mediante un registro de deshacer.
+ *
+ * Lo que NO se prueba aqui es que PostgreSQL cree realmente esos indices ni su
+ * semantica real de `FOR UPDATE` entre conexiones distintas: la cola reproduce
+ * la INTENCION (quien llega segundo lee lo que dejo el primero), no el
+ * aislamiento del motor. Eso hay que validarlo despues contra PostgreSQL.
  */
 
 const DEVICE_A_ID = '550e8400-e29b-41d4-a716-446655440000';
@@ -97,6 +102,46 @@ const technicians: Record<string, User> = {};
 type WhereValue = string | FindOperator<string>;
 type Row = SupportRequest | RemoteSession;
 
+/** Deshace un cambio hecho dentro de una transaccion que acabo fallando. */
+type UndoStep = () => void;
+
+/** Estado vivo de una transaccion del doble de `DataSource`. */
+interface TransactionScope {
+  undo: UndoStep[];
+  releases: (() => void)[];
+}
+
+/**
+ * Locks de fila por id, en lugar de `SELECT ... FOR UPDATE`.
+ *
+ * Las transacciones se encolan en el orden en que piden la fila y la siguiente
+ * no continua hasta que la anterior termina. Es lo que permite escribir la
+ * carrera `cancel` contra `create` sin PostgreSQL.
+ */
+class RowLocks {
+  private readonly tails = new Map<string, Promise<void>>();
+
+  /** Espera el turno de la fila y devuelve la funcion que la libera. */
+  async acquire(id: string): Promise<() => void> {
+    const previous = this.tails.get(id) ?? Promise.resolve();
+
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+
+    // La cola se encadena antes de esperar: el orden lo fija quien pide antes.
+    this.tails.set(
+      id,
+      previous.then(() => held),
+    );
+
+    await previous;
+
+    return release;
+  }
+}
+
 const uniqueViolation = (constraint: string): QueryFailedError =>
   new QueryFailedError('INSERT', [], {
     code: UNIQUE_VIOLATION,
@@ -118,7 +163,10 @@ const matches = (row: Row, where: Record<string, WhereValue>): boolean =>
  * transiciones. La condicion se evalua al ejecutar, no al construir: es lo que
  * hace que dos transiciones simultaneas no puedan aplicarse las dos.
  */
-const createUpdateBuilder = (resolveRows: (entity: unknown) => Row[]) => {
+const createUpdateBuilder = (
+  resolveRows: (entity: unknown) => Row[],
+  undo?: UndoStep[],
+) => {
   let rows: Row[] = [];
   let changes: Record<string, unknown> = {};
   const params: Record<string, unknown> = {};
@@ -148,6 +196,10 @@ const createUpdateBuilder = (resolveRows: (entity: unknown) => Row[]) => {
       );
 
       if (!row) return Promise.resolve({ affected: 0 });
+
+      const previous = { ...row };
+
+      undo?.push(() => Object.assign(row, previous));
 
       Object.assign(row, changes);
 
@@ -270,6 +322,13 @@ class FakeRemoteSessionRepository {
 
     return Promise.resolve(hydrated);
   }
+
+  /** Lo usa la cancelacion para saber si la solicitud ya tiene sesion viva. */
+  exists(options: { where: Record<string, WhereValue> }): Promise<boolean> {
+    return Promise.resolve(
+      this.rows.some((candidate) => matches(candidate, options.where)),
+    );
+  }
 }
 
 describe('RemoteSessionsService', () => {
@@ -339,14 +398,83 @@ describe('RemoteSessionsService', () => {
     emitToDevice = jest.fn().mockReturnValue(true);
     online = new Set<string>([deviceA.id, deviceB.id]);
 
-    // Doble de la transaccion: ejecuta la funcion con un manager que escribe en
-    // los mismos arrays. No hay aislamiento ni rollback, asi que las pruebas de
-    // concurrencia se apoyan en el UPDATE condicional, que es lo que decide.
-    const manager = {
+    const rowLocks = new RowLocks();
+
+    /**
+     * `EntityManager` con lo justo que usan los dos servicios.
+     *
+     * Sin `scope` es el manager suelto del `DataSource` (transiciones que no
+     * abren transaccion); con `scope` es el de una transaccion: pide los locks
+     * y anota como deshacer cada escritura.
+     */
+    const buildManager = (scope?: TransactionScope) => ({
       createQueryBuilder: () =>
-        createUpdateBuilder((entity) =>
-          entity === RemoteSession ? remoteSessions.rows : supportRequests.rows,
+        createUpdateBuilder(
+          (entity) =>
+            entity === RemoteSession
+              ? remoteSessions.rows
+              : supportRequests.rows,
+          scope?.undo,
         ),
+
+      findOne: async (
+        entity: unknown,
+        options: {
+          where: Record<string, WhereValue>;
+          relations?: Record<string, boolean>;
+          lock?: { mode: string };
+        },
+      ) => {
+        // La fila se lee DESPUES de obtener el lock, igual que hace PostgreSQL
+        // al reevaluar la fila bloqueada: quien espera ve lo que dejo el otro.
+        if (options.lock)
+          scope?.releases.push(
+            await rowLocks.acquire(options.where.id as string),
+          );
+
+        return entity === RemoteSession
+          ? remoteSessions.findOne(options)
+          : supportRequests.findOne(options);
+      },
+
+      findOneByOrFail: (_entity: unknown, where: { id: string }) =>
+        Promise.resolve(devices[where.id]),
+
+      save: async (_entity: unknown, remoteSession: RemoteSession) => {
+        const saved = await remoteSessions.save(remoteSession);
+
+        scope?.undo.push(() => {
+          const index = remoteSessions.rows.findIndex(
+            (row) => row.id === saved.id,
+          );
+
+          if (index >= 0) remoteSessions.rows.splice(index, 1);
+        });
+
+        return saved;
+      },
+
+      exists: (
+        _entity: unknown,
+        options: { where: Record<string, WhereValue> },
+      ) => remoteSessions.exists(options),
+    });
+
+    /** Commit o rollback, y siempre la liberacion de los locks al terminar. */
+    const transaction = async (
+      runInTransaction: (manager: unknown) => Promise<unknown>,
+    ) => {
+      const scope: TransactionScope = { undo: [], releases: [] };
+
+      try {
+        return await runInTransaction(buildManager(scope));
+      } catch (error) {
+        scope.undo.reverse().forEach((step) => step());
+
+        throw error;
+      } finally {
+        scope.releases.forEach((release) => release());
+      }
     };
 
     const moduleRef = await Test.createTestingModule({
@@ -363,10 +491,7 @@ describe('RemoteSessionsService', () => {
         },
         {
           provide: DataSource,
-          useValue: {
-            transaction: (runInTransaction: (m: unknown) => Promise<unknown>) =>
-              runInTransaction(manager),
-          },
+          useValue: { manager: buildManager(), transaction },
         },
         {
           provide: DevicePresenceService,
@@ -519,9 +644,10 @@ describe('RemoteSessionsService', () => {
     it('no abre una segunda sesion viva para el mismo dispositivo', async () => {
       const { remoteSessionId, supportRequestId } = await seedSession();
 
-      // La tablet retira la solicitud mientras la sesion sigue CONNECTING y
-      // abre otra: la solicitud vieja deja de bloquear, pero la sesion no.
-      await supportRequestsService.cancelByDevice(supportRequestId, deviceA);
+      // Con la sesion viva, la API ya no deja cancelar. Se fuerza el estado a
+      // mano solo para liberar el indice de solicitud activa y comprobar que el
+      // de sesion viva por dispositivo sigue siendo la segunda linea de defensa.
+      requestRow(supportRequestId).status = SupportRequestStatus.CANCELLED;
 
       const second = await seedAcceptedRequest(deviceA);
 
@@ -817,6 +943,164 @@ describe('RemoteSessionsService', () => {
       expect(row.endedAt).toEqual(winner.endedAt);
       expect(requestRow(supportRequestId).status).toBe(
         SupportRequestStatus.COMPLETED,
+      );
+    });
+  });
+
+  describe('cancelar la solicitud con la asistencia ya iniciada', () => {
+    it('cancela mientras no exista sesion remota', async () => {
+      const supportRequestId = await seedAcceptedRequest(deviceA);
+
+      await expect(
+        supportRequestsService.cancelByDevice(supportRequestId, deviceA),
+      ).resolves.toMatchObject({ status: SupportRequestStatus.CANCELLED });
+
+      expect(remoteSessions.rows).toHaveLength(0);
+    });
+
+    it('responde 409 con la sesion en CONNECTING y no toca nada', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+
+      await expect(
+        supportRequestsService.cancelByDevice(supportRequestId, deviceA),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      // La asistencia ya empezo: se termina cerrando la sesion.
+      expect(requestRow(supportRequestId)).toMatchObject({
+        status: SupportRequestStatus.ACCEPTED,
+        closedAt: null,
+      });
+      expect(sessionRow(remoteSessionId).status).toBe(
+        RemoteSessionStatus.CONNECTING,
+      );
+    });
+
+    it('responde 409 tambien con la sesion en ACTIVE', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+
+      // Todavia no hay endpoint que produzca ACTIVE: llega con el signaling.
+      sessionRow(remoteSessionId).status = RemoteSessionStatus.ACTIVE;
+
+      await expect(
+        supportRequestsService.cancelByDevice(supportRequestId, deviceA),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(requestRow(supportRequestId).status).toBe(
+        SupportRequestStatus.ACCEPTED,
+      );
+      expect(sessionRow(remoteSessionId).status).toBe(
+        RemoteSessionStatus.ACTIVE,
+      );
+    });
+
+    it('cerrar la sesion es la salida del usuario', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+
+      await service.closeByDevice(remoteSessionId, deviceA);
+
+      expect(requestRow(supportRequestId).status).toBe(
+        SupportRequestStatus.COMPLETED,
+      );
+    });
+  });
+
+  describe('carrera entre cancelar y abrir la sesion', () => {
+    /** La invariante del prompt: nunca CANCELLED con una sesion viva. */
+    const expectConsistent = (supportRequestId: string): void => {
+      const cancelled =
+        requestRow(supportRequestId).status === SupportRequestStatus.CANCELLED;
+
+      const live = remoteSessions.rows.some(
+        (row) =>
+          row.supportRequestId === supportRequestId &&
+          ACTIVE_REMOTE_SESSION_STATUSES.includes(row.status),
+      );
+
+      expect(cancelled && live).toBe(false);
+    };
+
+    it('gana la cancelacion: solicitud CANCELLED y ninguna sesion', async () => {
+      const supportRequestId = await seedAcceptedRequest(deviceA);
+
+      // Quien pide antes la fila obtiene antes el lock; el otro espera y lee
+      // despues el estado que dejo el primero.
+      const cancel = supportRequestsService.cancelByDevice(
+        supportRequestId,
+        deviceA,
+      );
+      const create = service.create({ supportRequestId }, technicianA);
+
+      await expect(cancel).resolves.toMatchObject({
+        status: SupportRequestStatus.CANCELLED,
+      });
+      await expect(create).rejects.toBeInstanceOf(ConflictException);
+
+      expect(remoteSessions.rows).toHaveLength(0);
+      expect(emitToDevice).not.toHaveBeenCalled();
+      expectConsistent(supportRequestId);
+    });
+
+    it('gana la creacion: sesion CONNECTING y la cancelacion responde 409', async () => {
+      const supportRequestId = await seedAcceptedRequest(deviceA);
+
+      const create = service.create({ supportRequestId }, technicianA);
+      const cancel = supportRequestsService.cancelByDevice(
+        supportRequestId,
+        deviceA,
+      );
+
+      await expect(create).resolves.toMatchObject({
+        status: RemoteSessionStatus.CONNECTING,
+      });
+      await expect(cancel).rejects.toBeInstanceOf(ConflictException);
+
+      expect(requestRow(supportRequestId)).toMatchObject({
+        status: SupportRequestStatus.ACCEPTED,
+        closedAt: null,
+      });
+      expect(remoteSessions.rows).toHaveLength(1);
+      expect(remoteSessions.rows[0].status).toBe(
+        RemoteSessionStatus.CONNECTING,
+      );
+      expectConsistent(supportRequestId);
+    });
+  });
+
+  describe('cierre sobre un estado inconsistente', () => {
+    it('aborta el cierre si la solicitud no puede pasar a COMPLETED', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+
+      // Estado que las APIs ya no pueden producir: se fabrica a mano para
+      // comprobar que el cierre no lo da por bueno.
+      requestRow(supportRequestId).status = SupportRequestStatus.CANCELLED;
+
+      await expect(
+        service.closeByTechnician(remoteSessionId, technicianA),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      // Rollback completo: la sesion no queda CLOSED a medias.
+      expect(sessionRow(remoteSessionId)).toMatchObject({
+        status: RemoteSessionStatus.CONNECTING,
+        endedAt: null,
+        endedBy: null,
+      });
+      expect(requestRow(supportRequestId).status).toBe(
+        SupportRequestStatus.CANCELLED,
+      );
+      expect(emitToDevice).not.toHaveBeenCalled();
+    });
+
+    it('tampoco deja cerrar al dispositivo', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+
+      requestRow(supportRequestId).status = SupportRequestStatus.CANCELLED;
+
+      await expect(
+        service.closeByDevice(remoteSessionId, deviceA),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(sessionRow(remoteSessionId).status).toBe(
+        RemoteSessionStatus.CONNECTING,
       );
     });
   });
