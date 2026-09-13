@@ -10,6 +10,7 @@ import { DevicesService } from './devices.service';
 import { DeviceEnrollment } from './entities/device-enrollment.entity';
 import { Device } from './entities/device.entity';
 import { DevicePresenceModule } from './presence/device-presence.module';
+import { DeviceRealtimeModule } from './realtime/device-realtime.module';
 
 @Module({
   controllers: [DevicesController, DeviceEnrollmentController],
@@ -24,6 +25,9 @@ import { DevicePresenceModule } from './presence/device-presence.module';
     // Presencia en tiempo real: la alimenta el gateway y la consultan tanto la
     // API administrativa como los flujos que retiran una autorizacion.
     DevicePresenceModule,
+    // Salida de eventos hacia las tablets: el gateway registra en ella su
+    // namespace para que otros modulos puedan emitir sin depender de el.
+    DeviceRealtimeModule,
   ],
   exports: [TypeOrmModule, DevicesService],
 })

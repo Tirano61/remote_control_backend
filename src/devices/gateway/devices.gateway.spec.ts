@@ -17,10 +17,13 @@ import { DeviceCredential } from '../entities/device-credential.entity';
 import { Device } from '../entities/device.entity';
 import { DevicePresenceService } from '../presence/device-presence.service';
 import {
+  DeviceRealtimeService,
+  deviceRoom,
+} from '../realtime/device-realtime.service';
+import {
   DEVICE_CONNECTED_EVENT,
   DEVICES_NAMESPACE,
   DevicesGateway,
-  deviceRoom,
 } from './devices.gateway';
 
 /**
@@ -149,6 +152,7 @@ describe('DevicesGateway (Socket.IO)', () => {
       providers: [
         DevicesGateway,
         DevicePresenceService,
+        DeviceRealtimeService,
         DeviceAuthService,
         DeviceCredentialsService,
         DevicesService,

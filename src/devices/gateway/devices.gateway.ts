@@ -8,12 +8,13 @@ import {
 import type { DefaultEventsMap, Namespace, Socket } from 'socket.io';
 import { DeviceAuthService } from '../auth/device-auth.service';
 import { DevicePresenceService } from '../presence/device-presence.service';
+import {
+  DeviceRealtimeService,
+  deviceRoom,
+} from '../realtime/device-realtime.service';
 
 /** Namespace exclusivo de tablets. Los tecnicos tendran el suyo aparte. */
 export const DEVICES_NAMESPACE = '/devices';
-
-/** Room privada del dispositivo. La asigna el servidor, nunca el cliente. */
-export const deviceRoom = (deviceId: string): string => `device:${deviceId}`;
 
 /** Confirmacion que recibe la tablet tras autenticarse. */
 export const DEVICE_CONNECTED_EVENT = 'device:connected';
@@ -54,9 +55,10 @@ type DeviceNamespace = Namespace<
 /**
  * Conexion persistente de los dispositivos Android.
  *
- * Solo mantiene la presencia: quien esta conectado y como cerrarle la conexion.
- * Las solicitudes de asistencia, las sesiones remotas y el signaling llegaran
- * en pasos posteriores.
+ * Mantiene la presencia (quien esta conectado y como cerrarle la conexion) y
+ * registra el namespace en `DeviceRealtimeService`, que es por donde el resto
+ * de modulos hace llegar eventos a una tablet. Las sesiones remotas y el
+ * signaling llegaran en pasos posteriores.
  */
 @WebSocketGateway({ namespace: DEVICES_NAMESPACE })
 export class DevicesGateway
@@ -70,6 +72,7 @@ export class DevicesGateway
   constructor(
     private readonly deviceAuthService: DeviceAuthService,
     private readonly devicePresenceService: DevicePresenceService,
+    private readonly deviceRealtimeService: DeviceRealtimeService,
   ) {}
 
   /**
@@ -79,6 +82,10 @@ export class DevicesGateway
    * existir para el gateway.
    */
   afterInit(namespace: DeviceNamespace): void {
+    // A partir de aqui otros modulos pueden emitir eventos a un dispositivo sin
+    // conocer este gateway ni Socket.IO.
+    this.deviceRealtimeService.bind(namespace);
+
     namespace.use((socket, next) => {
       void this.authenticate(socket).then(
         () => next(),
