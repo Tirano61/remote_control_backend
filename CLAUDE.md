@@ -719,6 +719,95 @@ The current repository state is authoritative.
 
 ---
 
+# Client contract documentation
+
+The backend contract consumed by the Flutter clients is documented in:
+
+```text
+docs/ENDPOINTS.md
+docs/REALTIME.md
+```
+
+Both files begin with the same statement:
+
+```text
+These files document the current public contract of remote_control_backend.
+
+If implementation and documentation ever disagree, the implementation must be
+reviewed and the documentation updated in the same backend change.
+```
+
+## Flutter clients
+
+These two applications consume those files as their contract:
+
+```text
+remote_control_device
+remote_control_web
+```
+
+They are developed in separate repositories and cannot read this backend's code.
+The documentation is what they build against.
+
+Therefore:
+
+* do not write ambiguous documentation;
+* do not document future behaviour as if it already existed;
+* document what the code actually does, not what the roadmap intends;
+* prefer stable HTTP status codes and error codes over exact exception strings,
+  so a client never has to match on a human-readable message.
+
+## REST contract rule
+
+Any future prompt that:
+
+* adds an endpoint;
+* removes an endpoint;
+* changes a route;
+* changes an HTTP method;
+* changes a request DTO;
+* changes a response;
+* changes authentication;
+* changes roles;
+* changes relevant functional errors;
+
+must review and update:
+
+```text
+docs/ENDPOINTS.md
+```
+
+in the same change.
+
+## Realtime contract rule
+
+Any future prompt that:
+
+* adds or removes a namespace;
+* adds or removes an event;
+* changes a payload;
+* changes an ACK;
+* changes an error code;
+* changes Socket.IO authentication;
+* changes join rules;
+* changes signaling;
+
+must review and update:
+
+```text
+docs/REALTIME.md
+```
+
+in the same change.
+
+## No deferred documentation
+
+Documentation updates are part of the change that causes them.
+
+Do not leave them for a later prompt.
+
+---
+
 # Verification
 
 After development changes:
@@ -733,6 +822,8 @@ Fix errors introduced by the changes.
 Do not claim a command succeeded unless it was actually executed successfully.
 
 If an existing unrelated problem prevents verification, report it clearly rather than modifying unrelated parts of the project.
+
+If the change touched any public REST route or realtime event, also verify that `docs/ENDPOINTS.md` and `docs/REALTIME.md` still match the code.
 
 ---
 

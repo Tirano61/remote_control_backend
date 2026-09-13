@@ -1,38 +1,35 @@
 import { Module } from '@nestjs/common';
-import { AuthModule } from './auth/auth.module';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { AuthModule } from './auth/auth.module';
+import { buildTypeOrmOptions } from './config/database.config';
 import { DevicesModule } from './devices/devices.module';
 import { RemoteSessionsModule } from './remote-sessions/remote-sessions.module';
 import { SignalingModule } from './signaling/signaling.module';
 import { SupportRequestsModule } from './support-requests/support-requests.module';
 
-
-
-
 @Module({
-	imports: [
-		ConfigModule.forRoot(),
-		TypeOrmModule.forRoot({
-			type: 'postgres',
-			host: process.env.DB_HOST,
-			port: +(process.env.DB_PORT ?? 5455),
-			database: process.env.POSTGRES_DB_NAME,
-			username: process.env.POSTGRES_USER,
-			password: process.env.POSTGRES_PASSWORD,
-			autoLoadEntities: true,
-			synchronize: true, // importante: no permitir que TypeORM altere esquema con tipos no reconocidos
-			extra: {}
-		}),
-		AuthModule,
-		DevicesModule,
-		SupportRequestsModule,
-		RemoteSessionsModule,
-		SignalingModule,
+  imports: [
+    ConfigModule.forRoot(),
 
-
-	],
-	controllers: [],
-	providers: [],
+    // `forRootAsync` y no un objeto literal: asi las opciones se construyen
+    // cuando `ConfigModule` ya cargo el `.env`, y no dependen del orden en
+    // que se evalue este array.
+    TypeOrmModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService) =>
+        buildTypeOrmOptions({
+          DATABASE_URL: configService.get<string>('DATABASE_URL'),
+        }),
+    }),
+    AuthModule,
+    DevicesModule,
+    SupportRequestsModule,
+    RemoteSessionsModule,
+    SignalingModule,
+  ],
+  controllers: [],
+  providers: [],
 })
-export class AppModule { }
+export class AppModule {}

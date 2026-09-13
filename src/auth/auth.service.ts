@@ -20,10 +20,13 @@ export class AuthService {
 
   async createUser(createUserDto: CreateUserDto) {
     try {
-      const { password, ...userData } = createUserDto;
+      const { password, roles, ...userData } = createUserDto;
       const user = this.userRepository.create({
         ...userData,
         password: bcrypt.hashSync( password, 10 ),
+        // Sin roles explicitos se respeta el default de la columna (`user`),
+        // que no habilita ningun endpoint de tecnico ni de administracion.
+        ...( roles ? { roles: [ ...new Set(roles) ] } : {} ),
       });
 
       await this.userRepository.save( user );
