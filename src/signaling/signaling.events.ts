@@ -18,6 +18,18 @@ export const remoteSessionRoom = (remoteSessionId: string): string =>
 /** El participante pide unirse a la sesion remota antes de enviar signaling. */
 export const REMOTE_SESSION_JOIN_EVENT = 'remote-session:join';
 
+/**
+ * El participante del OTRO extremo acaba de unirse a la sesion.
+ *
+ * Resuelve la carrera inicial de la negociacion: el que llega primero recibe
+ * `peerJoined: false` en su ACK y se entera por aqui, sin repetir el join ni
+ * esperar un tiempo arbitrario.
+ *
+ * Es readiness de signaling, no de WebRTC: significa que hay al menos un socket
+ * del namespace opuesto dentro de `remote-session:<id>`, nada mas.
+ */
+export const REMOTE_SESSION_PEER_JOINED_EVENT = 'remote-session:peer-joined';
+
 /** SDP offer. El backend no decide quien la crea: solo la retransmite. */
 export const WEBRTC_OFFER_EVENT = 'webrtc:offer';
 
@@ -48,4 +60,15 @@ export interface WebrtcIceCandidatePayload {
   candidate: string;
   sdpMid: string | null;
   sdpMLineIndex: number | null;
+}
+
+/**
+ * Aviso de que el otro extremo esta presente en la room de signaling.
+ *
+ * No lleva identidad del peer: quien lo recibe ya sabe con quien comparte la
+ * sesion, y anadir `userId`, `deviceId` o `technicianId` solo expondria datos
+ * que el contrato no necesita.
+ */
+export interface RemoteSessionPeerJoinedPayload {
+  remoteSessionId: string;
 }

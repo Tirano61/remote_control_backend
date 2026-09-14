@@ -16,13 +16,16 @@ import {
   SignalingRelayAck,
 } from './interfaces/signaling-ack.interface';
 import {
+  peerOf,
   SignalingIdentity,
   SignalingParticipant,
   SignalingSocket,
 } from './interfaces/signaling-participant.interface';
 import { SignalingRealtimeService } from './realtime/signaling-realtime.service';
 import {
+  REMOTE_SESSION_PEER_JOINED_EVENT,
   remoteSessionRoom,
+  RemoteSessionPeerJoinedPayload,
   WEBRTC_ANSWER_EVENT,
   WEBRTC_ICE_CANDIDATE_EVENT,
   WEBRTC_OFFER_EVENT,
@@ -69,6 +72,15 @@ export class SignalingService {
    * abandona antes de validar la nueva; si la nueva no es valida, el socket
    * queda sin sesion y tendra que volver a unirse. El payload se valida antes de
    * tocar nada: un mensaje mal formado no debe sacar a nadie de su sesion.
+   *
+   * El ACK incluye ademas `peerJoined`, que es lo que quita la carrera inicial
+   * de la negociacion: sin el, el primero en llegar podria mandar su offer a una
+   * room vacia y perderla, porque el signaling no se guarda en ningun sitio. Es
+   * readiness de signaling y nada mas: NO significa WebRTC conectado, ni ICE
+   * terminado, ni sesion `ACTIVE`, ni video disponible.
+   *
+   * Si el peer llega despues, se le avisa a este con
+   * `remote-session:peer-joined` en lugar de obligarle a repetir el join.
    */
   async join(
     socket: SignalingSocket,
@@ -90,14 +102,34 @@ export class SignalingService {
     // responde igual. Conocer el UUID no autoriza nada ni confirma que exista.
     if (!remoteSession) return joinRejected(SignalingErrorCode.UNAUTHORIZED);
 
+    // Antes de entrar: si ya habia otro socket de ESTE mismo extremo en la room,
+    // el otro lado ya fue avisado en su momento y no hace falta repetirselo. Es
+    // lo que evita que una segunda pestana del tecnico dispare un aviso extra.
+    const ownSideWasPresent =
+      await this.signalingRealtimeService.hasParticipantInSession(
+        identity.participant,
+        remoteSession.id,
+      );
+
     await socket.join(remoteSessionRoom(remoteSession.id));
     socket.data.remoteSessionId = remoteSession.id;
 
+    // Solo se llega aqui con la sesion ya validada: viva y del que la pide. Un
+    // socket no autorizado no produce readiness ni avisa a nadie.
+    const peerJoined =
+      await this.signalingRealtimeService.hasParticipantInSession(
+        peerOf(identity.participant),
+        remoteSession.id,
+      );
+
+    if (peerJoined && !ownSideWasPresent)
+      this.announceToPeer(identity, remoteSession.id);
+
     this.logger.log(
-      `${identity.participant} joined signaling of remote session ${remoteSession.id}`,
+      `${identity.participant} joined signaling of remote session ${remoteSession.id} (peerJoined=${peerJoined})`,
     );
 
-    return { joined: true, remoteSessionId: remoteSession.id };
+    return { joined: true, remoteSessionId: remoteSession.id, peerJoined };
   }
 
   /** Retransmite una SDP offer al otro extremo de la sesion. */
@@ -255,6 +287,33 @@ export class SignalingService {
   }
 
   /**
+   * Avisa al otro extremo de que su peer ya esta en la room.
+   *
+   * Resuelve el caso en que el primero en llegar recibio `peerJoined: false`:
+   * se entera sin repetir el join y sin esperar un tiempo inventado. No lleva
+   * identidad del peer ni cantidad de sockets, y va a la room de ESTA sesion en
+   * el namespace contrario, asi que nunca cruza sesiones.
+   *
+   * No devuelve nada ni rompe el join: que el aviso no llegue solo significa que
+   * el peer se fue entre la consulta y la emision, y entonces tampoco habia nada
+   * que anunciar. El cliente que recibe el evento dos veces (por ejemplo cuando
+   * los dos extremos se unen a la vez) debe tratarlo como idempotente.
+   */
+  private announceToPeer(
+    identity: SignalingIdentity,
+    remoteSessionId: string,
+  ): void {
+    const payload: RemoteSessionPeerJoinedPayload = { remoteSessionId };
+
+    this.signalingRealtimeService.emitToParticipantSession(
+      peerOf(identity.participant),
+      remoteSessionId,
+      REMOTE_SESSION_PEER_JOINED_EVENT,
+      payload,
+    );
+  }
+
+  /**
    * Entrega el mensaje en el namespace del OTRO extremo.
    *
    * Nunca hay broadcast: el destino es la room de esa sesion y nada mas. Como el
@@ -266,18 +325,12 @@ export class SignalingService {
     event: string,
     payload: WebrtcSdpPayload | WebrtcIceCandidatePayload,
   ): SignalingRelayAck {
-    const delivered =
-      identity.participant === SignalingParticipant.TECHNICIAN
-        ? this.signalingRealtimeService.emitToDeviceSession(
-            remoteSessionId,
-            event,
-            payload,
-          )
-        : this.signalingRealtimeService.emitToTechnicianSession(
-            remoteSessionId,
-            event,
-            payload,
-          );
+    const delivered = this.signalingRealtimeService.emitToParticipantSession(
+      peerOf(identity.participant),
+      remoteSessionId,
+      event,
+      payload,
+    );
 
     if (!delivered) return relayRejected(SignalingErrorCode.UNAVAILABLE);
 

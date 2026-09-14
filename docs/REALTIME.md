@@ -36,6 +36,7 @@ device presence (ONLINE/OFFLINE)      — /devices only, server-side
 support request notices               — /devices only, server -> device
 remote session notices                — both namespaces, server -> client
 WebRTC signaling relay                — both namespaces, bidirectional
+signaling readiness                   — both namespaces, server -> client
 ```
 
 What realtime is **not** used for:
@@ -257,6 +258,23 @@ no longer live.
 Relayed from the technician. See [Signaling](#signaling) below; payloads and
 rules are identical in both directions.
 
+### remote-session:peer-joined
+
+```text
+Direction     server -> device
+Namespace     /devices
+When          the technician of the same RemoteSession joined its signaling room
+              after this device had already joined
+```
+
+```json
+{ "remoteSessionId": "3d1b9e64-9a0f-4c88-9d0a-6f2a5c7e8b10" }
+```
+
+Signaling readiness only. See
+[Participant readiness](#participant-readiness) for the exact meaning, when it
+is emitted and when it is not.
+
 ## Events sent by remote_control_device
 
 ```text
@@ -421,6 +439,23 @@ webrtc:ice-candidate
 
 Relayed from the device. See [Signaling](#signaling).
 
+### remote-session:peer-joined
+
+```text
+Direction     server -> technician
+Namespace     /technicians
+When          the device of the same RemoteSession joined its signaling room
+              after this technician had already joined
+```
+
+```json
+{ "remoteSessionId": "3d1b9e64-9a0f-4c88-9d0a-6f2a5c7e8b10" }
+```
+
+Signaling readiness only. See
+[Participant readiness](#participant-readiness) for the exact meaning, when it
+is emitted and when it is not.
+
 ## Events sent by remote_control_web
 
 ```text
@@ -482,8 +517,21 @@ name is built by the server. Any extra property makes the payload invalid.
 ACK — accepted:
 
 ```json
-{ "joined": true, "remoteSessionId": "3d1b9e64-9a0f-4c88-9d0a-6f2a5c7e8b10" }
+{
+  "joined": true,
+  "remoteSessionId": "3d1b9e64-9a0f-4c88-9d0a-6f2a5c7e8b10",
+  "peerJoined": false
+}
 ```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `joined` | boolean | always `true` in this branch |
+| `remoteSessionId` | string | the session this socket is now joined to |
+| `peerJoined` | boolean | whether the **other** participant is already in the signaling room |
+
+`peerJoined` is signaling readiness and nothing else — see
+[Participant readiness](#participant-readiness).
 
 ACK — rejected:
 
@@ -491,7 +539,8 @@ ACK — rejected:
 { "joined": false, "error": "UNAUTHORIZED" }
 ```
 
-Possible `error` values: `INVALID_PAYLOAD`, `UNAUTHORIZED`.
+A rejected ACK carries no `peerJoined`: without a join there is no readiness to
+report. Possible `error` values: `INVALID_PAYLOAD`, `UNAUTHORIZED`.
 
 Preconditions for a successful join:
 
@@ -531,6 +580,113 @@ A client that needs to work with a different session simply sends
 Notes:
 `remote-session:join` is mandatory before any `webrtc:*` event. It is also the
 event to resend after a reconnection — a fresh socket has no joined session.
+
+Do **not** start the WebRTC negotiation on `joined: true` alone. Signaling is
+never buffered, so an offer sent into an empty room is lost. Start it when
+`peerJoined` is `true`, or when `remote-session:peer-joined` arrives.
+
+## Participant readiness
+
+```text
+peerJoined                   field of the successful remote-session:join ACK
+remote-session:peer-joined   server -> client event, both namespaces
+```
+
+Both answer exactly one question:
+
+```text
+Is there at least one socket of the OPPOSITE namespace
+currently joined to this RemoteSession?
+```
+
+For a `/technicians` socket the opposite side is the **device**; for a
+`/devices` socket it is the **technician**.
+
+What it does **not** mean:
+
+```text
+NOT "WebRTC is connected"
+NOT "ICE finished"
+NOT "the session is ACTIVE"
+NOT "video is available"
+NOT "the device is ONLINE"
+```
+
+It is readiness for *signaling*: the peer is in the room, so a message sent now
+has somebody to reach.
+
+Why it exists:
+
+```text
+technician joins  -> joined: true
+technician sends webrtc:offer
+device has not joined yet
+-> the offer is dropped and never replayed
+```
+
+The ACK alone cannot rule that out, because it only proves *this* socket
+joined. `peerJoined` closes the race without clients resorting to arbitrary
+delays.
+
+### Join order
+
+Technician first:
+
+```text
+technician  remote-session:join  -> { joined: true, ..., peerJoined: false }
+                                    no event is emitted to anybody
+device      remote-session:join  -> { joined: true, ..., peerJoined: true }
+technician  receives                remote-session:peer-joined
+```
+
+Device first is symmetric:
+
+```text
+device      remote-session:join  -> { joined: true, ..., peerJoined: false }
+technician  remote-session:join  -> { joined: true, ..., peerJoined: true }
+device      receives                remote-session:peer-joined
+```
+
+The side that arrives second learns it from its own ACK and receives no event —
+the event exists only for the side that was already waiting.
+
+### Payload
+
+```json
+{ "remoteSessionId": "3d1b9e64-9a0f-4c88-9d0a-6f2a5c7e8b10" }
+```
+
+That is the whole payload. It never carries `userId`, `technicianId`,
+`deviceId`, a token, a socket id or a count of connections. Clients already know
+who the other end of their session is; the event only says *when*.
+
+### Rules a client can rely on
+
+* **Authorization first.** Readiness is computed only after the join passed all
+  its checks. A socket rejected with `UNAUTHORIZED` never turns another
+  participant's `peerJoined` into `true` and never triggers the event;
+* **Session isolation.** Only participants of the *same* `RemoteSession` are
+  ever observed. Two sessions running at once never see each other, not even
+  when the same technician owns both;
+* **Nothing is persisted.** Readiness is live room membership. After a
+  disconnection the socket is gone from the room, so a peer that joins next gets
+  `peerJoined: false`;
+* **Reconnection recomputes it.** A client that reconnects and re-sends
+  `remote-session:join` gets a freshly computed `peerJoined`, and the waiting
+  peer receives `remote-session:peer-joined` again;
+* **Treat the event as idempotent.** It can arrive more than once for the same
+  session — a reconnect, or both ends joining simultaneously. Receiving it when
+  the peer is already known must be harmless;
+* **One logical participant per side.** A technician may hold several sockets
+  (several browser tabs). `peerJoined` means *at least one* opposite socket, and
+  the count of sockets is never exposed. A second tab joining a session whose
+  technician side is already present does not re-notify the device; when the
+  event is emitted, every socket of the receiving side gets it, since it is sent
+  to the session room.
+
+There is no `remote-session:peer-left` today. A peer that goes away is detected
+through the WebRTC/ICE connection state once WebRTC is in place, and through
+`remote-session:closed` when the session ends.
 
 ## webrtc:offer
 
@@ -716,7 +872,9 @@ device:<deviceId>                 internal. Namespace /devices only.
 remote-session:<remoteSessionId>  joined by the server as the result of a
                                   successful remote-session:join, in the
                                   namespace the socket belongs to. It is how a
-                                  signaling message reaches the other end.
+                                  signaling message reaches the other end, and
+                                  what remote-session:peer-joined is computed
+                                  from and emitted to.
 ```
 
 Points that matter for the Flutter clients:
@@ -727,6 +885,9 @@ Points that matter for the Flutter clients:
 * the two handshake rooms carry domain notifications, the session room carries
   signaling. That is why `remote-session:closed` arrives without having joined
   anything, while a `webrtc:*` message does not;
+* membership of the session room is also the whole implementation of readiness:
+  `peerJoined` and `remote-session:peer-joined` are answers about who is in
+  `remote-session:<id>` in the *other* namespace, and nothing is stored;
 * `/devices` and `/technicians` are separate namespaces with **separate rooms**.
   `remote-session:<id>` in `/devices` and `remote-session:<id>` in
   `/technicians` are two different rooms that merely share a name. Relaying "to
@@ -761,6 +922,10 @@ Details that apply to the current implementation:
 * **Joined sessions do not survive.** A new socket has no session attached, so
   `webrtc:*` would answer `NOT_JOINED`. Send `remote-session:join` again after
   every reconnection.
+* **Readiness is not persisted either.** The reconnected socket is out of the
+  session room until it joins again, so during that gap the peer's next join
+  reports `peerJoined: false`. Once it re-joins, its ACK carries the recomputed
+  value and the waiting peer receives `remote-session:peer-joined` again.
 * **Events sent while disconnected are lost.** There is no buffering or replay.
   After reconnecting, the client re-reads state over REST:
 

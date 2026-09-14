@@ -40,6 +40,8 @@ import { SignalingRealtimeService } from './realtime/signaling-realtime.service'
 import { TechnicianRealtimeService } from './realtime/technician-realtime.service';
 import {
   REMOTE_SESSION_JOIN_EVENT,
+  REMOTE_SESSION_PEER_JOINED_EVENT,
+  RemoteSessionPeerJoinedPayload,
   WEBRTC_ANSWER_EVENT,
   WEBRTC_ICE_CANDIDATE_EVENT,
   WEBRTC_OFFER_EVENT,
@@ -78,6 +80,14 @@ const SESSION_A_ID = '1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed';
 const SESSION_B_ID = '2c8e7cde-ccfe-4c3e-8c6e-bc9efcce5cfe';
 const SESSION_C_ID = '3d7f8def-ddaf-4d4f-9d7f-cdaf0ddf6daf';
 const CLOSED_SESSION_ID = '4e6a9efa-eeba-4e5a-8e8a-deba1eea7eba';
+
+/** Eventos servidor -> cliente que las pruebas registran en cada socket. */
+const TRACKED_EVENTS = [
+  WEBRTC_OFFER_EVENT,
+  WEBRTC_ANSWER_EVENT,
+  WEBRTC_ICE_CANDIDATE_EVENT,
+  REMOTE_SESSION_PEER_JOINED_EVENT,
+];
 
 const SDP =
   'v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nm=video 9 UDP/TLS/RTP/SAVPF 96';
@@ -121,6 +131,7 @@ describe('Signaling WebRTC (Socket.IO)', () => {
   let devicesUrl: string;
   let techniciansUrl: string;
   let presence: DevicePresenceService;
+  let signalingRealtime: SignalingRealtimeService;
   let deviceJwt: JwtService;
   let userJwt: JwtService;
 
@@ -221,17 +232,14 @@ describe('Signaling WebRTC (Socket.IO)', () => {
       });
 
       openClients.push(client);
-      received.set(client, {
-        [WEBRTC_OFFER_EVENT]: [],
-        [WEBRTC_ANSWER_EVENT]: [],
-        [WEBRTC_ICE_CANDIDATE_EVENT]: [],
-      });
+      received.set(
+        client,
+        Object.fromEntries(
+          TRACKED_EVENTS.map((event) => [event, [] as unknown[]] as const),
+        ),
+      );
 
-      for (const event of [
-        WEBRTC_OFFER_EVENT,
-        WEBRTC_ANSWER_EVENT,
-        WEBRTC_ICE_CANDIDATE_EVENT,
-      ])
+      for (const event of TRACKED_EVENTS)
         client.on(event, (payload: unknown) =>
           received.get(client)?.[event].push(payload),
         );
@@ -300,16 +308,44 @@ describe('Signaling WebRTC (Socket.IO)', () => {
     received.get(client)?.[event] ?? [];
 
   const waitFor = async (
-    condition: () => boolean,
+    condition: () => boolean | Promise<boolean>,
     description: string,
   ): Promise<void> => {
     const deadline = Date.now() + 5_000;
 
-    while (!condition()) {
+    while (!(await condition())) {
       if (Date.now() > deadline) throw new Error(`Timeout: ${description}`);
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
   };
+
+  /**
+   * Espera a que el servidor ya no vea ningun socket de ese extremo en la
+   * sesion.
+   *
+   * Cerrar un socket desde el cliente no es instantaneo para el servidor, y una
+   * prueba de readiness que no lo espere seria inestable. Se consulta por la
+   * misma via que usa produccion, asi que lo que se comprueba es el estado real
+   * de la room y no una espera inventada.
+   */
+  const waitForEmptySide = (
+    participant: SignalingParticipant,
+    remoteSessionId: string,
+  ): Promise<void> =>
+    waitFor(
+      async () =>
+        !(await signalingRealtime.hasParticipantInSession(
+          participant,
+          remoteSessionId,
+        )),
+      `${participant} fuera de la room de ${remoteSessionId}`,
+    );
+
+  const peerJoinedEvents = (client: ClientSocket): unknown[] =>
+    eventsOf(client, REMOTE_SESSION_PEER_JOINED_EVENT);
+
+  const waitForPeerJoined = (client: ClientSocket): Promise<unknown> =>
+    waitForEvent(client, REMOTE_SESSION_PEER_JOINED_EVENT);
 
   /** Margen para que un mensaje que NO debe llegar tuviera tiempo de llegar. */
   const settle = (): Promise<void> =>
@@ -377,6 +413,7 @@ describe('Signaling WebRTC (Socket.IO)', () => {
     app = moduleRef.createNestApplication();
 
     presence = app.get(DevicePresenceService);
+    signalingRealtime = app.get(SignalingRealtimeService);
     deviceJwt = app.get(JwtService);
     userJwt = new JwtService({
       secret: USER_JWT_SECRET,
@@ -448,6 +485,26 @@ describe('Signaling WebRTC (Socket.IO)', () => {
         ),
       'presencia vacia entre pruebas',
     );
+
+    // Los sockets de tecnico no tienen registro de presencia, y un socket que
+    // el servidor todavia no dio por cerrado contaria como readiness en la
+    // prueba siguiente. Se espera a que las dos rooms de cada sesion queden
+    // vacias antes de continuar.
+    await waitFor(async () => {
+      const presentSides = await Promise.all(
+        [SESSION_A_ID, SESSION_B_ID, SESSION_C_ID].flatMap((remoteSessionId) =>
+          [SignalingParticipant.DEVICE, SignalingParticipant.TECHNICIAN].map(
+            (participant) =>
+              signalingRealtime.hasParticipantInSession(
+                participant,
+                remoteSessionId,
+              ),
+          ),
+        ),
+      );
+
+      return presentSides.every((present) => !present);
+    }, 'rooms de signaling vacias entre pruebas');
   });
 
   afterAll(async () => {
@@ -512,9 +569,11 @@ describe('Signaling WebRTC (Socket.IO)', () => {
     it('une al tecnico dueno de una sesion CONNECTING', async () => {
       const technician = await connectTechnician(technicianA);
 
+      // Todavia no hay tablet en la room: readiness negativa.
       expect(await join(technician, SESSION_A_ID)).toEqual({
         joined: true,
         remoteSessionId: SESSION_A_ID,
+        peerJoined: false,
       });
     });
 
@@ -524,6 +583,7 @@ describe('Signaling WebRTC (Socket.IO)', () => {
       expect(await join(device, SESSION_A_ID)).toEqual({
         joined: true,
         remoteSessionId: SESSION_A_ID,
+        peerJoined: false,
       });
     });
 
@@ -611,6 +671,7 @@ describe('Signaling WebRTC (Socket.IO)', () => {
       expect(await join(technician, SESSION_C_ID)).toEqual({
         joined: true,
         remoteSessionId: SESSION_C_ID,
+        peerJoined: true,
       });
 
       // La sesion anterior quedo abandonada.
@@ -626,6 +687,293 @@ describe('Signaling WebRTC (Socket.IO)', () => {
 
       await waitForEvent(deviceC, WEBRTC_OFFER_EVENT);
       expect(eventsOf(deviceA, WEBRTC_OFFER_EVENT)).toHaveLength(0);
+    });
+  });
+
+  describe('readiness de participantes', () => {
+    const joinedWithPeer = (
+      remoteSessionId: string,
+      peerJoined: boolean,
+    ): JoinRemoteSessionAck => ({
+      joined: true,
+      remoteSessionId,
+      peerJoined,
+    });
+
+    const peerJoinedPayload = (
+      remoteSessionId: string,
+    ): RemoteSessionPeerJoinedPayload => ({ remoteSessionId });
+
+    it('technician-first: el tecnico entra solo y se entera cuando llega la tablet', async () => {
+      const technician = await connectTechnician(technicianA);
+      const device = await connectDevice(DEVICE_A_ID);
+
+      expect(await join(technician, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, false),
+      );
+
+      await settle();
+
+      // Nadie a quien avisar todavia.
+      expect(peerJoinedEvents(technician)).toHaveLength(0);
+      expect(peerJoinedEvents(device)).toHaveLength(0);
+
+      expect(await join(device, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, true),
+      );
+
+      expect(await waitForPeerJoined(technician)).toEqual(
+        peerJoinedPayload(SESSION_A_ID),
+      );
+
+      await settle();
+
+      // El segundo en llegar ya lo supo por su propio ACK.
+      expect(peerJoinedEvents(technician)).toHaveLength(1);
+      expect(peerJoinedEvents(device)).toHaveLength(0);
+    });
+
+    it('device-first: se comporta exactamente igual en el orden inverso', async () => {
+      const device = await connectDevice(DEVICE_A_ID);
+      const technician = await connectTechnician(technicianA);
+
+      expect(await join(device, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, false),
+      );
+
+      await settle();
+
+      expect(peerJoinedEvents(device)).toHaveLength(0);
+
+      expect(await join(technician, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, true),
+      );
+
+      expect(await waitForPeerJoined(device)).toEqual(
+        peerJoinedPayload(SESSION_A_ID),
+      );
+
+      await settle();
+
+      expect(peerJoinedEvents(device)).toHaveLength(1);
+      expect(peerJoinedEvents(technician)).toHaveLength(0);
+    });
+
+    it('no incluye identidad del peer en el aviso', async () => {
+      const technician = await connectTechnician(technicianA);
+      const device = await connectDevice(DEVICE_A_ID);
+
+      await join(technician, SESSION_A_ID);
+      await join(device, SESSION_A_ID);
+
+      // Exactamente una propiedad: ni deviceId, ni technicianId, ni userId.
+      expect(
+        Object.keys(
+          (await waitForPeerJoined(technician)) as Record<string, unknown>,
+        ),
+      ).toEqual(['remoteSessionId']);
+    });
+
+    it('devuelve peerJoined=true a quien se une con el peer ya presente', async () => {
+      const device = await connectDevice(DEVICE_A_ID);
+      const technician = await connectTechnician(technicianA);
+
+      await join(device, SESSION_A_ID);
+      await join(technician, SESSION_A_ID);
+
+      // La readiness se recalcula en cada join: los dos siguen viendose.
+      expect(await join(technician, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, true),
+      );
+      expect(await join(device, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, true),
+      );
+    });
+
+    it('nunca cruza readiness entre dos sesiones distintas', async () => {
+      const deviceOfA = await connectDevice(DEVICE_A_ID);
+      const technicianOfB = await connectTechnician(technicianB);
+
+      expect(await join(deviceOfA, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, false),
+      );
+      expect(await join(technicianOfB, SESSION_B_ID)).toEqual(
+        joinedWithPeer(SESSION_B_ID, false),
+      );
+
+      await settle();
+
+      // Estar en `remote-session:<id>` de OTRA sesion no cuenta como peer.
+      expect(peerJoinedEvents(deviceOfA)).toHaveLength(0);
+      expect(peerJoinedEvents(technicianOfB)).toHaveLength(0);
+    });
+
+    it('un join rechazado no produce readiness ni avisa al peer', async () => {
+      const device = await connectDevice(DEVICE_A_ID);
+      const intruder = await connectTechnician(technicianB);
+      const supervisor = await connectTechnician(admin);
+      const otherDevice = await connectDevice(DEVICE_B_ID);
+
+      await join(device, SESSION_A_ID);
+
+      // El ACK rechazado conserva su forma: sin `peerJoined`.
+      expect(await join(intruder, SESSION_A_ID)).toEqual({
+        joined: false,
+        error: SignalingErrorCode.UNAUTHORIZED,
+      });
+      expect(await join(supervisor, SESSION_A_ID)).toEqual({
+        joined: false,
+        error: SignalingErrorCode.UNAUTHORIZED,
+      });
+      expect(await join(otherDevice, SESSION_A_ID)).toEqual({
+        joined: false,
+        error: SignalingErrorCode.UNAUTHORIZED,
+      });
+      expect(await join(intruder, CLOSED_SESSION_ID)).toEqual({
+        joined: false,
+        error: SignalingErrorCode.UNAUTHORIZED,
+      });
+
+      await settle();
+
+      expect(peerJoinedEvents(device)).toHaveLength(0);
+
+      // Y la tablet sigue viendo la realidad: ningun tecnico entro.
+      expect(await join(device, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, false),
+      );
+    });
+
+    it('no cuenta un socket que ya se desconecto', async () => {
+      const technician = await connectTechnician(technicianA);
+      const device = await connectDevice(DEVICE_A_ID);
+
+      expect(await join(technician, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, false),
+      );
+
+      technician.close();
+      await waitForEmptySide(SignalingParticipant.TECHNICIAN, SESSION_A_ID);
+
+      expect(await join(device, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, false),
+      );
+
+      await settle();
+
+      expect(peerJoinedEvents(device)).toHaveLength(0);
+    });
+
+    it('recalcula la readiness cuando el tecnico reconecta y vuelve a unirse', async () => {
+      const technician = await connectTechnician(technicianA);
+      const device = await connectDevice(DEVICE_A_ID);
+
+      await join(technician, SESSION_A_ID);
+      await join(device, SESSION_A_ID);
+      await waitForPeerJoined(technician);
+
+      technician.close();
+      await waitForEmptySide(SignalingParticipant.TECHNICIAN, SESSION_A_ID);
+
+      const reconnected = await connectTechnician(technicianA);
+
+      // La readiness no se persiste: se vuelve a calcular con el socket nuevo.
+      expect(await join(reconnected, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, true),
+      );
+
+      // Y la tablet se entera de que su tecnico volvio sin repetir el join.
+      expect(await waitForPeerJoined(device)).toEqual(
+        peerJoinedPayload(SESSION_A_ID),
+      );
+    });
+
+    it('trata varias pestanas del mismo tecnico como un solo extremo', async () => {
+      const tab1 = await connectTechnician(technicianA);
+      const tab2 = await connectTechnician(technicianA);
+      const device = await connectDevice(DEVICE_A_ID);
+
+      expect(await join(tab1, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, false),
+      );
+      expect(await join(tab2, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, false),
+      );
+
+      await settle();
+
+      // Dos sockets del mismo lado no se avisan entre ellos.
+      expect(peerJoinedEvents(tab1)).toHaveLength(0);
+      expect(peerJoinedEvents(tab2)).toHaveLength(0);
+
+      expect(await join(device, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, true),
+      );
+
+      // El aviso va a la room, asi que las dos pestanas se enteran.
+      await waitForPeerJoined(tab1);
+      await waitForPeerJoined(tab2);
+
+      // Una tercera pestana no vuelve a molestar a la tablet: ese extremo ya
+      // estaba presente.
+      const tab3 = await connectTechnician(technicianA);
+
+      expect(await join(tab3, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, true),
+      );
+
+      await settle();
+
+      expect(peerJoinedEvents(tab1)).toHaveLength(1);
+      expect(peerJoinedEvents(tab2)).toHaveLength(1);
+      expect(peerJoinedEvents(tab3)).toHaveLength(0);
+      expect(peerJoinedEvents(device)).toHaveLength(0);
+    });
+
+    it('mantiene el aislamiento con varias pestanas y varias sesiones', async () => {
+      const tab1 = await connectTechnician(technicianA);
+      const tab2 = await connectTechnician(technicianA);
+      const deviceA = await connectDevice(DEVICE_A_ID);
+      const deviceC = await connectDevice(DEVICE_C_ID);
+
+      // Las dos sesiones son del mismo tecnico, en dispositivos distintos.
+      await join(tab1, SESSION_A_ID);
+      await join(tab2, SESSION_C_ID);
+
+      expect(await join(deviceA, SESSION_A_ID)).toEqual(
+        joinedWithPeer(SESSION_A_ID, true),
+      );
+
+      await waitForPeerJoined(tab1);
+      await settle();
+
+      // La pestana de la sesion C no observa la sesion A.
+      expect(peerJoinedEvents(tab2)).toHaveLength(0);
+      expect(peerJoinedEvents(deviceC)).toHaveLength(0);
+
+      // Y la sesion C tampoco ve al dispositivo de la A.
+      expect(await join(deviceC, SESSION_C_ID)).toEqual(
+        joinedWithPeer(SESSION_C_ID, true),
+      );
+
+      await waitForPeerJoined(tab2);
+      await settle();
+
+      expect(peerJoinedEvents(tab1)).toHaveLength(1);
+      expect(peerJoinedEvents(tab2)).toHaveLength(1);
+    });
+
+    it('no toca la sesion persistida al calcular la readiness', async () => {
+      const technician = await connectTechnician(technicianA);
+      const device = await connectDevice(DEVICE_A_ID);
+
+      await join(technician, SESSION_A_ID);
+      await join(device, SESSION_A_ID);
+      await waitForPeerJoined(technician);
+
+      // La readiness es presencia en una room, no estado de la sesion.
+      expect(writes).toEqual([]);
+      expect(remoteSessions[0].status).toBe(RemoteSessionStatus.CONNECTING);
     });
   });
 
@@ -917,6 +1265,7 @@ describe('Signaling WebRTC (Socket.IO)', () => {
       expect(await join(reconnected, SESSION_A_ID)).toEqual({
         joined: true,
         remoteSessionId: SESSION_A_ID,
+        peerJoined: true,
       });
 
       expect(await sendOffer(reconnected, SESSION_A_ID)).toEqual({
