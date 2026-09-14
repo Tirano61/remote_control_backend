@@ -2,5 +2,22 @@
 	"editor.detectIndentation": false,
 	"editor.insertSpaces": false,
 	"editor.tabSize": 2,
-	"editor.formatOnSave": true
+	"editor.formatOnSave": true,
+	"workbench.colorCustomizations": {
+    "titleBar.activeBackground": "#bd0cab",
+    "titleBar.activeForeground": "#FFFFFF",
+    "titleBar.inactiveBackground": "#bd0cab",
+    "titleBar.inactiveForeground": "#FFFFFFCC",
+    "activityBar.background": "#bd0cab",
+    "activityBar.foreground": "#FFFFFF",
+    "activityBar.inactiveForeground": "#FFFFFF99",
+    "activityBarBadge.background": "#A5D6A7",
+    "activityBarBadge.foreground": "#0B2E12",
+    "statusBar.background": "#bd0cab",
+    "statusBar.foreground": "#FFFFFF",
+    "statusBarItem.hoverBackground": "#bd0cab",
+    "statusBarItem.remoteBackground": "#bd0cab",
+    "statusBarItem.remoteForeground": "#FFFFFF"
+  }
 }
+

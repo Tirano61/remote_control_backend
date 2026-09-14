@@ -10,6 +10,21 @@ export enum SignalingParticipant {
   TECHNICIAN = 'TECHNICIAN',
 }
 
+/**
+ * El extremo contrario.
+ *
+ * Una sesion remota tiene exactamente dos, asi que "el otro" siempre esta
+ * definido. Se usa tanto para retransmitir signaling como para consultar la
+ * presencia del peer en la room, y tenerlo en un solo sitio evita que cada
+ * gateway invente su propia version de la misma regla.
+ */
+export const peerOf = (
+  participant: SignalingParticipant,
+): SignalingParticipant =>
+  participant === SignalingParticipant.DEVICE
+    ? SignalingParticipant.TECHNICIAN
+    : SignalingParticipant.DEVICE;
+
 /** Identidad autenticada de un extremo del signaling. */
 export interface SignalingIdentity {
   participant: SignalingParticipant;

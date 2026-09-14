@@ -19,9 +19,21 @@ export enum SignalingErrorCode {
   UNAVAILABLE = 'UNAVAILABLE',
 }
 
-/** Respuesta (ACK) de `remote-session:join`. */
+/**
+ * Respuesta (ACK) de `remote-session:join`.
+ *
+ * `peerJoined` indica si en ese momento hay al menos un socket del namespace
+ * OPUESTO dentro de la room de la sesion. Es readiness de signaling y nada mas:
+ * no significa que WebRTC este conectado, ni que ICE haya terminado, ni que la
+ * sesion sea `ACTIVE`, ni que haya video.
+ *
+ * Cuando llega `false`, el otro extremo todavia no esta: el cliente no debe
+ * esperar un tiempo arbitrario, sino el evento `remote-session:peer-joined`.
+ *
+ * Un ACK rechazado no lo lleva: sin join no hay readiness que informar.
+ */
 export type JoinRemoteSessionAck =
-  | { joined: true; remoteSessionId: string }
+  | { joined: true; remoteSessionId: string; peerJoined: boolean }
   | { joined: false; error: SignalingErrorCode };
 
 /**
