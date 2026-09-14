@@ -33,7 +33,8 @@ What realtime is used for today:
 
 ```text
 device presence (ONLINE/OFFLINE)      — /devices only, server-side
-support request and session notices   — /devices only, server -> device
+support request notices               — /devices only, server -> device
+remote session notices                — both namespaces, server -> client
 WebRTC signaling relay                — both namespaces, bidirectional
 ```
 
@@ -42,7 +43,8 @@ What realtime is **not** used for:
 * no media. Video, audio and the WebRTC DataChannel never pass through NestJS;
 * no persistence. SDP and ICE candidates are relayed and immediately forgotten;
 * no state changes. Signaling never moves a `RemoteSession` to `ACTIVE`;
-* no technician presence. `/technicians` keeps no registry of connected users.
+* no technician presence. `/technicians` keeps no registry of connected users,
+  and no REST field exposes whether a technician is connected.
 
 ### CORS
 
@@ -240,9 +242,10 @@ Payload:
 `endedBy` is a `RemoteSessionEndedBy` value.
 
 Notes:
-This event is **not** emitted when the device itself closes the session through
-`POST /device/remote-sessions/:id/close` — the closing side already receives the
-closed session in its HTTP response.
+This event is **not** emitted into `/devices` when the device itself closes the
+session through `POST /device/remote-sessions/:id/close` — the closing side
+already receives the closed session in its HTTP response. That close emits the
+same event into `/technicians` instead.
 
 The backend does not leave the session room on the device's behalf. The tablet
 should tear down its peer connection when it receives this. Any further
@@ -306,11 +309,39 @@ A user with only `user` or `sales` cannot open this namespace.
 
 ## Scope of this namespace
 
-`/technicians` exists **only** for WebRTC signaling. It keeps no presence
-registry, persists nothing, and the backend sends no notification events to it —
-a technician is not told over Socket.IO when a device accepts, rejects, cancels,
-or closes a session. That state is read over REST
-(`GET /support-requests`, `GET /remote-sessions/:id`).
+`/technicians` carries WebRTC signaling and exactly one server notification,
+`remote-session:closed`. It keeps no presence registry and persists nothing.
+
+Everything else is still read over REST. A technician is **not** told over
+Socket.IO when a device accepts, rejects or cancels a support request: that state
+comes from `GET /support-requests`, polled or re-read after a user action.
+
+On connecting, the server puts the socket in a private room derived from the
+authenticated user, which is how a notification reaches that technician. The room
+is internal: there is no event to join or leave it, its name is not part of this
+contract, and membership is a consequence of authenticating.
+
+## Realtime is a trigger, never the state
+
+`remote_control_web` must treat `remote-session:closed` as *something changed,
+go and read it*:
+
+```text
+remote-session:closed  ->  GET /remote-sessions/current
+```
+
+Not as the state itself. The reasons are the same ones that apply to the tablet:
+
+* delivery is best-effort. A socket that was reconnecting when the device closed
+  never sees the event, and nothing is replayed;
+* the event carries no session object, only its id and who ended it;
+* REST is the source of truth. A close is committed to PostgreSQL before any
+  event is emitted, so REST is never behind the event — it can only be ahead of
+  it.
+
+The same rule covers the case where no event exists at all: after a page reload
+the web app has no socket history, and `GET /remote-sessions/current` is what
+tells it whether a session is still open.
 
 ## Ownership still applies to admins
 
@@ -331,9 +362,56 @@ disconnects on its own. What still protects the system in the meantime:
   `webrtc:*` message re-validates the session.
 
 Force-closing a technician's sockets would require a technician presence
-registry, which does not exist today.
+registry, which does not exist today. The handshake room used to deliver
+`remote-session:closed` is not one: it addresses sockets, it does not track who
+is connected, and nothing reads it back.
 
 ## Events received by remote_control_web
+
+### remote-session:closed
+
+```text
+Direction     server -> technician
+Namespace     /technicians
+Sent by       backend, after POST /device/remote-sessions/:id/close commits
+              (the DEVICE-initiated close only)
+Received by   every authenticated socket of the technician who owns the session
+ACK           none
+```
+
+Payload:
+
+```json
+{
+  "remoteSessionId": "3d1b9e64-9a0f-4c88-9d0a-6f2a5c7e8b10",
+  "endedBy": "DEVICE"
+}
+```
+
+Same event name and same payload as the one `/devices` receives — one contract
+for one fact. `endedBy` is a `RemoteSessionEndedBy` value and is `DEVICE` here,
+because this is the close the technician did not perform.
+
+Notes:
+`remote-session:join` is **not** required. This is a domain notification, not
+signaling: it is addressed to the technician, not to the session room, so it
+arrives on a socket that has only authenticated.
+
+It reaches only the technician the session belongs to. There is no broadcast, and
+another connected technician receives nothing.
+
+It is **not** emitted when the technician closes the session with
+`POST /remote-sessions/:id/close` — that HTTP response already carries the closed
+session.
+
+Emitted only after the transaction commits, so the session named here is always
+already `CLOSED` and its support request `COMPLETED`. If the delivery fails, the
+close stands: realtime never rolls back persisted state.
+
+Answer it with `GET /remote-sessions/current`, and tear down the peer connection.
+Any further `webrtc:*` for that session would be rejected with `UNAUTHORIZED`.
+
+### webrtc:offer / webrtc:answer / webrtc:ice-candidate
 
 ```text
 webrtc:offer
@@ -341,8 +419,7 @@ webrtc:answer
 webrtc:ice-candidate
 ```
 
-Relayed from the device. These are the only events the backend emits into this
-namespace. See [Signaling](#signaling).
+Relayed from the device. See [Signaling](#signaling).
 
 ## Events sent by remote_control_web
 
@@ -618,8 +695,8 @@ acknowledgement never hangs.
 
 # Rooms
 
-Two room naming schemes exist. Both are **assigned by the server**; a client
-never names, requests or constructs a room.
+Three rooms exist. All of them are **assigned by the server**; a client never
+names, requests or constructs a room.
 
 ```text
 device:<deviceId>                 internal. Namespace /devices only.
@@ -629,6 +706,13 @@ device:<deviceId>                 internal. Namespace /devices only.
                                   (support:assigned, remote-session:created,
                                   remote-session:closed).
 
+<per-technician room>             internal. Namespace /technicians only.
+                                  Joined automatically at handshake, from the
+                                  user id in the validated token. It is how the
+                                  backend addresses a specific technician
+                                  (remote-session:closed). Its name is not part
+                                  of this contract and may change.
+
 remote-session:<remoteSessionId>  joined by the server as the result of a
                                   successful remote-session:join, in the
                                   namespace the socket belongs to. It is how a
@@ -637,9 +721,12 @@ remote-session:<remoteSessionId>  joined by the server as the result of a
 
 Points that matter for the Flutter clients:
 
-* the client does **not** choose `device:<deviceId>`, and there is no event to
-  join or leave a room directly. Room membership is a consequence of
-  authenticating and of `remote-session:join`;
+* the client does **not** choose the room it is put in at handshake, and there
+  is no event to join or leave a room directly. Room membership is a consequence
+  of authenticating and of `remote-session:join`;
+* the two handshake rooms carry domain notifications, the session room carries
+  signaling. That is why `remote-session:closed` arrives without having joined
+  anything, while a `webrtc:*` message does not;
 * `/devices` and `/technicians` are separate namespaces with **separate rooms**.
   `remote-session:<id>` in `/devices` and `remote-session:<id>` in
   `/technicians` are two different rooms that merely share a name. Relaying "to
@@ -682,7 +769,7 @@ remote_control_device   GET /support-requests/current
                         GET /device/remote-sessions/current
 
 remote_control_web      GET /support-requests
-                        GET /remote-sessions/:id
+                        GET /remote-sessions/current
 ```
 
 * **Presence may briefly show two sockets.** A device can hold the old and the

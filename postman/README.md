@@ -166,10 +166,16 @@ The token lasts 2 hours. When it expires, run *Login user* again or
 08  List support requests (status=WAITING)  05 - Support requests - Technician
 09  Assign support request                  05 - Support requests - Technician
 10  Accept support request                  04 - Support requests - Device
-11  Create remote session                   06 - Remote sessions
-12  Get current remote session - Device     06 - Remote sessions
-13  Close remote session                    06 - Remote sessions
+11  Create remote session                     06 - Remote sessions
+12a Get current remote session - Device       06 - Remote sessions
+12b Get current remote session - Technician   06 - Remote sessions
+13  Close remote session                      06 - Remote sessions
 ```
+
+Step 12b is what `remote_control_web` uses to recover its own session: it takes
+no id, only `{{userToken}}`, so a lost `remoteSessionId` is not a problem. It is
+also the request to repeat after the device closes the session, which is
+announced on `/technicians` with `remote-session:closed`.
 
 ### Step 09 needs the device to be ONLINE
 
@@ -190,13 +196,16 @@ Captured automatically by the test scripts:
 
 ```text
 userToken          Login user, Check user status
+userId             Login user, Check user status
 deviceId           Create device, Generate enrollment, Activate device
 publicId           Create device, Generate enrollment, Activate device
 enrollmentCode     Generate enrollment
 deviceSecret       Activate device
 deviceToken        Device login
 supportRequestId   Create support request, Get current support request
-remoteSessionId    Create remote session, Get current remote session - Device
+remoteSessionId    Create remote session,
+                   Get current remote session - Device,
+                   Get current remote session - Technician
 ```
 
 Filled in by hand:

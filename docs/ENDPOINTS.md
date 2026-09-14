@@ -1242,10 +1242,15 @@ If the technician and the device close at the same instant, only one wins; the
 other receives `409`, and the recorded `endedBy` / `endedAt` are those of the
 first.
 
-No `remote-session:closed` event is emitted when the device is the one closing —
-the closing side already has the closed session in this HTTP response. The
-technician is **not** notified over Socket.IO either, and must re-read
-`GET /remote-sessions/:id`.
+The device does **not** receive `remote-session:closed` for its own close — the
+closing side already has the closed session in this HTTP response.
+
+The technician **is** notified: after the transaction commits, the backend emits
+`remote-session:closed` to that technician on the `/technicians` namespace. It is
+a change notification, not state: the web app answers it with
+`GET /remote-sessions/current`. Delivery is best-effort and never rolls the close
+back — if the technician is not connected the event is lost and the session is
+still `CLOSED`.
 
 ---
 
@@ -1337,6 +1342,85 @@ On success the backend emits `remote-session:created` to the device over
 Socket.IO, after the transaction commits. Delivery is best-effort; the tablet can
 always recover with `GET /device/remote-sessions/current`.
 
+## GET /remote-sessions/current
+
+```text
+CLIENT: remote_control_web
+```
+
+Authentication:
+User JWT — roles: `admin`, `tecnico`.
+
+Description:
+The live remote session of the authenticated technician, if any. This is how the
+web app recovers after an F5, after being closed and reopened, or after missing a
+Socket.IO event, without having to treat a `remoteSessionId` kept in browser
+storage as the source of truth.
+
+Request:
+No body. `technicianId` and `userId` are **not** accepted in the query, the body
+or the path: the technician is the authenticated user and nothing else.
+
+Response 200 — with a live session:
+
+```json
+{
+  "remoteSession": {
+    "id": "3d1b9e64-9a0f-4c88-9d0a-6f2a5c7e8b10",
+    "supportRequestId": "8f14e45f-ceea-4d3c-b4e2-2f4b3c9a1d77",
+    "status": "CONNECTING",
+    "createdAt": "2026-03-11T09:33:41.000Z",
+    "connectedAt": null,
+    "endedAt": null,
+    "endedBy": null,
+    "device": {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "publicId": "384-729-142",
+      "name": "Tablet Tolva 01",
+      "isOnline": true
+    },
+    "technician": {
+      "id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+      "name": "Ana Torres"
+    }
+  }
+}
+```
+
+Response 200 — with none:
+
+```json
+{ "remoteSession": null }
+```
+
+Errors:
+
+```text
+401 — Not authenticated.
+403 — Authenticated without role admin/tecnico.
+```
+
+Notes:
+Same envelope and same session object as `GET /device/remote-sessions/current`.
+Having no live session is normal, not an error: it answers `200` with
+`remoteSession: null`, never `404`.
+
+"Live" means `status` is `CONNECTING` or `ACTIVE`. A `CLOSED` session is never
+returned here; read a closed one by id with `GET /remote-sessions/:id`.
+
+Ownership is part of the query, not a filter applied afterwards: only sessions
+whose `technicianId` is the authenticated user are considered. A live session
+belonging to another technician reads exactly like having none. Holding `admin`
+changes nothing — an administrator recovers the sessions they own as the
+assigned technician and no others; there is no supervision or takeover.
+
+Unlike a device, a technician **may** hold several live sessions at once: the
+one-live-session unique index is per device, not per technician. When that
+happens this endpoint returns the most recently created one.
+
+The literal path segment `current` is routed before `:id`, so it is never parsed
+as a session UUID.
+
 ## GET /remote-sessions/:id
 
 ```text
@@ -1366,9 +1450,10 @@ Errors:
 ```
 
 Notes:
-This is the endpoint the Flutter Web app uses to detect that the device closed
-the session, since no realtime event is sent to the technician namespace for
-that.
+Use this to read one specific session, closed ones included — for example the
+session named by a `remote-session:closed` event. To recover "the session I have
+open right now", use `GET /remote-sessions/current` instead: it does not depend
+on the client remembering an id.
 
 ## POST /remote-sessions/:id/close
 
@@ -1410,7 +1495,8 @@ Errors:
 
 Notes:
 On success the backend emits `remote-session:closed` to the device over
-Socket.IO.
+Socket.IO. No echo is sent back to the technician who closed: this HTTP response
+already carries the closed session.
 
 Closing the session immediately cuts signaling: the backend re-checks the session
 on every `webrtc:*` message, so a closed session starts answering `UNAUTHORIZED`.
@@ -1522,13 +1608,17 @@ At any point the tablet reads GET /support-requests/current to recover state.
           -> RemoteSession CONNECTING
           -> emits remote-session:created to the device
 
-2. GET    /device/remote-sessions/current (Device JWT)
+2a. GET   /device/remote-sessions/current (Device JWT)
           -> the tablet recovers the session after a restart or reconnection
+2b. GET   /remote-sessions/current        (User JWT, admin|tecnico)
+          -> the web app recovers the session after an F5 or a reopen
 
 3a. POST  /remote-sessions/:id/close          (User JWT)   endedBy TECHNICIAN
                                                            -> emits remote-session:closed
+                                                              to the device
 3b. POST  /device/remote-sessions/:id/close   (Device JWT) endedBy DEVICE
-                                                           -> emits no event
+                                                           -> emits remote-session:closed
+                                                              to the technician
 
 4. In both cases the SupportRequest becomes COMPLETED in the same transaction.
 ```

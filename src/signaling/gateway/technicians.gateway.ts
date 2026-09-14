@@ -25,6 +25,10 @@ import {
 } from '../interfaces/signaling-participant.interface';
 import { SignalingRealtimeService } from '../realtime/signaling-realtime.service';
 import {
+  TechnicianRealtimeService,
+  technicianRoom,
+} from '../realtime/technician-realtime.service';
+import {
   REMOTE_SESSION_JOIN_EVENT,
   WEBRTC_ANSWER_EVENT,
   WEBRTC_ICE_CANDIDATE_EVENT,
@@ -86,9 +90,16 @@ type TechnicianNamespace = Namespace<
 /**
  * Conexion realtime de la aplicacion del tecnico (Flutter Web).
  *
- * Existe unicamente para el signaling de WebRTC: aqui NO se lleva presencia de
- * tecnicos ni se persiste nada. Todo el trabajo lo hace `SignalingService`; este
- * gateway solo autentica el socket y traduce eventos de Socket.IO.
+ * Aqui NO se lleva presencia de tecnicos ni se persiste nada: el gateway solo
+ * autentica el socket, lo mete en su room personal y traduce eventos de
+ * Socket.IO. El signaling entero lo resuelve `SignalingService`.
+ *
+ * Sirve para dos cosas distintas que conviene no confundir:
+ *
+ * - el signaling de WebRTC, sobre la room `remote-session:<id>`, a la que solo
+ *   se entra con `remote-session:join`;
+ * - los avisos de dominio dirigidos al tecnico (hoy `remote-session:closed`),
+ *   sobre su room personal, en la que entra al conectarse.
  *
  * CORS: el servidor de Socket.IO es uno solo para todos los namespaces, asi que
  * la configuracion no va en este decorador sino en el adaptador que instala
@@ -113,6 +124,8 @@ export class TechniciansGateway
     private readonly authService: AuthService,
     private readonly signalingService: SignalingService,
     private readonly signalingRealtimeService: SignalingRealtimeService,
+
+    private readonly technicianRealtimeService: TechnicianRealtimeService,
   ) {}
 
   /**
@@ -126,6 +139,10 @@ export class TechniciansGateway
     // tecnicos de una sesion sin conocer este gateway.
     this.signalingRealtimeService.bindTechnicianNamespace(namespace);
 
+    // Y por el mismo mecanismo, los modulos de dominio pueden avisar a un
+    // tecnico concreto (`remote-session:closed`) sin conocer Socket.IO.
+    this.technicianRealtimeService.bind(namespace);
+
     namespace.use((socket, next) => {
       void this.authenticate(socket).then(
         () => next(),
@@ -134,7 +151,7 @@ export class TechniciansGateway
     });
   }
 
-  handleConnection(client: TechnicianSocket): void {
+  async handleConnection(client: TechnicianSocket): Promise<void> {
     const context = client.data.technician;
 
     // Sin identidad no paso por el middleware: no deberia ocurrir.
@@ -142,6 +159,12 @@ export class TechniciansGateway
       client.disconnect(true);
       return;
     }
+
+    // Room personal del tecnico, decidida por el servidor a partir del token
+    // validado: el cliente no puede elegir la de otro usuario. Es infraestructura
+    // interna y no forma parte del contrato publico; existe para que un aviso de
+    // dominio le llegue aunque todavia no haya hecho `remote-session:join`.
+    await client.join(technicianRoom(context.userId));
 
     this.logger.log(`Technician connected: ${context.userId}`);
   }

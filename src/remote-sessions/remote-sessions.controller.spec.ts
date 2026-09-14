@@ -2,6 +2,7 @@ import {
   CanActivate,
   ExecutionContext,
   INestApplication,
+  UnauthorizedException,
   ValidationPipe,
 } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
@@ -10,7 +11,6 @@ import { randomUUID } from 'crypto';
 import { Server } from 'http';
 import * as request from 'supertest';
 import { User } from '../auth/entities/user.entity';
-import { UserRoleGuard } from '../auth/guards/user-role.guard';
 import { ValidRoles } from '../auth/interfaces/valid-roles';
 import { DeviceJwtGuard } from '../devices/auth/guards/device-jwt.guard';
 import { Device } from '../devices/entities/device.entity';
@@ -22,8 +22,12 @@ import { RemoteSessionsService } from './remote-sessions.service';
  * Cableado HTTP de los dos controladores de sesiones remotas.
  *
  * Lo que se comprueba es el enrutado, de que identidad sale cada parametro y
- * que el body no pueda sugerir un dispositivo o un tecnico. La autenticacion se
- * sustituye por guards de prueba: el JWT no es el asunto aqui.
+ * que el body no pueda sugerir un dispositivo o un tecnico.
+ *
+ * La firma del JWT no es el asunto aqui, asi que se sustituye por un guard que
+ * traduce un bearer conocido en un usuario, igual que en `AuthController`. El
+ * `UserRoleGuard` en cambio es el de verdad: los roles que exige `@Auth()` si
+ * forman parte del contrato de estas rutas.
  */
 
 const device: Device = {
@@ -39,16 +43,34 @@ const device: Device = {
   updatedAt: new Date(),
 };
 
-const technician: User = {
-  id: randomUUID(),
-  email: 'ana@acme.com',
-  password: 'hash-que-nunca-debe-salir',
-  fullName: 'Ana Tecnica',
-  isActive: true,
-  roles: [ValidRoles.tecnico],
-  created_at: new Date(),
-  updated_at: new Date(),
-} as User;
+const buildUser = (fullName: string, roles: ValidRoles[]): User =>
+  ({
+    id: randomUUID(),
+    email: `${fullName.toLowerCase().replace(/ /g, '.')}@acme.com`,
+    password: 'hash-que-nunca-debe-salir',
+    fullName,
+    isActive: true,
+    roles,
+    created_at: new Date(),
+    updated_at: new Date(),
+  }) as User;
+
+const technician = buildUser('Ana Tecnica', [ValidRoles.tecnico]);
+const admin = buildUser('Admin Total', [ValidRoles.admin]);
+const plainUser = buildUser('Usuario Normal', [ValidRoles.user]);
+
+const TECNICO_TOKEN = 'tecnico-token';
+const ADMIN_TOKEN = 'admin-token';
+const USER_TOKEN = 'user-token';
+
+const usersByToken: Record<string, User> = {
+  [TECNICO_TOKEN]: technician,
+  [ADMIN_TOKEN]: admin,
+  [USER_TOKEN]: plainUser,
+};
+
+/** Cabecera de un tecnico autenticado. */
+const asTechnician = { Authorization: `Bearer ${TECNICO_TOKEN}` };
 
 /** Deja el dispositivo autenticado donde lo espera `@GetDevice()`. */
 class FakeDeviceGuard implements CanActivate {
@@ -59,10 +81,22 @@ class FakeDeviceGuard implements CanActivate {
   }
 }
 
-/** Deja el usuario autenticado donde lo espera `@GetUser()`. */
-class FakeUserGuard implements CanActivate {
+/**
+ * Reemplaza a Passport: sin bearer conocido responde `401`, igual que la
+ * estrategia real. Deja el usuario donde lo esperan `@GetUser()` y
+ * `UserRoleGuard`.
+ */
+class FakeUserAuthGuard implements CanActivate {
   canActivate(context: ExecutionContext): boolean {
-    context.switchToHttp().getRequest<{ user?: User }>().user = technician;
+    const req = context
+      .switchToHttp()
+      .getRequest<{ headers: Record<string, string>; user?: User }>();
+
+    const user = usersByToken[(req.headers.authorization ?? '').slice(7)];
+
+    if (!user) throw new UnauthorizedException('Token not valid');
+
+    req.user = user;
 
     return true;
   }
@@ -78,6 +112,7 @@ describe('RemoteSessions controllers (HTTP)', () => {
     closeByTechnician: jest.fn(),
     findCurrentForDevice: jest.fn(),
     closeByDevice: jest.fn(),
+    findCurrentForTechnician: jest.fn(),
   };
 
   beforeAll(async () => {
@@ -90,10 +125,9 @@ describe('RemoteSessions controllers (HTTP)', () => {
     })
       .overrideGuard(DeviceJwtGuard)
       .useClass(FakeDeviceGuard)
+      // El guard de roles se deja el real: es justo lo que se quiere comprobar.
       .overrideGuard(AuthGuard())
-      .useClass(FakeUserGuard)
-      .overrideGuard(UserRoleGuard)
-      .useValue({ canActivate: () => true })
+      .useClass(FakeUserAuthGuard)
       .compile();
 
     app = moduleRef.createNestApplication();
@@ -122,6 +156,7 @@ describe('RemoteSessions controllers (HTTP)', () => {
 
       await request(server)
         .post('/remote-sessions')
+        .set(asTechnician)
         .send({ supportRequestId })
         .expect(201);
 
@@ -134,6 +169,7 @@ describe('RemoteSessions controllers (HTTP)', () => {
     it('rechaza un body que intente elegir dispositivo o tecnico', async () => {
       await request(server)
         .post('/remote-sessions')
+        .set(asTechnician)
         .send({
           supportRequestId: randomUUID(),
           deviceId: randomUUID(),
@@ -147,6 +183,7 @@ describe('RemoteSessions controllers (HTTP)', () => {
     it('rechaza un supportRequestId que no es UUID', async () => {
       await request(server)
         .post('/remote-sessions')
+        .set(asTechnician)
         .send({ supportRequestId: 'no-es-uuid' })
         .expect(400);
 
@@ -158,7 +195,10 @@ describe('RemoteSessions controllers (HTTP)', () => {
 
       remoteSessionsService.findOneForTechnician.mockResolvedValue({ id });
 
-      await request(server).get(`/remote-sessions/${id}`).expect(200);
+      await request(server)
+        .get(`/remote-sessions/${id}`)
+        .set(asTechnician)
+        .expect(200);
 
       expect(remoteSessionsService.findOneForTechnician).toHaveBeenCalledWith(
         id,
@@ -171,7 +211,10 @@ describe('RemoteSessions controllers (HTTP)', () => {
 
       remoteSessionsService.closeByTechnician.mockResolvedValue({});
 
-      await request(server).post(`/remote-sessions/${id}/close`).expect(200);
+      await request(server)
+        .post(`/remote-sessions/${id}/close`)
+        .set(asTechnician)
+        .expect(200);
 
       expect(remoteSessionsService.closeByTechnician).toHaveBeenCalledWith(
         id,
@@ -179,8 +222,92 @@ describe('RemoteSessions controllers (HTTP)', () => {
       );
     });
 
+    it('devuelve la sesion actual del tecnico del token', async () => {
+      remoteSessionsService.findCurrentForTechnician.mockResolvedValue({
+        remoteSession: null,
+      });
+
+      await request(server)
+        .get('/remote-sessions/current')
+        .set(asTechnician)
+        .expect(200, { remoteSession: null });
+
+      // Solo el id del token: no hay ningun parametro de tecnico que pudiera
+      // llegar del cliente.
+      expect(
+        remoteSessionsService.findCurrentForTechnician,
+      ).toHaveBeenCalledWith(technician.id);
+    });
+
+    it('no deja que /current entre por la ruta /:id', async () => {
+      remoteSessionsService.findCurrentForTechnician.mockResolvedValue({
+        remoteSession: null,
+      });
+
+      await request(server)
+        .get('/remote-sessions/current')
+        .set(asTechnician)
+        .expect(200);
+
+      // Si `:id` ganara, `current` no seria un UUID y esto acabaria en 400.
+      expect(remoteSessionsService.findOneForTechnician).not.toHaveBeenCalled();
+    });
+
+    it('ignora un technicianId sugerido por query', async () => {
+      remoteSessionsService.findCurrentForTechnician.mockResolvedValue({
+        remoteSession: null,
+      });
+
+      await request(server)
+        .get(`/remote-sessions/current?technicianId=${randomUUID()}`)
+        .set(asTechnician)
+        .expect(200);
+
+      expect(
+        remoteSessionsService.findCurrentForTechnician,
+      ).toHaveBeenCalledWith(technician.id);
+    });
+
+    it('responde 401 sin token', async () => {
+      await request(server).get('/remote-sessions/current').expect(401);
+
+      expect(
+        remoteSessionsService.findCurrentForTechnician,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('responde 403 a un rol que no es admin ni tecnico', async () => {
+      await request(server)
+        .get('/remote-sessions/current')
+        .set({ Authorization: `Bearer ${USER_TOKEN}` })
+        .expect(403);
+
+      expect(
+        remoteSessionsService.findCurrentForTechnician,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('deja que un admin recupere su propia sesion actual', async () => {
+      remoteSessionsService.findCurrentForTechnician.mockResolvedValue({
+        remoteSession: null,
+      });
+
+      await request(server)
+        .get('/remote-sessions/current')
+        .set({ Authorization: `Bearer ${ADMIN_TOKEN}` })
+        .expect(200);
+
+      // El admin tampoco consulta en nombre de otro: su propio id.
+      expect(
+        remoteSessionsService.findCurrentForTechnician,
+      ).toHaveBeenCalledWith(admin.id);
+    });
+
     it('responde 400 cuando el :id del tecnico no es un UUID', async () => {
-      await request(server).get('/remote-sessions/no-es-uuid').expect(400);
+      await request(server)
+        .get('/remote-sessions/no-es-uuid')
+        .set(asTechnician)
+        .expect(400);
 
       expect(remoteSessionsService.findOneForTechnician).not.toHaveBeenCalled();
     });

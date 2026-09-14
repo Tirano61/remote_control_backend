@@ -4,8 +4,11 @@ import { getDataSourceToken, getEntityManagerToken } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { DevicesModule } from '../devices/devices.module';
 import { DevicesGateway } from '../devices/gateway/devices.gateway';
+import { RemoteSessionsModule } from '../remote-sessions/remote-sessions.module';
+import { RemoteSessionsService } from '../remote-sessions/remote-sessions.service';
 import { TechniciansGateway } from './gateway/technicians.gateway';
 import { SignalingRealtimeService } from './realtime/signaling-realtime.service';
+import { TechnicianRealtimeService } from './realtime/technician-realtime.service';
 import { SignalingModule } from './signaling.module';
 import { SignalingService } from './signaling.service';
 
@@ -70,6 +73,21 @@ describe('SignalingModule (cableado)', () => {
     expect(
       moduleRef.get(SignalingRealtimeService, { strict: false }),
     ).toBeInstanceOf(SignalingRealtimeService);
+
+    await moduleRef.close();
+  });
+
+  it('deja que RemoteSessionsModule avise a un tecnico sin importar el signaling', async () => {
+    const moduleRef = await Test.createTestingModule({
+      imports: [FakeDatabaseModule, RemoteSessionsModule],
+    }).compile();
+
+    // Solo se resuelve si `TechnicianRealtimeModule` exporta el servicio y es
+    // realmente independiente de `SignalingModule`.
+    expect(moduleRef.get(RemoteSessionsService)).toBeDefined();
+    expect(
+      moduleRef.get(TechnicianRealtimeService, { strict: false }),
+    ).toBeInstanceOf(TechnicianRealtimeService);
 
     await moduleRef.close();
   });
