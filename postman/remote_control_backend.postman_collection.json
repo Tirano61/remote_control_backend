@@ -1,0 +1,1377 @@
+{
+  "info": {
+    "_postman_id": "846f6c90-5271-4858-83c8-d616d8da10ab",
+    "name": "remote_control_backend",
+    "description": "Manual end-to-end testing of remote_control_backend.\n\nThe contract this collection follows is docs/ENDPOINTS.md. If a request here\never disagrees with that file, the file wins and the collection is the one to\nfix.\n\n## Before starting\n\n1. Run the backend (`npm run start:dev`).\n2. Create the first administrator with `npm run bootstrap:admin`.\n3. Import the environment `remote_control_backend.postman_environment.json`\n   and select it.\n4. Set `baseUrl`, `userEmail` and `userPassword` there. No password is stored\n   in this collection.\n\n## End-to-end flow\n\n```text\n01  Login user                              (01 - Authentication)\n02  Create device                           (02 - Devices)\n03  Generate enrollment                     (02 - Devices)\n04  Activate device                         (03 - Device enrollment ...)\n05  Device login                            (03 - Device enrollment ...)\n06  Device check-status                     (03 - Device enrollment ...)\n07  Create support request                  (04 - Support requests - Device)\n08  List support requests (status=WAITING)  (05 - Support requests - Technician)\n09  Assign support request                  (05 - Support requests - Technician)\n10  Accept support request                  (04 - Support requests - Device)\n11  Create remote session                   (06 - Remote sessions)\n12  Get current remote session - Device     (06 - Remote sessions)\n13  Close remote session                    (06 - Remote sessions)\n```\n\nStep 09 requires the device to be ONLINE, and step 11 depends on step 09. A\ndevice is ONLINE only while it holds an open Socket.IO connection to the\n/devices namespace, which no HTTP request can create: without the Flutter app\n(or another Socket.IO client) connected with the Device JWT, \"Assign support\nrequest\" answers 409 and the flow stops there.\n\n## Realtime\n\nThe two Socket.IO namespaces\n\n```text\n/devices\n/technicians\n```\n\nare documented in docs/REALTIME.md. They are not representable as HTTP requests\nand are deliberately absent from this collection — there are no fake REST calls\nfor presence, signaling or WebRTC here.\n\n## Authentication\n\nNothing is inherited: every request carries its own Authorization header, either\n`Bearer {{userToken}}` (technician/admin) or `Bearer {{deviceToken}}` (tablet).\nThe two token types are signed with different secrets and are never\ninterchangeable.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "noauth"
+  },
+  "item": [
+    {
+      "name": "01 - Authentication",
+      "description": "Technician/user identity (User JWT). See docs/ENDPOINTS.md — \"Authentication — Web\".\n\nRun \"Login user\" first: every request in folders 02, 05 and 06 needs the\n{{userToken}} it stores.",
+      "item": [
+        {
+          "name": "Login user",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The account is active', function () {",
+                  "    pm.expect(body.isActive).to.eql(true);",
+                  "  });",
+                  "",
+                  "  pm.test('Response carries a user token', function () {",
+                  "    pm.expect(body.token).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "",
+                  "  if (typeof body.token === 'string' && body.token.length > 0) {",
+                  "    pm.environment.set('userToken', body.token);",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "login"
+              ]
+            },
+            "description": "Step 01 of the end-to-end flow.\n\nPublic endpoint. Answers 200 (not 201): logging in does not create a resource.\n\nFill {{userEmail}} and {{userPassword}} in the environment with the administrator\ncreated by `npm run bootstrap:admin`. No password is stored in this collection.\n\nStores: userToken.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{userEmail}}\",\n  \"password\": \"{{userPassword}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Check user status",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('Response carries a renewed user token', function () {",
+                  "    pm.expect(body.token).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "",
+                  "  if (typeof body.token === 'string' && body.token.length > 0) {",
+                  "    pm.environment.set('userToken', body.token);",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/check-status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "check-status"
+              ]
+            },
+            "description": "Validates the current User JWT and returns the user with a renewed token.\nThe stored {{userToken}} is replaced with the renewed one.\n\nStores: userToken."
+          },
+          "response": []
+        },
+        {
+          "name": "Register user",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 201', function () {",
+                  "  pm.response.to.have.status(201);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 201) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The created account is active', function () {",
+                  "    pm.expect(body.isActive).to.eql(true);",
+                  "  });",
+                  "",
+                  "  pm.test('The password is never returned', function () {",
+                  "    pm.expect(body).to.not.have.property('password');",
+                  "  });",
+                  "",
+                  "  pm.test('The created user has an id', function () {",
+                  "    pm.expect(body.id).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/register",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "register"
+              ]
+            },
+            "description": "Administrative user creation. Requires an admin token: a `tecnico` gets 403.\n\nThe `token` in the response belongs to the CREATED user, not to the admin who\nmade the call, so this request deliberately does not overwrite {{userToken}}.\n\nThe password in the body is a throwaway example value for local testing.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"tecnico@example.com\",\n  \"password\": \"Abc12345\",\n  \"fullName\": \"Ana Torres\",\n  \"roles\": [\n    \"tecnico\"\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "02 - Devices",
+      "description": "Administrative device management. User JWT with role admin or tecnico.\nThe tablet never calls these routes.",
+      "item": [
+        {
+          "name": "Create device",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 201', function () {",
+                  "  pm.response.to.have.status(201);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 201) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('Response carries the device id', function () {",
+                  "    pm.expect(body.id).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "",
+                  "  if (typeof body.id === 'string' && body.id.length > 0) {",
+                  "    pm.environment.set('deviceId', body.id);",
+                  "  }",
+                  "",
+                  "  pm.test('Response carries the public id', function () {",
+                  "    pm.expect(body.publicId).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "",
+                  "  if (typeof body.publicId === 'string' && body.publicId.length > 0) {",
+                  "    pm.environment.set('publicId', body.publicId);",
+                  "  }",
+                  "",
+                  "  pm.test('A new device is enabled and offline', function () {",
+                  "    pm.expect(body.isActive).to.eql(true);",
+                  "    pm.expect(body.isOnline).to.eql(false);",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/devices",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "devices"
+              ]
+            },
+            "description": "Step 02 of the end-to-end flow.\n\nAll fields are optional; an empty body {} is accepted. The backend generates\nid and publicId. The device is created with no credential: it cannot\nauthenticate until it is enrolled.\n\nStores: deviceId, publicId.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Tablet Tolva 01\",\n  \"manufacturer\": \"Samsung\",\n  \"model\": \"SM-X210\",\n  \"androidVersion\": \"14\",\n  \"appVersion\": \"1.0.0\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "List devices",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The response is an array', function () {",
+                  "    pm.expect(body).to.be.an('array');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/devices",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "devices"
+              ]
+            },
+            "description": "All devices, newest first. Each row carries its realtime isOnline."
+          },
+          "response": []
+        },
+        {
+          "name": "Get device",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('It is the requested device', function () {",
+                  "    pm.expect(body.id).to.eql(pm.environment.get('deviceId'));",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/devices/{{deviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "devices",
+                "{{deviceId}}"
+              ]
+            },
+            "description": "One device by its UUID. A non-UUID id returns 400 before the handler runs."
+          },
+          "response": []
+        },
+        {
+          "name": "Update device",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The name was updated', function () {",
+                  "    pm.expect(body.name).to.eql('Tablet Tolva 02');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/devices/{{deviceId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "devices",
+                "{{deviceId}}"
+              ]
+            },
+            "description": "Updates the administrative fields of a device. Only the properties present in\nthe body are applied. id, publicId, createdAt and updatedAt are rejected.\n\nThis body only renames the device on purpose. Sending \"isActive\": false also\nforce-closes every open Socket.IO connection of the device and makes all its\nREST calls fail with 401, which would interrupt the end-to-end flow.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Tablet Tolva 02\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Generate enrollment",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 201', function () {",
+                  "  pm.response.to.have.status(201);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 201) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('Response carries the enrollment code', function () {",
+                  "    pm.expect(body.enrollmentCode).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "",
+                  "  if (typeof body.enrollmentCode === 'string' && body.enrollmentCode.length > 0) {",
+                  "    pm.environment.set('enrollmentCode', body.enrollmentCode);",
+                  "  }",
+                  "",
+                  "  pm.test('Response carries the device id', function () {",
+                  "    pm.expect(body.deviceId).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "",
+                  "  if (typeof body.deviceId === 'string' && body.deviceId.length > 0) {",
+                  "    pm.environment.set('deviceId', body.deviceId);",
+                  "  }",
+                  "",
+                  "  pm.test('Response carries the public id', function () {",
+                  "    pm.expect(body.publicId).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "",
+                  "  if (typeof body.publicId === 'string' && body.publicId.length > 0) {",
+                  "    pm.environment.set('publicId', body.publicId);",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/devices/{{deviceId}}/enrollment",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "devices",
+                "{{deviceId}}",
+                "enrollment"
+              ]
+            },
+            "description": "Step 03 of the end-to-end flow.\n\nGenerates the 6-digit activation code the technician reads out to the user of\nthe tablet. Issuing a new code revokes every previous pending code of that\ndevice. The code travels in clear text once, in this response only; it expires\nin 30 minutes and is single-use.\n\nStores: enrollmentCode, deviceId, publicId."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "03 - Device enrollment and authentication",
+      "description": "The tablet identity. Activation is public (the enrollment code is what\nauthorises it) and everything afterwards uses the Device JWT, which is signed\nwith a different secret than the user one and is never interchangeable with it.",
+      "item": [
+        {
+          "name": "Activate device",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The device was activated', function () {",
+                  "    pm.expect(body.activated).to.eql(true);",
+                  "  });",
+                  "",
+                  "  pm.test('Response carries the device secret', function () {",
+                  "    pm.expect(body.deviceSecret).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "",
+                  "  if (typeof body.deviceSecret === 'string' && body.deviceSecret.length > 0) {",
+                  "    pm.environment.set('deviceSecret', body.deviceSecret);",
+                  "  }",
+                  "",
+                  "  pm.test('Response carries the device id', function () {",
+                  "    pm.expect(body.deviceId).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "",
+                  "  if (typeof body.deviceId === 'string' && body.deviceId.length > 0) {",
+                  "    pm.environment.set('deviceId', body.deviceId);",
+                  "  }",
+                  "",
+                  "  pm.test('Response carries the public id', function () {",
+                  "    pm.expect(body.publicId).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "",
+                  "  if (typeof body.publicId === 'string' && body.publicId.length > 0) {",
+                  "    pm.environment.set('publicId', body.publicId);",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/device-enrollment/activate",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "device-enrollment",
+                "activate"
+              ]
+            },
+            "description": "Step 04 of the end-to-end flow.\n\nPublic endpoint. Exchanges publicId + code for the permanent deviceSecret,\nwhich is delivered once and only here. Every rejection reason answers the same\n401 on purpose.\n\nStores: deviceSecret, deviceId, publicId.\n\nSecurity note: deviceSecret is written to the Postman environment because this\ncollection is a local testing tool. It is never logged to the console.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"publicId\": \"{{publicId}}\",\n  \"code\": \"{{enrollmentCode}}\",\n  \"manufacturer\": \"Samsung\",\n  \"model\": \"SM-X210\",\n  \"androidVersion\": \"14\",\n  \"appVersion\": \"1.0.0\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Device login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('Response carries a device token', function () {",
+                  "    pm.expect(body.token).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "",
+                  "  if (typeof body.token === 'string' && body.token.length > 0) {",
+                  "    pm.environment.set('deviceToken', body.token);",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/device-auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "device-auth",
+                "login"
+              ]
+            },
+            "description": "Step 05 of the end-to-end flow.\n\nExchanges the permanent deviceSecret for a Device JWT (24h by default).\npublicId is not accepted here: it does not authenticate. Answers 200.\n\nStores: deviceToken.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"deviceId\": \"{{deviceId}}\",\n  \"deviceSecret\": \"{{deviceSecret}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Device check-status",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('It is the authenticated device', function () {",
+                  "    pm.expect(body.id).to.eql(pm.environment.get('deviceId'));",
+                  "  });",
+                  "",
+                  "  pm.test('No token is renewed here', function () {",
+                  "    pm.expect(body).to.not.have.property('token');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{deviceToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/device-auth/check-status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "device-auth",
+                "check-status"
+              ]
+            },
+            "description": "Step 06 of the end-to-end flow.\n\nValidates the current Device JWT. Unlike GET /auth/check-status it does NOT\nrenew the token; renewal is done through POST /device-auth/login."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "04 - Support requests - Device",
+      "description": "Device JWT. The device identity always comes from the token: no endpoint in\nthis group accepts a deviceId.\n\nAccept, Reject and Cancel are alternative outcomes, not consecutive steps. The\nmain flow uses Accept.",
+      "item": [
+        {
+          "name": "Create support request",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 201', function () {",
+                  "  pm.response.to.have.status(201);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 201) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The request starts WAITING', function () {",
+                  "    pm.expect(body.status).to.eql('WAITING');",
+                  "  });",
+                  "",
+                  "  pm.test('Response carries the support request id', function () {",
+                  "    pm.expect(body.id).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "",
+                  "  if (typeof body.id === 'string' && body.id.length > 0) {",
+                  "    pm.environment.set('supportRequestId', body.id);",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{deviceToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/support-requests",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "support-requests"
+              ]
+            },
+            "description": "Step 07 of the end-to-end flow.\n\nThe user of the tablet presses \"request assistance\". Empty body. A device may\nhave only one active request (WAITING, ASSIGNED, ACCEPTED) at a time; a second\none answers 409.\n\nStores: supportRequestId."
+          },
+          "response": []
+        },
+        {
+          "name": "Get current support request",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The response carries the supportRequest field', function () {",
+                  "    pm.expect(body).to.have.property('supportRequest');",
+                  "  });",
+                  "",
+                  "  if (body.supportRequest) {",
+                  "    pm.test('The active request has an id', function () {",
+                  "      pm.expect(body.supportRequest.id).to.be.a('string').and.to.not.be.empty;",
+                  "    });",
+                  "",
+                  "    if (typeof body.supportRequest.id === 'string' && body.supportRequest.id.length > 0) {",
+                  "      pm.environment.set('supportRequestId', body.supportRequest.id);",
+                  "    }",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{deviceToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/support-requests/current",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "support-requests",
+                "current"
+              ]
+            },
+            "description": "How the tablet recovers state after a restart, a reconnection or a missed\nSocket.IO event. Having no active request is normal and answers 200 with\n{ \"supportRequest\": null }, not 404.\n\nStores: supportRequestId, when there is an active request."
+          },
+          "response": []
+        },
+        {
+          "name": "Accept support request",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The request is ACCEPTED', function () {",
+                  "    pm.expect(body.status).to.eql('ACCEPTED');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{deviceToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/support-requests/{{supportRequestId}}/accept",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "support-requests",
+                "{{supportRequestId}}",
+                "accept"
+              ]
+            },
+            "description": "Step 10 of the end-to-end flow.\n\nThe user authorises the assigned technician: ASSIGNED -> ACCEPTED. Empty body.\nACCEPTED does not create a remote session; the technician still has to call\nPOST /remote-sessions."
+          },
+          "response": []
+        },
+        {
+          "name": "Reject support request",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The request is REJECTED', function () {",
+                  "    pm.expect(body.status).to.eql('REJECTED');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{deviceToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/support-requests/{{supportRequestId}}/reject",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "support-requests",
+                "{{supportRequestId}}",
+                "reject"
+              ]
+            },
+            "description": "Alternative to Accept: the user refuses the assigned technician.\nASSIGNED -> REJECTED, terminal. Only valid from ASSIGNED; anything else is 409."
+          },
+          "response": []
+        },
+        {
+          "name": "Cancel support request",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The request is CANCELLED', function () {",
+                  "    pm.expect(body.status).to.eql('CANCELLED');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{deviceToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/support-requests/{{supportRequestId}}/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "support-requests",
+                "{{supportRequestId}}",
+                "cancel"
+              ]
+            },
+            "description": "The user withdraws the request. Allowed from WAITING, ASSIGNED and ACCEPTED.\n\nOnce a live RemoteSession exists, cancelling is refused with 409: the tablet\nmust close the session with POST /device/remote-sessions/:id/close instead."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "05 - Support requests - Technician",
+      "description": "User JWT with role admin or tecnico. Reading the queue is not ownership-scoped.",
+      "item": [
+        {
+          "name": "List support requests",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The response is an array', function () {",
+                  "    pm.expect(body).to.be.an('array');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/support-requests?status=WAITING",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "support-requests"
+              ],
+              "query": [
+                {
+                  "key": "status",
+                  "value": "WAITING"
+                }
+              ]
+            },
+            "description": "Step 08 of the end-to-end flow.\n\nThe queue, oldest first, with the device and its realtime isOnline. Remove the\nstatus query parameter to get every request; an unknown value is a 400, not an\nempty list."
+          },
+          "response": []
+        },
+        {
+          "name": "Get support request",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('It is the requested support request', function () {",
+                  "    pm.expect(body.id).to.eql(pm.environment.get('supportRequestId'));",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/support-requests/{{supportRequestId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "support-requests",
+                "{{supportRequestId}}"
+              ]
+            },
+            "description": "One support request by id. Any admin/tecnico can read any request."
+          },
+          "response": []
+        },
+        {
+          "name": "Assign support request",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The request is ASSIGNED', function () {",
+                  "    pm.expect(body.status).to.eql('ASSIGNED');",
+                  "  });",
+                  "",
+                  "  pm.test('The technician comes from the token', function () {",
+                  "    pm.expect(body.technicianId).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/support-requests/{{supportRequestId}}/assign",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "support-requests",
+                "{{supportRequestId}}",
+                "assign"
+              ]
+            },
+            "description": "Step 09 of the end-to-end flow.\n\nThe technician takes the request: WAITING -> ASSIGNED. Empty body on purpose —\ntechnicianId is not accepted, the technician is the authenticated user.\n\nRequires the device to be ONLINE (connected to the /devices Socket.IO\nnamespace); an offline device answers 409 and the request stays WAITING."
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "06 - Remote sessions",
+      "description": "The technician routes are mounted under /remote-sessions (User JWT) and the\ndevice ones under /device/remote-sessions (Device JWT).\n\nEvery technician route is ownership-scoped: the session must belong to the\nauthenticated technician. Being admin is not an exemption — it answers 404 like\nanybody else.\n\nThe two close requests are alternatives: whoever closes first wins and the\nother side gets 409.",
+      "item": [
+        {
+          "name": "Create remote session - Technician",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 201', function () {",
+                  "  pm.response.to.have.status(201);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 201) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The session starts CONNECTING', function () {",
+                  "    pm.expect(body.status).to.eql('CONNECTING');",
+                  "  });",
+                  "",
+                  "  pm.test('Response carries the remote session id', function () {",
+                  "    pm.expect(body.id).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "",
+                  "  if (typeof body.id === 'string' && body.id.length > 0) {",
+                  "    pm.environment.set('remoteSessionId', body.id);",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json",
+                "type": "text"
+              },
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/remote-sessions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "remote-sessions"
+              ]
+            },
+            "description": "Step 11 of the end-to-end flow.\n\nOnly an ACCEPTED request assigned to this technician authorises remote control.\nsupportRequestId is the only accepted field: sending deviceId or technicianId\nfails with 400.\n\nStores: remoteSessionId.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"supportRequestId\": \"{{supportRequestId}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get remote session - Technician",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('It is the requested session', function () {",
+                  "    pm.expect(body.id).to.eql(pm.environment.get('remoteSessionId'));",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/remote-sessions/{{remoteSessionId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "remote-sessions",
+                "{{remoteSessionId}}"
+              ]
+            },
+            "description": "The session by id, closed ones included. This is how the web app detects that\nthe device closed the session, since no realtime event is sent to the\ntechnician namespace for that."
+          },
+          "response": []
+        },
+        {
+          "name": "Get current remote session - Device",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The response carries the remoteSession field', function () {",
+                  "    pm.expect(body).to.have.property('remoteSession');",
+                  "  });",
+                  "",
+                  "  if (body.remoteSession) {",
+                  "    pm.test('The live session has an id', function () {",
+                  "      pm.expect(body.remoteSession.id).to.be.a('string').and.to.not.be.empty;",
+                  "    });",
+                  "",
+                  "    if (typeof body.remoteSession.id === 'string' && body.remoteSession.id.length > 0) {",
+                  "      pm.environment.set('remoteSessionId', body.remoteSession.id);",
+                  "    }",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{deviceToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/device/remote-sessions/current",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "device",
+                "remote-sessions",
+                "current"
+              ]
+            },
+            "description": "Step 12 of the end-to-end flow.\n\nThe live session of the authenticated device, or { \"remoteSession\": null }.\n\"Live\" means CONNECTING or ACTIVE; a CLOSED session is never returned here.\n\nStores: remoteSessionId, when there is a live session."
+          },
+          "response": []
+        },
+        {
+          "name": "Close remote session - Technician",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The session is closed by the technician', function () {",
+                  "    pm.expect(body.status).to.eql('CLOSED');",
+                  "    pm.expect(body.endedBy).to.eql('TECHNICIAN');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/remote-sessions/{{remoteSessionId}}/close",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "remote-sessions",
+                "{{remoteSessionId}}",
+                "close"
+              ]
+            },
+            "description": "Step 13 of the end-to-end flow.\n\nThe technician ends the assistance: the session becomes CLOSED with\nendedBy TECHNICIAN and its support request becomes COMPLETED in the same\ntransaction. Emits remote-session:closed to the device."
+          },
+          "response": []
+        },
+        {
+          "name": "Close remote session - Device",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The session is closed by the device', function () {",
+                  "    pm.expect(body.status).to.eql('CLOSED');",
+                  "    pm.expect(body.endedBy).to.eql('DEVICE');",
+                  "  });",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{deviceToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/device/remote-sessions/{{remoteSessionId}}/close",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "device",
+                "remote-sessions",
+                "{{remoteSessionId}}",
+                "close"
+              ]
+            },
+            "description": "Alternative to closing as the technician: the user of the tablet ends the\nassistance. CLOSED with endedBy DEVICE, and the support request becomes\nCOMPLETED in the same transaction. No Socket.IO event is emitted in this\ndirection; the technician re-reads GET /remote-sessions/:id."
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}

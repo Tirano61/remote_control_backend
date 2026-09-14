@@ -18,7 +18,9 @@
 		"test:cov": "jest --coverage",
 		"test:debug": "node --inspect-brk -r tsconfig-paths/register -r ts-node/register node_modules/.bin/jest --runInBand",
 		"test:e2e": "jest --config ./test/jest-e2e.json",
-		"migrate": "node -r tsconfig-paths/register -r reflect-metadata -r ts-node/register scripts/run-migrations.ts"
+		"migrate": "node -r tsconfig-paths/register -r reflect-metadata -r ts-node/register scripts/run-migrations.ts",
+		"bootstrap:admin": "node -r tsconfig-paths/register -r reflect-metadata -r ts-node/register scripts/bootstrap-admin.ts",
+		"reset:admin-password": "node -r tsconfig-paths/register -r reflect-metadata -r ts-node/register scripts/reset-admin-password.ts"
 	},
 	"dependencies": {
 		"@nestjs/common": "^11.0.1",

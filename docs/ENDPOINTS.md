@@ -195,9 +195,19 @@ Errors:
 ```
 
 Notes:
-Creating the **first** admin is not exposed through the API: it has to be done
-directly in the database. A reproducible bootstrap mechanism is a separate
-backend task and does not exist today.
+Creating the **first** admin is not exposed through the API and never will be: a
+public route able to create administrators would be a permanent open door. It is
+a local console operation run by whoever deploys the backend:
+
+```text
+npm run bootstrap:admin
+```
+
+It reads `BOOTSTRAP_ADMIN_EMAIL`, `BOOTSTRAP_ADMIN_PASSWORD` and
+`BOOTSTRAP_ADMIN_FULL_NAME` from the environment, and creates the account only
+if the database holds no administrator yet. It never promotes an existing
+account. Details in `postman/README.md`. No HTTP endpoint takes part in this and
+the Flutter clients are not involved.
 
 Changing the roles of an existing account, deactivating it or deleting it is
 also not exposed through the API yet.
