@@ -1,4 +1,8 @@
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import {
+  ConflictException,
+  InternalServerErrorException,
+  NotFoundException,
+} from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { randomUUID } from 'crypto';
@@ -25,6 +29,7 @@ import { TechnicianRealtimeService } from '../signaling/realtime/technician-real
 import { SupportRequestsService } from '../support-requests/support-requests.service';
 import {
   ACTIVE_REMOTE_SESSION_INDEX,
+  ACTIVE_TECHNICIAN_REMOTE_SESSION_INDEX,
   REMOTE_SESSION_SUPPORT_REQUEST_INDEX,
   RemoteSession,
 } from './entities/remote-session.entity';
@@ -50,8 +55,8 @@ import {
  * reproducen lo que en produccion garantiza PostgreSQL:
  *
  * - los indices unicos (una sesion por solicitud, una sesion viva por
- *   dispositivo, una solicitud activa por dispositivo), que fallan con
- *   `unique_violation` (23505);
+ *   dispositivo, una sesion viva por tecnico, una solicitud activa por
+ *   dispositivo), que fallan con `unique_violation` (23505);
  * - el UPDATE condicionado al estado actual, que devuelve cuantas filas cambio
  *   y es lo que decide los cierres simultaneos.
  *
@@ -271,7 +276,7 @@ class FakeSupportRequestRepository {
   }
 }
 
-/** Reproduce las dos unicidades de `remote_sessions`. */
+/** Reproduce las tres unicidades de `remote_sessions`. */
 class FakeRemoteSessionRepository {
   readonly rows: RemoteSession[] = [];
 
@@ -287,14 +292,27 @@ class FakeRemoteSessionRepository {
         uniqueViolation(REMOTE_SESSION_SUPPORT_REQUEST_INDEX),
       );
 
+    const isLive = ACTIVE_REMOTE_SESSION_STATUSES.includes(entity.status);
+
     const deviceIsBusy = others.some(
       (row) =>
         row.deviceId === entity.deviceId &&
         ACTIVE_REMOTE_SESSION_STATUSES.includes(row.status),
     );
 
-    if (deviceIsBusy && ACTIVE_REMOTE_SESSION_STATUSES.includes(entity.status))
+    if (deviceIsBusy && isLive)
       return Promise.reject(uniqueViolation(ACTIVE_REMOTE_SESSION_INDEX));
+
+    const technicianIsBusy = others.some(
+      (row) =>
+        row.technicianId === entity.technicianId &&
+        ACTIVE_REMOTE_SESSION_STATUSES.includes(row.status),
+    );
+
+    if (technicianIsBusy && isLive)
+      return Promise.reject(
+        uniqueViolation(ACTIVE_TECHNICIAN_REMOTE_SESSION_INDEX),
+      );
 
     const row: RemoteSession = {
       ...entity,
@@ -316,8 +334,8 @@ class FakeRemoteSessionRepository {
       matches(candidate, options.where),
     );
 
-    // Un tecnico puede tener varias sesiones vivas: el orden forma parte de la
-    // consulta, asi que el doble tambien tiene que aplicarlo.
+    // El orden forma parte de la consulta, asi que el doble tambien tiene que
+    // aplicarlo aunque hoy no pueda haber dos sesiones vivas del mismo tecnico.
     if (options.order?.createdAt)
       found.sort((a, b) =>
         options.order?.createdAt === 'DESC'
@@ -724,6 +742,132 @@ describe('RemoteSessionsService', () => {
     });
   });
 
+  describe('una sola sesion viva por tecnico', () => {
+    it('crea la sesion cuando el tecnico no tiene ninguna viva', async () => {
+      const supportRequestId = await seedAcceptedRequest(deviceA);
+
+      await expect(
+        service.create({ supportRequestId }, technicianA),
+      ).resolves.toMatchObject({ status: RemoteSessionStatus.CONNECTING });
+    });
+
+    it('rechaza una segunda sesion con una CONNECTING, aunque sea de otro dispositivo', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      const supportRequestId = await seedAcceptedRequest(deviceB, technicianA);
+
+      await expect(
+        service.create({ supportRequestId }, technicianA),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(remoteSessions.rows).toHaveLength(1);
+      expect(sessionRow(remoteSessionId).status).toBe(
+        RemoteSessionStatus.CONNECTING,
+      );
+      // La solicitud del segundo dispositivo no se toca: sigue ACCEPTED y el
+      // tecnico puede iniciarla en cuanto cierre la que tiene abierta.
+      expect(requestRow(supportRequestId).status).toBe(
+        SupportRequestStatus.ACCEPTED,
+      );
+      expect(emitToDevice).not.toHaveBeenCalled();
+    });
+
+    it('rechaza una segunda sesion con una ACTIVE', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      // Todavia no hay ningun camino que escriba ACTIVE: se fuerza la fila para
+      // comprobar que el estado tambien cuenta como vivo.
+      sessionRow(remoteSessionId).status = RemoteSessionStatus.ACTIVE;
+
+      const supportRequestId = await seedAcceptedRequest(deviceB, technicianA);
+
+      await expect(
+        service.create({ supportRequestId }, technicianA),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(remoteSessions.rows).toHaveLength(1);
+      expect(sessionRow(remoteSessionId).status).toBe(
+        RemoteSessionStatus.ACTIVE,
+      );
+    });
+
+    it('deja crear otra en cuanto la anterior queda CLOSED', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      await service.closeByTechnician(remoteSessionId, technicianA);
+
+      const supportRequestId = await seedAcceptedRequest(deviceB, technicianA);
+
+      // Sin ninguna limpieza intermedia: una fila CLOSED queda fuera del indice
+      // unico parcial.
+      await expect(
+        service.create({ supportRequestId }, technicianA),
+      ).resolves.toMatchObject({ status: RemoteSessionStatus.CONNECTING });
+
+      expect(remoteSessions.rows).toHaveLength(2);
+    });
+
+    it('no impide que otro tecnico abra la suya sobre otro dispositivo', async () => {
+      await seedSession();
+
+      const supportRequestId = await seedAcceptedRequest(deviceB, technicianB);
+
+      await expect(
+        service.create({ supportRequestId }, technicianB),
+      ).resolves.toMatchObject({ status: RemoteSessionStatus.CONNECTING });
+
+      expect(remoteSessions.rows).toHaveLength(2);
+    });
+
+    it('crea una sola cuando el mismo tecnico lanza dos simultaneas sobre dispositivos distintos', async () => {
+      const first = await seedAcceptedRequest(deviceA, technicianA);
+      const second = await seedAcceptedRequest(deviceB, technicianA);
+
+      // Dos solicitudes distintas: no compiten por la misma fila, asi que el
+      // lock no las ordena y las dos pasan la comprobacion previa. Lo unico que
+      // decide es el indice unico parcial por tecnico.
+      const results = await Promise.allSettled([
+        service.create({ supportRequestId: first }, technicianA),
+        service.create({ supportRequestId: second }, technicianA),
+      ]);
+
+      expect(
+        results.filter((result) => result.status === 'fulfilled'),
+      ).toHaveLength(1);
+
+      const rejected = results.filter((result) => result.status === 'rejected');
+
+      expect(rejected).toHaveLength(1);
+      // La violacion de la restriccion sale como 409, no como un 500 con el
+      // QueryFailedError dentro.
+      expect(rejected[0].reason).toBeInstanceOf(ConflictException);
+
+      expect(
+        remoteSessions.rows.filter(
+          (row) =>
+            row.technicianId === technicianA.id &&
+            ACTIVE_REMOTE_SESSION_STATUSES.includes(row.status),
+        ),
+      ).toHaveLength(1);
+      expect(emitToDevice).toHaveBeenCalledTimes(1);
+    });
+
+    it('no convierte en 409 un 23505 de otra restriccion', async () => {
+      const supportRequestId = await seedAcceptedRequest(deviceA);
+
+      jest
+        .spyOn(remoteSessions, 'save')
+        .mockRejectedValueOnce(uniqueViolation('IDX_de_otra_tabla'));
+
+      // Un unique_violation que no es ninguno de los tres indices de esta tabla
+      // no puede anunciarse como "ya hay una sesion": es un fallo que no
+      // sabemos interpretar.
+      await expect(
+        service.create({ supportRequestId }, technicianA),
+      ).rejects.toBeInstanceOf(InternalServerErrorException);
+    });
+  });
+
   describe('remote-session:created', () => {
     it('avisa solo al dispositivo de la sesion y con datos minimos', async () => {
       const supportRequestId = await seedAcceptedRequest(deviceA);
@@ -909,19 +1053,48 @@ describe('RemoteSessionsService', () => {
       ).resolves.toEqual({ remoteSession: null });
     });
 
-    it('devuelve la mas reciente si tiene varias vivas', async () => {
-      const { remoteSessionId: older } = await seedSession();
-      const newer = await seedSessionFor(deviceB, technicianA);
+    it('no puede tener mas de una viva que devolver', async () => {
+      const { remoteSessionId } = await seedSession();
 
-      // Las dos nacen en el mismo milisegundo: se separan a mano para que el
-      // orden sea comprobable.
-      sessionRow(older).createdAt = new Date(Date.now() - 60_000);
+      // Intentar abrir una segunda, sobre otro dispositivo, no deja al tecnico
+      // con dos sesiones entre las que elegir: responde 409.
+      const supportRequestId = await seedAcceptedRequest(deviceB, technicianA);
+
+      await expect(
+        service.create({ supportRequestId }, technicianA),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(
+        remoteSessions.rows.filter(
+          (row) =>
+            row.technicianId === technicianA.id &&
+            ACTIVE_REMOTE_SESSION_STATUSES.includes(row.status),
+        ),
+      ).toHaveLength(1);
 
       const { remoteSession } = await service.findCurrentForTechnician(
         technicianA.id,
       );
 
-      expect(remoteSession).toMatchObject({ id: newer });
+      expect(remoteSession).toMatchObject({ id: remoteSessionId });
+    });
+
+    it('devuelve la sesion nueva despues de cerrar la anterior', async () => {
+      const { remoteSessionId: closed } = await seedSession();
+
+      await service.closeByTechnician(closed, technicianA);
+
+      const supportRequestId = await seedAcceptedRequest(deviceB, technicianA);
+      const { id: current } = await service.create(
+        { supportRequestId },
+        technicianA,
+      );
+
+      const { remoteSession } = await service.findCurrentForTechnician(
+        technicianA.id,
+      );
+
+      expect(remoteSession).toMatchObject({ id: current });
     });
 
     it('calcula isOnline en el momento, sin persistirlo', async () => {

@@ -1128,9 +1128,21 @@
               "script": {
                 "type": "text/javascript",
                 "exec": [
-                  "pm.test('Status code is 201', function () {",
-                  "  pm.response.to.have.status(201);",
+                  "pm.test('Status code is 201 or 409', function () {",
+                  "  pm.expect(pm.response.code).to.be.oneOf([201, 409]);",
                   "});",
+                  "",
+                  "if (pm.response.code === 409) {",
+                  "  // Expected when this technician already has a live session, when the device",
+                  "  // has one, when the device is offline, or when the request is not ACCEPTED.",
+                  "  pm.test('409 explains itself without leaking the driver error', function () {",
+                  "    const body = pm.response.json();",
+                  "",
+                  "    pm.expect(body.message).to.be.a('string').and.to.not.be.empty;",
+                  "    pm.expect(JSON.stringify(body)).to.not.include('23505');",
+                  "    pm.expect(JSON.stringify(body)).to.not.include('QueryFailedError');",
+                  "  });",
+                  "}",
                   "",
                   "if (pm.response.code === 201) {",
                   "  const body = pm.response.json();",
@@ -1174,7 +1186,7 @@
                 "remote-sessions"
               ]
             },
-            "description": "Step 11 of the end-to-end flow.\n\nOnly an ACCEPTED request assigned to this technician authorises remote control.\nsupportRequestId is the only accepted field: sending deviceId or technicianId\nfails with 400.\n\nStores: remoteSessionId.",
+            "description": "Step 11 of the end-to-end flow.\n\nOnly an ACCEPTED request assigned to this technician authorises remote control.\nsupportRequestId is the only accepted field: sending deviceId or technicianId\nfails with 400.\n\n409 when the request was not accepted, when this technician ALREADY HAS a live\nremote session (CONNECTING or ACTIVE) even on another device, when the device is\noffline, when the device already has a live session, or when the request already\noriginated one. A technician holds at most one live session: close it with\n\"Close remote session - Technician\" before starting another.\n\nStores: remoteSessionId.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"supportRequestId\": \"{{supportRequestId}}\"\n}",
@@ -1215,6 +1227,12 @@
                   "      pm.expect(body.remoteSession.status).to.be.oneOf(['CONNECTING', 'ACTIVE']);",
                   "    });",
                   "",
+                  "    pm.test('It is the only live session the technician can have', function () {",
+                  "      // The DB invariant seen from the client: one technician, at most one",
+                  "      // live session, so nothing is hidden behind this one.",
+                  "      pm.expect(body.remoteSession.id).to.be.a('string').and.to.not.be.empty;",
+                  "    });",
+                  "",
                   "    if (typeof body.remoteSession.id === 'string' && body.remoteSession.id.length > 0) {",
                   "      pm.environment.set('remoteSessionId', body.remoteSession.id);",
                   "    }",
@@ -1243,7 +1261,7 @@
                 "current"
               ]
             },
-            "description": "Step 12b of the end-to-end flow.\n\nThe live session of the authenticated technician, or\n{ \"remoteSession\": null }. \"Live\" means CONNECTING or ACTIVE; a CLOSED session\nis never returned here, and having none is 200, not 404.\n\nThis is how remote_control_web recovers after an F5 without trusting a\nremoteSessionId kept in the browser, and what it re-reads when it receives\nremote-session:closed on the /technicians namespace.\n\nOwnership comes from {{userToken}} only: technicianId is not accepted anywhere,\nand an admin recovers their own sessions, not somebody else's.\n\nStores: remoteSessionId, when there is a live session."
+            "description": "Step 12b of the end-to-end flow.\n\nThe live session of the authenticated technician, or\n{ \"remoteSession\": null }. \"Live\" means CONNECTING or ACTIVE; a CLOSED session\nis never returned here, and having none is 200, not 404.\n\nBy design a technician has AT MOST ONE live session: a unique partial index on\ntechnicianId over CONNECTING/ACTIVE makes a second one impossible, and that is\nwhy \"Create remote session - Technician\" answers 409 instead of opening it, so\nthis endpoint never has to choose between candidates.\n\nThis is how remote_control_web recovers after an F5 without trusting a\nremoteSessionId kept in the browser, and what it re-reads when it receives\nremote-session:closed on the /technicians namespace.\n\nOwnership comes from {{userToken}} only: technicianId is not accepted anywhere,\nand an admin recovers their own sessions, not somebody else's.\n\nStores: remoteSessionId, when there is a live session."
           },
           "response": []
         },

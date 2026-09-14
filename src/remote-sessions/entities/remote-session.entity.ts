@@ -23,6 +23,10 @@ export const REMOTE_SESSION_SUPPORT_REQUEST_INDEX =
 /** Indice unico parcial: una sola sesion viva por dispositivo. */
 export const ACTIVE_REMOTE_SESSION_INDEX = 'IDX_remote_sessions_device_active';
 
+/** Indice unico parcial: una sola sesion viva por tecnico. */
+export const ACTIVE_TECHNICIAN_REMOTE_SESSION_INDEX =
+  'IDX_remote_sessions_technician_active';
+
 /**
  * Lista de estados vivos en SQL, derivada del enum para que el indice no pueda
  * quedar desalineado si manana se agrega un estado.
@@ -38,11 +42,12 @@ const ACTIVE_STATUSES_SQL = ACTIVE_REMOTE_SESSION_STATUSES.map(
  * acepto: el acceso remoto existe mientras exista una sesion, nunca porque un
  * tecnico este autenticado.
  *
- * Las dos invariantes importantes las impone PostgreSQL y no un SELECT previo
+ * Las tres invariantes importantes las impone PostgreSQL y no un SELECT previo
  * (entre la comprobacion y el INSERT habria una carrera):
  *
  * - una solicitud origina como maximo una sesion;
- * - un dispositivo no tiene dos sesiones vivas a la vez.
+ * - un dispositivo no tiene dos sesiones vivas a la vez;
+ * - un tecnico no atiende dos sesiones vivas a la vez.
  *
  * CUIDADO al agregar estados: `synchronize` compara nombre, columnas y
  * unicidad de los indices, pero no su condicion, asi que un cambio en la lista
@@ -57,10 +62,19 @@ const ACTIVE_STATUSES_SQL = ACTIVE_REMOTE_SESSION_STATUSES.map(
   unique: true,
   where: `"status" IN (${ACTIVE_STATUSES_SQL})`,
 })
+// Misma condicion, otra columna: el tecnico tampoco puede atender dos sesiones
+// vivas a la vez. Es la invariante que permite a `remote_control_web` hablar de
+// "la sesion actual" del tecnico sin ambiguedad.
+@Index(ACTIVE_TECHNICIAN_REMOTE_SESSION_INDEX, ['technicianId'], {
+  unique: true,
+  where: `"status" IN (${ACTIVE_STATUSES_SQL})`,
+})
 // Historial de un dispositivo. El indice parcial de arriba solo cubre las
 // sesiones vivas, asi que no sirve para consultar las ya cerradas.
 @Index(['deviceId'])
-// Sesiones de un tecnico concreto.
+// Historial de un tecnico, por el mismo motivo: el indice unico parcial de
+// arriba deja fuera las sesiones CLOSED, que son casi todas las filas. Se
+// conserva a proposito; no lo sustituye.
 @Index(['technicianId'])
 @Index(['status'])
 export class RemoteSession {

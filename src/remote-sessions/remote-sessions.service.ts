@@ -28,6 +28,8 @@ import {
 } from './dto/remote-session-response.dto';
 import {
   ACTIVE_REMOTE_SESSION_INDEX,
+  ACTIVE_TECHNICIAN_REMOTE_SESSION_INDEX,
+  REMOTE_SESSION_SUPPORT_REQUEST_INDEX,
   RemoteSession,
 } from './entities/remote-session.entity';
 import { RemoteSessionEndedBy } from './enums/remote-session-ended-by.enum';
@@ -102,6 +104,11 @@ export class RemoteSessionsService {
    * solicitud y el tecnico del token. Un `admin` usa el mismo endpoint pero no
    * queda por encima de la regla, tambien tiene que ser el tecnico asignado: de
    * momento no existe supervision ni takeover administrativo.
+   *
+   * Un tecnico atiende como maximo una sesion viva: si ya tiene una
+   * `CONNECTING` o `ACTIVE`, la segunda responde `409` aunque sea sobre otro
+   * dispositivo. Al cerrarla queda habilitado de inmediato, sin ninguna
+   * limpieza: el indice unico parcial deja fuera las filas `CLOSED`.
    */
   async create(
     createRemoteSessionDto: CreateRemoteSessionDto,
@@ -127,6 +134,21 @@ export class RemoteSessionsService {
       if (supportRequest.status !== SupportRequestStatus.ACCEPTED)
         throw new ConflictException(
           `Support request with id ${supportRequestId} was not accepted by the device`,
+        );
+
+      // Un tecnico atiende una sola sesion a la vez, aunque la segunda fuera
+      // sobre otro dispositivo. Se comprueba antes que la presencia a
+      // proposito: que el tecnico ya este ocupado es un dato suyo y accionable
+      // ("cierra la que tienes abierta"), mientras que una tablet offline no le
+      // dice nada mientras no pueda abrir ninguna sesion.
+      //
+      // Esto NO es lo que garantiza la invariante: entre este SELECT y el
+      // INSERT hay una carrera, y quien la cierra es el indice unico parcial.
+      // Sirve para no llegar al motor en el caso normal y para dar un mensaje
+      // preciso.
+      if (await this.technicianHasLiveSession(manager, user.id))
+        throw new ConflictException(
+          `Technician with id ${user.id} already has an active remote session`,
         );
 
       // Una tablet desconectada no puede establecer nada. La solicitud NO se
@@ -180,10 +202,10 @@ export class RemoteSessionsService {
    * recupera sus propias sesiones y nada mas: aqui tampoco hay supervision ni
    * takeover.
    *
-   * A diferencia del dispositivo, un tecnico SI puede tener varias sesiones
-   * vivas a la vez (el indice unico parcial es por dispositivo, no por
-   * tecnico), asi que se devuelve la mas reciente para que la respuesta sea
-   * determinista.
+   * No hay ambiguedad que resolver: un tecnico tiene como maximo una sesion
+   * viva, y lo garantiza el indice unico parcial por `technicianId`, no esta
+   * consulta. El `ORDER BY createdAt DESC` se conserva porque es inocuo y deja
+   * la respuesta definida incluso si algun dia se relajara la invariante.
    */
   async findCurrentForTechnician(
     technicianId: string,
@@ -460,10 +482,13 @@ export class RemoteSessionsService {
   /**
    * Guarda la sesion traduciendo las restricciones de PostgreSQL.
    *
-   * Las dos unicidades las comprueba el motor y no un SELECT previo: siguen
+   * Las tres unicidades las comprueba el motor y no un SELECT previo: siguen
    * siendo la segunda linea de defensa aunque ahora la solicitud este
    * bloqueada, porque el lock ordena a los que compiten por esa fila y no a
-   * cualquier otro camino que pudiera abrir una sesion sobre el dispositivo.
+   * cualquier otro camino que pudiera abrir una sesion sobre el dispositivo o
+   * sobre el tecnico. Dos peticiones simultaneas del mismo tecnico sobre
+   * dispositivos distintos ni siquiera compiten por la misma solicitud: ahi el
+   * indice es lo unico que decide.
    *
    * Va por el `EntityManager` de la transaccion: si la unicidad falla, el
    * `ConflictException` la aborta y no queda nada a medias.
@@ -475,17 +500,9 @@ export class RemoteSessionsService {
     try {
       return await manager.save(RemoteSession, remoteSession);
     } catch (error) {
-      const constraint = this.uniqueViolationConstraint(error);
+      const conflict = this.uniqueViolationMessage(error, remoteSession);
 
-      if (constraint === ACTIVE_REMOTE_SESSION_INDEX)
-        throw new ConflictException(
-          `Device with id ${remoteSession.deviceId} already has an active remote session`,
-        );
-
-      if (constraint !== null)
-        throw new ConflictException(
-          `Support request with id ${remoteSession.supportRequestId} already has a remote session`,
-        );
+      if (conflict) throw new ConflictException(conflict);
 
       this.logger.error(error);
 
@@ -494,20 +511,62 @@ export class RemoteSessionsService {
   }
 
   /**
-   * Nombre del indice unico violado, o `null` si el error es otro.
+   * Mensaje del conflicto que corresponde al indice unico violado, o `null` si
+   * el error no es una violacion de uno de los indices de esta tabla.
    *
-   * La tabla tiene dos unicidades distintas (una sesion por solicitud y una
-   * sesion viva por dispositivo) y el mensaje no es el mismo, asi que aqui si
-   * hace falta distinguirlas.
+   * La tabla tiene tres unicidades distintas (una sesion por solicitud, una
+   * sesion viva por dispositivo y una sesion viva por tecnico) y el mensaje no
+   * es el mismo, asi que hay que distinguirlas por el NOMBRE de la restriccion
+   * que devuelve PostgreSQL.
+   *
+   * Un `23505` que no sea uno de esos tres nombres NO se convierte en `409`:
+   * seria un fallo distinto (la clave primaria, un indice de otra tabla, algo
+   * que todavia no existe) y anunciarlo como "ya hay una sesion" mentiria al
+   * cliente. Cae al `500` con el error registrado, que es lo que corresponde a
+   * algo que no sabemos interpretar.
    */
-  private uniqueViolationConstraint(error: unknown): string | null {
+  private uniqueViolationMessage(
+    error: unknown,
+    remoteSession: RemoteSession,
+  ): string | null {
     if (!(error instanceof QueryFailedError)) return null;
 
     const driverError = error.driverError as unknown as PostgresError | null;
 
     if (driverError?.code !== UNIQUE_VIOLATION) return null;
 
-    return driverError.constraint ?? '';
+    switch (driverError.constraint) {
+      case ACTIVE_REMOTE_SESSION_INDEX:
+        return `Device with id ${remoteSession.deviceId} already has an active remote session`;
+
+      case ACTIVE_TECHNICIAN_REMOTE_SESSION_INDEX:
+        return `Technician with id ${remoteSession.technicianId} already has an active remote session`;
+
+      case REMOTE_SESSION_SUPPORT_REQUEST_INDEX:
+        return `Support request with id ${remoteSession.supportRequestId} already has a remote session`;
+
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Si el tecnico ya tiene una sesion `CONNECTING` o `ACTIVE`.
+   *
+   * Va por el `EntityManager` de la transaccion y no por el repositorio
+   * inyectado: tiene que leer dentro de la misma transaccion que despues
+   * inserta.
+   */
+  private technicianHasLiveSession(
+    manager: EntityManager,
+    technicianId: string,
+  ): Promise<boolean> {
+    return manager.exists(RemoteSession, {
+      where: {
+        technicianId,
+        status: In([...ACTIVE_REMOTE_SESSION_STATUSES]),
+      },
+    });
   }
 
   /**

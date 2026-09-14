@@ -1323,7 +1323,8 @@ Errors:
 403 — Authenticated without role admin/tecnico.
 404 — The support request does not exist, or it is not assigned to the
       authenticated technician.
-409 — The request was not accepted by the device; OR the device is offline;
+409 — The request was not accepted by the device; OR the authenticated
+      technician already has a live remote session; OR the device is offline;
       OR the device already has a live remote session; OR the request already
       originated a remote session.
 ```
@@ -1335,8 +1336,16 @@ authenticated technician grants nothing by itself.
 There is no supervision or administrative takeover: an `admin` who is not the
 assigned technician gets `404`, exactly like any other user.
 
-One live session per device and one session per support request are both
-enforced by unique indexes in PostgreSQL.
+A technician holds **at most one live session** (`CONNECTING` or `ACTIVE`).
+Asking for a second one answers `409` even when it targets a different device;
+the support request is left untouched and can be started later. Closing the open
+session frees the technician immediately — there is no cleanup step and no
+waiting period.
+
+One live session per technician, one live session per device and one session per
+support request are all enforced by unique indexes in PostgreSQL, not only by a
+check in the application, so two simultaneous requests cannot both win: one gets
+`201` and the other `409`.
 
 On success the backend emits `remote-session:created` to the device over
 Socket.IO, after the transaction commits. Delivery is best-effort; the tablet can
@@ -1414,9 +1423,11 @@ belonging to another technician reads exactly like having none. Holding `admin`
 changes nothing — an administrator recovers the sessions they own as the
 assigned technician and no others; there is no supervision or takeover.
 
-Unlike a device, a technician **may** hold several live sessions at once: the
-one-live-session unique index is per device, not per technician. When that
-happens this endpoint returns the most recently created one.
+By design there is at most one live session per technician: a unique partial
+index on `technicianId` (over `CONNECTING` and `ACTIVE`) makes a second one
+impossible, which is why `POST /remote-sessions` answers `409` instead of
+opening it. So this endpoint never has to choose between candidates — the
+answer is that one session, or `null`.
 
 The literal path segment `current` is routed before `:id`, so it is never parsed
 as a session UUID.
@@ -1607,6 +1618,8 @@ At any point the tablet reads GET /support-requests/current to recover state.
           body: supportRequestId of an ACCEPTED request owned by this technician
           -> RemoteSession CONNECTING
           -> emits remote-session:created to the device
+          -> 409 if this technician already has a live session, even on
+             another device: one technician, one live session
 
 2a. GET   /device/remote-sessions/current (Device JWT)
           -> the tablet recovers the session after a restart or reconnection
