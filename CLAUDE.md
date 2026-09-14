@@ -204,6 +204,20 @@ Do not create a second authentication implementation.
 
 Do not replace the existing JWT/Passport architecture unless explicitly requested.
 
+## Administrative bootstrap and password recovery
+
+Administrative bootstrap/password recovery is CLI-only.
+
+Never expose it as HTTP endpoints.
+
+```text
+npm run bootstrap:admin        creates the first administrator
+npm run reset:admin-password   changes the password of an existing administrator
+```
+
+Neither creates an HTTP route, and neither promotes, demotes or activates an
+account.
+
 ---
 
 # Authorization and roles
@@ -800,6 +814,31 @@ docs/REALTIME.md
 
 in the same change.
 
+## Postman collection rule
+
+The manual test collection lives in:
+
+```text
+postman/remote_control_backend.postman_collection.json
+```
+
+When a change modifies the REST contract, updating `docs/ENDPOINTS.md` is not
+enough: if the modified endpoint is represented in the collection, the collection
+must be updated in the same change.
+
+That includes:
+
+* a route or HTTP method that changes;
+* a request body that changes;
+* a response field the collection captures into an environment variable;
+* the authentication or the roles of an endpoint;
+* the HTTP status a request asserts.
+
+Do not let the Postman collection go stale.
+
+Purely internal changes that do not alter requests or responses do not require
+touching it.
+
 ## No deferred documentation
 
 Documentation updates are part of the change that causes them.
@@ -823,7 +862,7 @@ Do not claim a command succeeded unless it was actually executed successfully.
 
 If an existing unrelated problem prevents verification, report it clearly rather than modifying unrelated parts of the project.
 
-If the change touched any public REST route or realtime event, also verify that `docs/ENDPOINTS.md` and `docs/REALTIME.md` still match the code.
+If the change touched any public REST route or realtime event, also verify that `docs/ENDPOINTS.md` and `docs/REALTIME.md` still match the code, and that `postman/remote_control_backend.postman_collection.json` still matches any endpoint it represents.
 
 ---
 

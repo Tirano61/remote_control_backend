@@ -4,6 +4,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { User } from './entities/user.entity';
 import  * as bcrypt from 'bcrypt'
+import { hashPassword } from './password';
 import { LoginUserDto } from './dto/login_user.dto';
 import { JWTPayloadInterface } from './interfaces/jwt-payload.interface';
 import { JwtService } from '@nestjs/jwt';
@@ -23,7 +24,7 @@ export class AuthService {
       const { password, roles, ...userData } = createUserDto;
       const user = this.userRepository.create({
         ...userData,
-        password: bcrypt.hashSync( password, 10 ),
+        password: hashPassword( password ),
         // Sin roles explicitos se respeta el default de la columna (`user`),
         // que no habilita ningun endpoint de tecnico ni de administracion.
         ...( roles ? { roles: [ ...new Set(roles) ] } : {} ),
