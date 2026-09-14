@@ -21,6 +21,7 @@ import {
   ACTIVE_SUPPORT_REQUEST_STATUSES,
   SupportRequestStatus,
 } from '../support-requests/enums/support-request-status.enum';
+import { TechnicianRealtimeService } from '../signaling/realtime/technician-realtime.service';
 import { SupportRequestsService } from '../support-requests/support-requests.service';
 import {
   ACTIVE_REMOTE_SESSION_INDEX,
@@ -83,14 +84,17 @@ const buildDevice = (id: string, publicId: string): Device => ({
   updatedAt: new Date(),
 });
 
-const buildTechnician = (fullName: string): User =>
+const buildTechnician = (
+  fullName: string,
+  roles: ValidRoles[] = [ValidRoles.tecnico],
+): User =>
   ({
     id: randomUUID(),
     email: `${fullName.toLowerCase().replace(/\s/g, '.')}@acme.com`,
     password: 'hash-que-nunca-debe-salir',
     fullName,
     isActive: true,
-    roles: [ValidRoles.tecnico],
+    roles,
     created_at: new Date(),
     updated_at: new Date(),
   }) as User;
@@ -306,10 +310,22 @@ class FakeRemoteSessionRepository {
   findOne(options: {
     where: Record<string, WhereValue>;
     relations?: Record<string, boolean>;
+    order?: { createdAt?: 'ASC' | 'DESC' };
   }): Promise<RemoteSession | null> {
-    const row = this.rows.find((candidate) =>
+    const found = this.rows.filter((candidate) =>
       matches(candidate, options.where),
     );
+
+    // Un tecnico puede tener varias sesiones vivas: el orden forma parte de la
+    // consulta, asi que el doble tambien tiene que aplicarlo.
+    if (options.order?.createdAt)
+      found.sort((a, b) =>
+        options.order?.createdAt === 'DESC'
+          ? b.createdAt.getTime() - a.createdAt.getTime()
+          : a.createdAt.getTime() - b.createdAt.getTime(),
+      );
+
+    const row = found[0];
 
     if (!row) return Promise.resolve(null);
 
@@ -337,12 +353,14 @@ describe('RemoteSessionsService', () => {
   let remoteSessions: FakeRemoteSessionRepository;
   let supportRequests: FakeSupportRequestRepository;
   let emitToDevice: jest.Mock;
+  let emitToTechnician: jest.Mock;
   let online: Set<string>;
 
   let deviceA: Device;
   let deviceB: Device;
   let technicianA: User;
   let technicianB: User;
+  let adminUser: User;
 
   /** Lleva una solicitud nueva hasta ACCEPTED por el flujo real. */
   const seedAcceptedRequest = async (
@@ -369,8 +387,24 @@ describe('RemoteSessionsService', () => {
     const { id } = await service.create({ supportRequestId }, technicianA);
 
     emitToDevice.mockClear();
+    emitToTechnician.mockClear();
 
     return { supportRequestId, remoteSessionId: id };
+  };
+
+  /** Solicitud ACCEPTED + sesion CONNECTING sobre el dispositivo indicado. */
+  const seedSessionFor = async (
+    device: Device,
+    technician: User,
+  ): Promise<string> => {
+    const supportRequestId = await seedAcceptedRequest(device, technician);
+
+    const { id } = await service.create({ supportRequestId }, technician);
+
+    emitToDevice.mockClear();
+    emitToTechnician.mockClear();
+
+    return id;
   };
 
   const sessionRow = (id: string): RemoteSession =>
@@ -384,6 +418,7 @@ describe('RemoteSessionsService', () => {
     deviceB = buildDevice(DEVICE_B_ID, '111-222-333');
     technicianA = buildTechnician('Ana Tecnica');
     technicianB = buildTechnician('Bruno Tecnico');
+    adminUser = buildTechnician('Admin Total', [ValidRoles.admin]);
 
     for (const key of Object.keys(devices)) delete devices[key];
     for (const key of Object.keys(technicians)) delete technicians[key];
@@ -392,10 +427,12 @@ describe('RemoteSessionsService', () => {
     devices[deviceB.id] = deviceB;
     technicians[technicianA.id] = technicianA;
     technicians[technicianB.id] = technicianB;
+    technicians[adminUser.id] = adminUser;
 
     remoteSessions = new FakeRemoteSessionRepository();
     supportRequests = new FakeSupportRequestRepository();
     emitToDevice = jest.fn().mockReturnValue(true);
+    emitToTechnician = jest.fn().mockReturnValue(true);
     online = new Set<string>([deviceA.id, deviceB.id]);
 
     const rowLocks = new RowLocks();
@@ -498,6 +535,10 @@ describe('RemoteSessionsService', () => {
           useValue: { isOnline: (deviceId: string) => online.has(deviceId) },
         },
         { provide: DeviceRealtimeService, useValue: { emitToDevice } },
+        {
+          provide: TechnicianRealtimeService,
+          useValue: { emitToTechnician },
+        },
       ],
     }).compile();
 
@@ -775,6 +816,127 @@ describe('RemoteSessionsService', () => {
     });
   });
 
+  describe('sesion actual del tecnico', () => {
+    it('devuelve remoteSession: null cuando no tiene ninguna viva', async () => {
+      await expect(
+        service.findCurrentForTechnician(technicianA.id),
+      ).resolves.toEqual({ remoteSession: null });
+    });
+
+    it('devuelve su sesion CONNECTING', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+
+      const { remoteSession } = await service.findCurrentForTechnician(
+        technicianA.id,
+      );
+
+      expect(remoteSession).toMatchObject({
+        id: remoteSessionId,
+        supportRequestId,
+        status: RemoteSessionStatus.CONNECTING,
+        technician: { id: technicianA.id, name: technicianA.fullName },
+        device: { id: deviceA.id, publicId: deviceA.publicId },
+      });
+    });
+
+    it('devuelve tambien una sesion ACTIVE', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      // Todavia no hay ningun camino que escriba ACTIVE, asi que se fuerza la
+      // fila: lo que se comprueba es que el estado cuenta como vivo.
+      sessionRow(remoteSessionId).status = RemoteSessionStatus.ACTIVE;
+
+      const { remoteSession } = await service.findCurrentForTechnician(
+        technicianA.id,
+      );
+
+      expect(remoteSession).toMatchObject({
+        id: remoteSessionId,
+        status: RemoteSessionStatus.ACTIVE,
+      });
+    });
+
+    it('no devuelve una sesion CLOSED', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      await service.closeByTechnician(remoteSessionId, technicianA);
+
+      await expect(
+        service.findCurrentForTechnician(technicianA.id),
+      ).resolves.toEqual({ remoteSession: null });
+    });
+
+    it('no devuelve la sesion viva de otro tecnico', async () => {
+      await seedSession();
+
+      await expect(
+        service.findCurrentForTechnician(technicianB.id),
+      ).resolves.toEqual({ remoteSession: null });
+    });
+
+    it('filtra por tecnico en la consulta y no despues de traerla', async () => {
+      await seedSession();
+
+      const findOne = jest.spyOn(remoteSessions, 'findOne');
+
+      await service.findCurrentForTechnician(technicianB.id);
+
+      const [options] = findOne.mock.calls[0];
+
+      findOne.mockRestore();
+
+      // La pertenencia viaja en el WHERE: una sesion ajena no llega a leerse
+      // para descartarla despues.
+      expect(options.where.technicianId).toBe(technicianB.id);
+    });
+
+    it('devuelve al admin la sesion de la que el mismo es tecnico', async () => {
+      const remoteSessionId = await seedSessionFor(deviceA, adminUser);
+
+      const { remoteSession } = await service.findCurrentForTechnician(
+        adminUser.id,
+      );
+
+      expect(remoteSession).toMatchObject({ id: remoteSessionId });
+    });
+
+    it('no le da al admin la sesion de otro tecnico', async () => {
+      await seedSession();
+
+      // Ser admin no es un takeover: no supervisa las sesiones ajenas.
+      await expect(
+        service.findCurrentForTechnician(adminUser.id),
+      ).resolves.toEqual({ remoteSession: null });
+    });
+
+    it('devuelve la mas reciente si tiene varias vivas', async () => {
+      const { remoteSessionId: older } = await seedSession();
+      const newer = await seedSessionFor(deviceB, technicianA);
+
+      // Las dos nacen en el mismo milisegundo: se separan a mano para que el
+      // orden sea comprobable.
+      sessionRow(older).createdAt = new Date(Date.now() - 60_000);
+
+      const { remoteSession } = await service.findCurrentForTechnician(
+        technicianA.id,
+      );
+
+      expect(remoteSession).toMatchObject({ id: newer });
+    });
+
+    it('calcula isOnline en el momento, sin persistirlo', async () => {
+      await seedSession();
+      online.delete(deviceA.id);
+
+      const { remoteSession } = await service.findCurrentForTechnician(
+        technicianA.id,
+      );
+
+      expect(remoteSession?.device.isOnline).toBe(false);
+      expect(remoteSessions.rows[0]).not.toHaveProperty('isOnline');
+    });
+  });
+
   describe('consulta del tecnico', () => {
     it('devuelve la sesion a su tecnico', async () => {
       const { remoteSessionId } = await seedSession();
@@ -844,6 +1006,15 @@ describe('RemoteSessionsService', () => {
       );
     });
 
+    it('no le devuelve el eco a quien acaba de cerrar', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      await service.closeByTechnician(remoteSessionId, technicianA);
+
+      // La web ya recibe la sesion cerrada en la respuesta HTTP.
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
     it('responde 404 a otro tecnico y no cierra nada', async () => {
       const { remoteSessionId } = await seedSession();
 
@@ -855,6 +1026,7 @@ describe('RemoteSessionsService', () => {
         RemoteSessionStatus.CONNECTING,
       );
       expect(emitToDevice).not.toHaveBeenCalled();
+      expect(emitToTechnician).not.toHaveBeenCalled();
     });
 
     it('responde 409 al cerrar dos veces, sin alterar el primer cierre', async () => {
@@ -898,6 +1070,43 @@ describe('RemoteSessionsService', () => {
       expect(emitToDevice).not.toHaveBeenCalled();
     });
 
+    it('avisa al tecnico dueno con remote-session:closed', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      await service.closeByDevice(remoteSessionId, deviceA);
+
+      expect(emitToTechnician).toHaveBeenCalledTimes(1);
+      expect(emitToTechnician).toHaveBeenCalledWith(
+        technicianA.id,
+        REMOTE_SESSION_CLOSED_EVENT,
+        {
+          remoteSessionId,
+          endedBy: RemoteSessionEndedBy.DEVICE,
+        },
+      );
+    });
+
+    it('mantiene el cierre aunque el aviso al tecnico falle', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+
+      emitToTechnician.mockImplementation(() => {
+        throw new Error('transporte caido');
+      });
+
+      // La persistencia es la fuente de verdad: el aviso no puede deshacerla
+      // ni convertir un cierre correcto en un 500.
+      await expect(
+        service.closeByDevice(remoteSessionId, deviceA),
+      ).resolves.toMatchObject({ status: RemoteSessionStatus.CLOSED });
+
+      expect(sessionRow(remoteSessionId).status).toBe(
+        RemoteSessionStatus.CLOSED,
+      );
+      expect(requestRow(supportRequestId).status).toBe(
+        SupportRequestStatus.COMPLETED,
+      );
+    });
+
     it('responde 404 a otro dispositivo y no cierra nada', async () => {
       const { remoteSessionId } = await seedSession();
 
@@ -908,6 +1117,20 @@ describe('RemoteSessionsService', () => {
       expect(sessionRow(remoteSessionId).status).toBe(
         RemoteSessionStatus.CONNECTING,
       );
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it('no avisa dos veces si la sesion ya estaba cerrada', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      await service.closeByDevice(remoteSessionId, deviceA);
+      emitToTechnician.mockClear();
+
+      await expect(
+        service.closeByDevice(remoteSessionId, deviceA),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(emitToTechnician).not.toHaveBeenCalled();
     });
   });
 

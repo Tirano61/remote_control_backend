@@ -17,6 +17,7 @@ import { User } from '../auth/entities/user.entity';
 import { Device } from '../devices/entities/device.entity';
 import { DevicePresenceService } from '../devices/presence/device-presence.service';
 import { DeviceRealtimeService } from '../devices/realtime/device-realtime.service';
+import { TechnicianRealtimeService } from '../signaling/realtime/technician-realtime.service';
 import { SupportRequestTechnicianDto } from '../support-requests/dto/support-request-response.dto';
 import { SupportRequest } from '../support-requests/entities/support-request.entity';
 import { SupportRequestStatus } from '../support-requests/enums/support-request-status.enum';
@@ -38,7 +39,13 @@ import {
 /** Aviso a la tablet de que el tecnico inicio la asistencia. */
 export const REMOTE_SESSION_CREATED_EVENT = 'remote-session:created';
 
-/** Aviso a la tablet de que la sesion termino. */
+/**
+ * Aviso de que la sesion termino, hacia el extremo que NO la cerro.
+ *
+ * Mismo nombre y mismo payload en los dos namespaces: `/devices` cuando cierra
+ * el tecnico y `/technicians` cuando cierra el dispositivo. Un unico contrato
+ * para un unico hecho.
+ */
 export const REMOTE_SESSION_CLOSED_EVENT = 'remote-session:closed';
 
 /** Payload de `remote-session:created`. Sin email, sin roles y sin tokens. */
@@ -80,6 +87,8 @@ export class RemoteSessionsService {
     private readonly devicePresenceService: DevicePresenceService,
 
     private readonly deviceRealtimeService: DeviceRealtimeService,
+
+    private readonly technicianRealtimeService: TechnicianRealtimeService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -159,6 +168,41 @@ export class RemoteSessionsService {
   }
 
   /**
+   * Sesion viva del tecnico autenticado, o `null` si no tiene ninguna.
+   *
+   * Es como `remote_control_web` recupera su sesion tras un F5, al reabrir la
+   * aplicacion o despues de perderse un evento de Socket.IO: el cliente no
+   * tiene que tratar un `remoteSessionId` guardado en local como fuente de
+   * verdad.
+   *
+   * La pertenencia viaja en el WHERE y sale exclusivamente del token: no hay
+   * ningun `technicianId` que pueda llegar por query, body o path. Un `admin`
+   * recupera sus propias sesiones y nada mas: aqui tampoco hay supervision ni
+   * takeover.
+   *
+   * A diferencia del dispositivo, un tecnico SI puede tener varias sesiones
+   * vivas a la vez (el indice unico parcial es por dispositivo, no por
+   * tecnico), asi que se devuelve la mas reciente para que la respuesta sea
+   * determinista.
+   */
+  async findCurrentForTechnician(
+    technicianId: string,
+  ): Promise<CurrentRemoteSessionResponseDto> {
+    const remoteSession = await this.remoteSessionRepository.findOne({
+      where: {
+        technicianId,
+        status: In([...ACTIVE_REMOTE_SESSION_STATUSES]),
+      },
+      relations: { device: true, technician: true },
+      order: { createdAt: 'DESC' },
+    });
+
+    return {
+      remoteSession: remoteSession ? this.toResponse(remoteSession) : null,
+    };
+  }
+
+  /**
    * Sesion concreta para la aplicacion del tecnico.
    *
    * Conocer el UUID no alcanza: solo la ve el tecnico al que pertenece.
@@ -182,7 +226,7 @@ export class RemoteSessionsService {
       RemoteSessionEndedBy.TECHNICIAN,
     );
 
-    this.notifyClosed(closed);
+    this.notifyDeviceClosed(closed);
 
     return this.toResponse(closed);
   }
@@ -216,11 +260,13 @@ export class RemoteSessionsService {
   /**
    * El usuario de la tablet corta la sesion.
    *
-   * DECISION: no se le reenvia `remote-session:closed`. Quien cierra ya recibe
-   * la sesion cerrada en la respuesta HTTP, igual que ocurre con las
-   * transiciones de `SupportRequest`, y el estado siempre se puede releer por
-   * REST. Al tecnico tampoco se le notifica: todavia no existe Socket.IO de
-   * tecnicos y la Flutter Web recupera el estado por REST.
+   * DECISION: a quien cierra no se le reenvia `remote-session:closed`. Ya
+   * recibe la sesion cerrada en la respuesta HTTP, igual que ocurre con las
+   * transiciones de `SupportRequest`.
+   *
+   * Al tecnico si se le avisa, y despues del commit: es el unico extremo que se
+   * quedaria mostrando una sesion que ya no existe. El aviso es simetrico del
+   * que recibe la tablet cuando cierra el tecnico.
    */
   async closeByDevice(
     id: string,
@@ -228,9 +274,14 @@ export class RemoteSessionsService {
   ): Promise<RemoteSessionResponseDto> {
     const remoteSession = await this.findOwnedByDeviceOrFail(id, device.id);
 
-    return this.toResponse(
-      await this.close(remoteSession, RemoteSessionEndedBy.DEVICE),
-    );
+    const closed = await this.close(remoteSession, RemoteSessionEndedBy.DEVICE);
+
+    // Nunca antes de que la transaccion confirme: no se anuncia un cierre que
+    // todavia pudiera deshacerse. Si la sesion ya estaba cerrada, `close` ha
+    // lanzado `409` y aqui no se llega, asi que no se emiten avisos falsos.
+    this.notifyTechnicianClosed(closed);
+
+    return this.toResponse(closed);
   }
 
   // ---------------------------------------------------------------------------
@@ -483,17 +534,52 @@ export class RemoteSessionsService {
   }
 
   /** Avisa a la tablet de que el tecnico termino la sesion. */
-  private notifyClosed(remoteSession: RemoteSession): void {
-    const payload: RemoteSessionClosedPayload = {
-      remoteSessionId: remoteSession.id,
-      endedBy: remoteSession.endedBy ?? RemoteSessionEndedBy.SYSTEM,
-    };
-
+  private notifyDeviceClosed(remoteSession: RemoteSession): void {
     this.deviceRealtimeService.emitToDevice(
       remoteSession.deviceId,
       REMOTE_SESSION_CLOSED_EVENT,
-      payload,
+      this.closedPayload(remoteSession),
     );
+  }
+
+  /**
+   * Avisa al tecnico de que el usuario de la tablet termino la sesion.
+   *
+   * Va a su room personal y no a la de la sesion: `remote-session:closed` es un
+   * evento de dominio, no signaling, y tiene que llegarle aunque nunca haya
+   * ejecutado `remote-session:join`.
+   *
+   * El aviso NO es la fuente de verdad ni forma parte de la transaccion: si el
+   * transporte falla, la sesion sigue `CLOSED` y su solicitud `COMPLETED`, y no
+   * se deshace nada. Por eso el error se registra y no se propaga: quien cerro
+   * ya recibio su respuesta HTTP correcta y convertirla en un `500` haria creer
+   * que el cierre fallo. El tecnico recupera el estado con
+   * `GET /remote-sessions/current`.
+   */
+  private notifyTechnicianClosed(remoteSession: RemoteSession): void {
+    try {
+      this.technicianRealtimeService.emitToTechnician(
+        remoteSession.technicianId,
+        REMOTE_SESSION_CLOSED_EVENT,
+        this.closedPayload(remoteSession),
+      );
+    } catch (error) {
+      // Sin datos de la sesion mas alla de su id: nada de tokens ni de SDP.
+      this.logger.error(
+        `Remote session ${remoteSession.id} is closed, but ${REMOTE_SESSION_CLOSED_EVENT} could not be delivered to its technician`,
+        error instanceof Error ? error.stack : undefined,
+      );
+    }
+  }
+
+  /** Un unico payload de cierre para los dos destinatarios. */
+  private closedPayload(
+    remoteSession: RemoteSession,
+  ): RemoteSessionClosedPayload {
+    return {
+      remoteSessionId: remoteSession.id,
+      endedBy: remoteSession.endedBy ?? RemoteSessionEndedBy.SYSTEM,
+    };
   }
 
   /** La presencia se resuelve al responder: `isOnline` no es una columna. */

@@ -37,6 +37,7 @@ import {
 } from './interfaces/signaling-ack.interface';
 import { SignalingParticipant } from './interfaces/signaling-participant.interface';
 import { SignalingRealtimeService } from './realtime/signaling-realtime.service';
+import { TechnicianRealtimeService } from './realtime/technician-realtime.service';
 import {
   REMOTE_SESSION_JOIN_EVENT,
   WEBRTC_ANSWER_EVENT,
@@ -342,6 +343,9 @@ describe('Signaling WebRTC (Socket.IO)', () => {
         TechniciansGateway,
         SignalingService,
         SignalingRealtimeService,
+        // El gateway de tecnicos tambien registra la salida de eventos de
+        // dominio; aqui no se emite ninguno.
+        TechnicianRealtimeService,
         DevicePresenceService,
         DeviceRealtimeService,
         DeviceAuthService,

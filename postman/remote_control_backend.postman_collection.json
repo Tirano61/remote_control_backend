@@ -39,6 +39,14 @@
                   "  if (typeof body.token === 'string' && body.token.length > 0) {",
                   "    pm.environment.set('userToken', body.token);",
                   "  }",
+                  "",
+                  "  pm.test('Response carries the user id', function () {",
+                  "    pm.expect(body.id).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "",
+                  "  if (typeof body.id === 'string' && body.id.length > 0) {",
+                  "    pm.environment.set('userId', body.id);",
+                  "  }",
                   "}"
                 ]
               }
@@ -97,6 +105,14 @@
                   "",
                   "  if (typeof body.token === 'string' && body.token.length > 0) {",
                   "    pm.environment.set('userToken', body.token);",
+                  "  }",
+                  "",
+                  "  pm.test('Response carries the user id', function () {",
+                  "    pm.expect(body.id).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "",
+                  "  if (typeof body.id === 'string' && body.id.length > 0) {",
+                  "    pm.environment.set('userId', body.id);",
                   "  }",
                   "}"
                 ]
@@ -1102,7 +1118,7 @@
     },
     {
       "name": "06 - Remote sessions",
-      "description": "The technician routes are mounted under /remote-sessions (User JWT) and the\ndevice ones under /device/remote-sessions (Device JWT).\n\nEvery technician route is ownership-scoped: the session must belong to the\nauthenticated technician. Being admin is not an exemption — it answers 404 like\nanybody else.\n\nThe two close requests are alternatives: whoever closes first wins and the\nother side gets 409.",
+      "description": "The technician routes are mounted under /remote-sessions (User JWT) and the\ndevice ones under /device/remote-sessions (Device JWT).\n\nEvery technician route is ownership-scoped: the session must belong to the\nauthenticated technician. Being admin is not an exemption — it answers 404 like\nanybody else, and /remote-sessions/current answers remoteSession null.\n\nThe two close requests are alternatives: whoever closes first wins and the\nother side gets 409. Each close notifies the other end over Socket.IO.",
       "item": [
         {
           "name": "Create remote session - Technician",
@@ -1172,6 +1188,66 @@
           "response": []
         },
         {
+          "name": "Get current remote session - Technician",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200', function () {",
+                  "  pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The response carries the remoteSession field', function () {",
+                  "    pm.expect(body).to.have.property('remoteSession');",
+                  "  });",
+                  "",
+                  "  if (body.remoteSession) {",
+                  "    pm.test('The live session belongs to the authenticated technician', function () {",
+                  "      pm.expect(body.remoteSession.technician.id).to.eql(pm.environment.get('userId'));",
+                  "    });",
+                  "",
+                  "    pm.test('A current session is never CLOSED', function () {",
+                  "      pm.expect(body.remoteSession.status).to.be.oneOf(['CONNECTING', 'ACTIVE']);",
+                  "    });",
+                  "",
+                  "    if (typeof body.remoteSession.id === 'string' && body.remoteSession.id.length > 0) {",
+                  "      pm.environment.set('remoteSessionId', body.remoteSession.id);",
+                  "    }",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/remote-sessions/current",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "remote-sessions",
+                "current"
+              ]
+            },
+            "description": "Step 12b of the end-to-end flow.\n\nThe live session of the authenticated technician, or\n{ \"remoteSession\": null }. \"Live\" means CONNECTING or ACTIVE; a CLOSED session\nis never returned here, and having none is 200, not 404.\n\nThis is how remote_control_web recovers after an F5 without trusting a\nremoteSessionId kept in the browser, and what it re-reads when it receives\nremote-session:closed on the /technicians namespace.\n\nOwnership comes from {{userToken}} only: technicianId is not accepted anywhere,\nand an admin recovers their own sessions, not somebody else's.\n\nStores: remoteSessionId, when there is a live session."
+          },
+          "response": []
+        },
+        {
           "name": "Get remote session - Technician",
           "event": [
             {
@@ -1213,7 +1289,7 @@
                 "{{remoteSessionId}}"
               ]
             },
-            "description": "The session by id, closed ones included. This is how the web app detects that\nthe device closed the session, since no realtime event is sent to the\ntechnician namespace for that."
+            "description": "The session by id, closed ones included. Use it to read one specific session,\nfor example the one named by a remote-session:closed event. To recover \"the\nsession I have open right now\", use Get current remote session - Technician."
           },
           "response": []
         },
@@ -1270,7 +1346,7 @@
                 "current"
               ]
             },
-            "description": "Step 12 of the end-to-end flow.\n\nThe live session of the authenticated device, or { \"remoteSession\": null }.\n\"Live\" means CONNECTING or ACTIVE; a CLOSED session is never returned here.\n\nStores: remoteSessionId, when there is a live session."
+            "description": "Step 12a of the end-to-end flow.\n\nThe live session of the authenticated device, or { \"remoteSession\": null }.\n\"Live\" means CONNECTING or ACTIVE; a CLOSED session is never returned here.\n\nStores: remoteSessionId, when there is a live session."
           },
           "response": []
         },
@@ -1367,7 +1443,7 @@
                 "close"
               ]
             },
-            "description": "Alternative to closing as the technician: the user of the tablet ends the\nassistance. CLOSED with endedBy DEVICE, and the support request becomes\nCOMPLETED in the same transaction. No Socket.IO event is emitted in this\ndirection; the technician re-reads GET /remote-sessions/:id."
+            "description": "Alternative to closing as the technician: the user of the tablet ends the\nassistance. CLOSED with endedBy DEVICE, and the support request becomes\nCOMPLETED in the same transaction.\n\nEmits remote-session:closed to the owning technician on /technicians, after the\ntransaction commits. The web app answers that event with\nGET /remote-sessions/current."
           },
           "response": []
         }

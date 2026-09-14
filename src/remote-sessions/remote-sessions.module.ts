@@ -4,6 +4,7 @@ import { AuthModule } from '../auth/auth.module';
 import { DeviceAuthModule } from '../devices/auth/device-auth.module';
 import { DevicePresenceModule } from '../devices/presence/device-presence.module';
 import { DeviceRealtimeModule } from '../devices/realtime/device-realtime.module';
+import { TechnicianRealtimeModule } from '../signaling/realtime/technician-realtime.module';
 import { SupportRequest } from '../support-requests/entities/support-request.entity';
 import { DeviceRemoteSessionsController } from './device-remote-sessions.controller';
 import { RemoteSession } from './entities/remote-session.entity';
@@ -36,6 +37,9 @@ import { RemoteSessionsService } from './remote-sessions.service';
     DevicePresenceModule,
     // Salida de eventos hacia la tablet (`remote-session:created` / `:closed`).
     DeviceRealtimeModule,
+    // Salida de eventos hacia el tecnico (`remote-session:closed` cuando cierra
+    // el dispositivo). Es un modulo sin dependencias: no arrastra el signaling.
+    TechnicianRealtimeModule,
   ],
   exports: [TypeOrmModule, RemoteSessionsService],
 })

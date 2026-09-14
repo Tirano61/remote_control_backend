@@ -84,10 +84,15 @@ export class RemoteSessionResponseDto {
 }
 
 /**
- * Respuesta de `GET /device/remote-sessions/current`.
+ * Respuesta de `GET /device/remote-sessions/current` y de
+ * `GET /remote-sessions/current`.
  *
- * Que la tablet no tenga sesion viva es una situacion normal, no un error: se
- * responde `200` con `remoteSession: null` en lugar de un `404`, igual que en
+ * Una sola forma para los dos: la tablet y la Flutter Web recuperan su sesion
+ * viva con la misma envoltura y el mismo DTO, aunque la pertenencia se resuelva
+ * con identidades distintas.
+ *
+ * Que no haya sesion viva es una situacion normal, no un error: se responde
+ * `200` con `remoteSession: null` en lugar de un `404`, igual que en
  * `GET /support-requests/current`.
  */
 export class CurrentRemoteSessionResponseDto {

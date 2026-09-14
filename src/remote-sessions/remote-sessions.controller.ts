@@ -41,6 +41,22 @@ export class RemoteSessionsController {
     return this.remoteSessionsService.create(createRemoteSessionDto, user);
   }
 
+  /**
+   * Sesion viva del propio tecnico, o `remoteSession: null` si no tiene.
+   *
+   * Es con lo que la Flutter Web se recupera tras un F5 o al reabrirse, sin
+   * tener que confiar en un `remoteSessionId` guardado en el navegador. No
+   * tener sesion es lo normal, no un error: responde `200`, no `404`.
+   *
+   * DECLARADA ANTES QUE `:id` A PROPOSITO: Nest resuelve las rutas en el orden
+   * en que se declaran, asi que al reves `current` entraria por `:id` (y, con
+   * el `ParseUUIDPipe`, acabaria en un `400`).
+   */
+  @Get('current')
+  findCurrent(@GetUser('id') technicianId: string) {
+    return this.remoteSessionsService.findCurrentForTechnician(technicianId);
+  }
+
   @Get(':id')
   findOne(@Param('id', ParseUUIDPipe) id: string, @GetUser() user: User) {
     return this.remoteSessionsService.findOneForTechnician(id, user);

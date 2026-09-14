@@ -4,6 +4,7 @@ import { AuthModule } from '../auth/auth.module';
 import { RemoteSession } from '../remote-sessions/entities/remote-session.entity';
 import { TechniciansGateway } from './gateway/technicians.gateway';
 import { SignalingRealtimeService } from './realtime/signaling-realtime.service';
+import { TechnicianRealtimeModule } from './realtime/technician-realtime.module';
 import { SignalingService } from './signaling.service';
 
 /**
@@ -21,10 +22,19 @@ import { SignalingService } from './signaling.service';
  *
  * De `AuthModule` sale `AuthService`, que es como se reutiliza la autenticacion
  * de usuarios ya existente para los sockets de tecnico.
+ *
+ * `TechnicianRealtimeModule` es la salida de eventos de dominio hacia los
+ * tecnicos. Se importa aqui porque el gateway registra en el su namespace, y va
+ * en un modulo propio sin dependencias para que quien emite (hoy
+ * `RemoteSessionsModule`) no tenga que importar este.
  */
 @Module({
   providers: [SignalingService, SignalingRealtimeService, TechniciansGateway],
-  imports: [TypeOrmModule.forFeature([RemoteSession]), AuthModule],
+  imports: [
+    TypeOrmModule.forFeature([RemoteSession]),
+    AuthModule,
+    TechnicianRealtimeModule,
+  ],
   exports: [SignalingService, SignalingRealtimeService],
 })
 export class SignalingModule {}
