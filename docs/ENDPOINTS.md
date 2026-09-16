@@ -1193,9 +1193,11 @@ Notes:
 "Live" means `status` is `CONNECTING` or `ACTIVE`. A `CLOSED` session is never
 returned here.
 
-`status` is `CONNECTING` for every session that exists today: nothing in the
-current code transitions a session to `ACTIVE`, and `connectedAt` therefore stays
-`null`. Signaling does not change the session state.
+A session is born `CONNECTING` with `connectedAt: null` and becomes `ACTIVE`
+with `connectedAt` set when the technician reports the remote connection through
+`POST /remote-sessions/:id/activate`. Signaling does not change the session
+state, so the tablet must read this endpoint (or answer `remote-session:active`)
+to see the change; it is not told by any `webrtc:*` message.
 
 ## POST /device/remote-sessions/:id/close
 
@@ -1466,6 +1468,94 @@ session named by a `remote-session:closed` event. To recover "the session I have
 open right now", use `GET /remote-sessions/current` instead: it does not depend
 on the client remembering an id.
 
+## POST /remote-sessions/:id/activate
+
+```text
+CLIENT: remote_control_web
+```
+
+Authentication:
+User JWT — roles: `admin`, `tecnico`.
+
+Description:
+The technician reports that the remote connection is established: its
+`RTCPeerConnection` is `connected` and the `control` DataChannel is `open`. The
+session moves `CONNECTING -> ACTIVE` and `connectedAt` is set.
+
+The backend cannot observe this by itself — it takes no part in WebRTC, and
+signaling never changes the state of a session. This endpoint is the only code
+path that writes `ACTIVE`.
+
+Path params:
+
+```text
+id — remote session UUID
+```
+
+Request:
+Empty body. The request body is not read at all: a `status`, a `connectedAt`, a
+`technicianId` or a `userId` sent in it are ignored, not honoured. The session
+comes from the path, the technician from the token and `connectedAt` from the
+server clock.
+
+Response 200:
+The session, same shape as `POST /remote-sessions`, with:
+
+```json
+{
+  "status": "ACTIVE",
+  "connectedAt": "2026-03-11T09:34:02.000Z"
+}
+```
+
+Errors:
+
+```text
+400 — id is not a valid UUID.
+401 — Not authenticated.
+403 — Authenticated without role admin/tecnico.
+404 — The session does not exist, or belongs to another technician.
+409 — The session is CLOSED. A closed session never reopens.
+```
+
+Notes:
+**Idempotent.** Calling it again on a session that is already `ACTIVE` answers
+`200` with that same session: `connectedAt` keeps its original value and no new
+event is emitted. This is deliberate, because the call travels exactly when the
+network has just come up: if the response is lost and the client retries, the
+second request recovers the same `ACTIVE` state instead of failing.
+
+`connectedAt` is written exactly once, on the real `CONNECTING -> ACTIVE`
+transition, and never moves afterwards — not on a retry, and not when the
+session is later closed.
+
+Ownership is the same as everywhere else in this group: the session must belong
+to the authenticated technician, and a session belonging to somebody else
+answers `404`, exactly like one that does not exist. Holding `admin` changes
+nothing; there is no supervision or takeover.
+
+The support request is **not** touched here. It stays `ACCEPTED` and only
+becomes `COMPLETED` when the session is closed, through the existing close path.
+
+The transition runs inside a transaction that locks the session row, so an
+`activate` and a `close` arriving at the same time cannot interleave:
+
+```text
+close first     -> the session is CLOSED and activate answers 409
+activate first  -> the session is ACTIVE and the close then does ACTIVE -> CLOSED
+```
+
+On a real transition the backend emits `remote-session:active` to the device and
+to the technician, after the transaction commits — see [REALTIME.md](REALTIME.md).
+Delivery is best-effort and never rolls the activation back: a socket failure
+does not turn a successful activation into a `500`. Either side recovers the
+state with `GET /remote-sessions/current` or
+`GET /device/remote-sessions/current`.
+
+Activating is not required for signaling or for closing: `webrtc:*` works while
+the session is `CONNECTING`, and both `CONNECTING` and `ACTIVE` are live states.
+It records that the connection actually came up.
+
 ## POST /remote-sessions/:id/close
 
 ```text
@@ -1505,6 +1595,11 @@ Errors:
 ```
 
 Notes:
+Both live states close the same way: a session still `CONNECTING` and one
+already `ACTIVE` both become `CLOSED`. A session that was activated keeps its
+`connectedAt` — closing never rewrites it — so the response carries
+`connectedAt` and `endedAt` together.
+
 On success the backend emits `remote-session:closed` to the device over
 Socket.IO. No echo is sent back to the technician who closed: this HTTP response
 already carries the closed session.
@@ -1538,7 +1633,10 @@ Active statuses (only one at a time per device): `WAITING`, `ASSIGNED`,
 
 ```text
 CONNECTING  The session exists and both ends may start connecting.
-ACTIVE      Reserved. No code path sets it today.
+ACTIVE      The remote connection is established. Written only by
+            POST /remote-sessions/:id/activate, which is how the technician
+            reports it; the backend takes no part in WebRTC and signaling never
+            changes the status.
 CLOSED      The session ended. Terminal.
 ```
 
@@ -1626,16 +1724,28 @@ At any point the tablet reads GET /support-requests/current to recover state.
 2b. GET   /remote-sessions/current        (User JWT, admin|tecnico)
           -> the web app recovers the session after an F5 or a reopen
 
-3a. POST  /remote-sessions/:id/close          (User JWT)   endedBy TECHNICIAN
+3. POST   /remote-sessions/:id/activate   (User JWT, admin|tecnico)
+          sent by the web app once WebRTC is connected and the control
+          DataChannel is open
+          -> CONNECTING -> ACTIVE, connectedAt set
+          -> emits remote-session:active to BOTH ends
+          -> idempotent: a retry on an ACTIVE session answers 200 with the
+             same connectedAt and emits nothing
+          -> 409 if the session is already CLOSED
+
+4a. POST  /remote-sessions/:id/close          (User JWT)   endedBy TECHNICIAN
                                                            -> emits remote-session:closed
                                                               to the device
-3b. POST  /device/remote-sessions/:id/close   (Device JWT) endedBy DEVICE
+4b. POST  /device/remote-sessions/:id/close   (Device JWT) endedBy DEVICE
                                                            -> emits remote-session:closed
                                                               to the technician
 
-4. In both cases the SupportRequest becomes COMPLETED in the same transaction.
+5. In both cases the SupportRequest becomes COMPLETED in the same transaction.
+   A session closed after step 3 keeps its connectedAt.
 ```
 
 Once the session exists, WebRTC negotiation happens over Socket.IO — see
-[REALTIME.md](REALTIME.md). No REST endpoint takes part in WebRTC, and none marks
-a session as `ACTIVE`.
+[REALTIME.md](REALTIME.md). No REST endpoint takes part in WebRTC and no
+Socket.IO message changes the status of a session: `ACTIVE` is written only by
+`POST /remote-sessions/:id/activate`, which is the technician reporting what
+WebRTC did. Step 3 is not a precondition for signaling or for closing.

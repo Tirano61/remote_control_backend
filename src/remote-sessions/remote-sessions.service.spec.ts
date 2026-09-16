@@ -39,6 +39,7 @@ import {
   RemoteSessionStatus,
 } from './enums/remote-session-status.enum';
 import {
+  REMOTE_SESSION_ACTIVE_EVENT,
   REMOTE_SESSION_CLOSED_EVENT,
   REMOTE_SESSION_CREATED_EVENT,
   RemoteSessionsService,
@@ -374,6 +375,14 @@ describe('RemoteSessionsService', () => {
   let emitToTechnician: jest.Mock;
   let online: Set<string>;
 
+  /**
+   * Filas pedidas con `SELECT ... FOR UPDATE`, como `<entidad>:<id>`.
+   *
+   * Sirve para comprobar que una transicion se hace de verdad sobre la fila
+   * bloqueada y no sobre una lectura suelta.
+   */
+  let lockedRows: string[];
+
   let deviceA: Device;
   let deviceB: Device;
   let technicianA: User;
@@ -452,6 +461,7 @@ describe('RemoteSessionsService', () => {
     emitToDevice = jest.fn().mockReturnValue(true);
     emitToTechnician = jest.fn().mockReturnValue(true);
     online = new Set<string>([deviceA.id, deviceB.id]);
+    lockedRows = [];
 
     const rowLocks = new RowLocks();
 
@@ -487,9 +497,22 @@ describe('RemoteSessionsService', () => {
             await rowLocks.acquire(options.where.id as string),
           );
 
-        return entity === RemoteSession
-          ? remoteSessions.findOne(options)
-          : supportRequests.findOne(options);
+        const row =
+          entity === RemoteSession
+            ? await remoteSessions.findOne(options)
+            : await supportRequests.findOne(options);
+
+        // Se anota la fila realmente bloqueada: si el WHERE no encuentra
+        // ninguna (por ejemplo porque es de otro tecnico), PostgreSQL tampoco
+        // bloquea nada.
+        if (options.lock && row)
+          lockedRows.push(
+            `${entity === RemoteSession ? 'RemoteSession' : 'SupportRequest'}:${
+              options.where.id as string
+            }`,
+          );
+
+        return row;
       },
 
       findOneByOrFail: (_entity: unknown, where: { id: string }) =>
@@ -1131,6 +1154,500 @@ describe('RemoteSessionsService', () => {
       await expect(
         service.findOneForTechnician(randomUUID(), technicianA),
       ).rejects.toBeInstanceOf(NotFoundException);
+    });
+  });
+
+  describe('activacion por el tecnico', () => {
+    it('lleva la sesion de CONNECTING a ACTIVE', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      const activated = await service.activateByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+
+      expect(activated).toMatchObject({
+        id: remoteSessionId,
+        status: RemoteSessionStatus.ACTIVE,
+        endedAt: null,
+        endedBy: null,
+        device: { id: deviceA.id, publicId: deviceA.publicId },
+        technician: { id: technicianA.id, name: technicianA.fullName },
+      });
+      expect(sessionRow(remoteSessionId).status).toBe(
+        RemoteSessionStatus.ACTIVE,
+      );
+    });
+
+    it('fija connectedAt con la hora del backend', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      expect(sessionRow(remoteSessionId).connectedAt).toBeNull();
+
+      const before = Date.now();
+
+      const activated = await service.activateByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+
+      const after = Date.now();
+
+      expect(activated.connectedAt).toBeInstanceOf(Date);
+      // La hora la genera el backend: cae dentro de la ventana de la llamada, y
+      // no hay ningun camino por el que el cliente pueda proponerla.
+      expect(activated.connectedAt?.getTime()).toBeGreaterThanOrEqual(before);
+      expect(activated.connectedAt?.getTime()).toBeLessThanOrEqual(after);
+      expect(sessionRow(remoteSessionId).connectedAt).toEqual(
+        activated.connectedAt,
+      );
+    });
+
+    it('bloquea la fila de la sesion para hacer la transicion', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      lockedRows = [];
+
+      await service.activateByTechnician(remoteSessionId, technicianA);
+
+      // `SELECT ... FOR UPDATE` sobre la propia sesion: es lo que serializa la
+      // activacion con el cierre.
+      expect(lockedRows).toContain(`RemoteSession:${remoteSessionId}`);
+    });
+
+    it('no toca la solicitud de asistencia', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+      const before = { ...requestRow(supportRequestId) };
+
+      await service.activateByTechnician(remoteSessionId, technicianA);
+
+      // La solicitud sigue asociada a la asistencia hasta que la sesion cierre:
+      // COMPLETED es cosa del cierre, no de la activacion.
+      expect(requestRow(supportRequestId)).toMatchObject({
+        status: SupportRequestStatus.ACCEPTED,
+        closedAt: null,
+        respondedAt: before.respondedAt,
+        assignedAt: before.assignedAt,
+        technicianId: before.technicianId,
+      });
+    });
+
+    it('no publica datos sensibles del tecnico', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      const activated = await service.activateByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+
+      expect(activated.technician).not.toHaveProperty('email');
+      expect(activated.technician).not.toHaveProperty('roles');
+      expect(activated.technician).not.toHaveProperty('password');
+    });
+
+    it('es idempotente: un segundo activate devuelve la misma sesion ACTIVE', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      const first = await service.activateByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+
+      // El caso real: la respuesta se perdio por red y el cliente reintenta.
+      const second = await service.activateByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+
+      expect(second).toMatchObject({
+        id: remoteSessionId,
+        status: RemoteSessionStatus.ACTIVE,
+      });
+      expect(second.connectedAt).toEqual(first.connectedAt);
+      expect(sessionRow(remoteSessionId).connectedAt).toEqual(
+        first.connectedAt,
+      );
+    });
+
+    it('conserva el connectedAt original tras varios reintentos', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      const { connectedAt } = await service.activateByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+
+      await service.activateByTechnician(remoteSessionId, technicianA);
+      await service.activateByTechnician(remoteSessionId, technicianA);
+
+      expect(sessionRow(remoteSessionId).connectedAt).toEqual(connectedAt);
+    });
+
+    it('responde 409 sobre una sesion CLOSED y no la reabre', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      const closed = await service.closeByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+
+      await expect(
+        service.activateByTechnician(remoteSessionId, technicianA),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      // CLOSED es terminal: ni el estado ni el cierre se alteran.
+      expect(sessionRow(remoteSessionId)).toMatchObject({
+        status: RemoteSessionStatus.CLOSED,
+        endedAt: closed.endedAt,
+        endedBy: RemoteSessionEndedBy.TECHNICIAN,
+        connectedAt: null,
+      });
+    });
+
+    it('responde 409 tambien sobre una sesion que estuvo ACTIVE y se cerro', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      const { connectedAt } = await service.activateByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+
+      await service.closeByTechnician(remoteSessionId, technicianA);
+
+      await expect(
+        service.activateByTechnician(remoteSessionId, technicianA),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(sessionRow(remoteSessionId).status).toBe(
+        RemoteSessionStatus.CLOSED,
+      );
+      // El historial de la sesion no se reescribe.
+      expect(sessionRow(remoteSessionId).connectedAt).toEqual(connectedAt);
+    });
+
+    it('responde 404 a un tecnico que no es el de la sesion', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      await expect(
+        service.activateByTechnician(remoteSessionId, technicianB),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      expect(sessionRow(remoteSessionId).status).toBe(
+        RemoteSessionStatus.CONNECTING,
+      );
+      expect(sessionRow(remoteSessionId).connectedAt).toBeNull();
+      expect(emitToDevice).not.toHaveBeenCalled();
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it('responde 404 al admin sobre una sesion ajena: no hay takeover', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      await expect(
+        service.activateByTechnician(remoteSessionId, adminUser),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      expect(sessionRow(remoteSessionId).status).toBe(
+        RemoteSessionStatus.CONNECTING,
+      );
+    });
+
+    it('deja al admin activar la sesion de la que el mismo es tecnico', async () => {
+      const remoteSessionId = await seedSessionFor(deviceA, adminUser);
+
+      await expect(
+        service.activateByTechnician(remoteSessionId, adminUser),
+      ).resolves.toMatchObject({ status: RemoteSessionStatus.ACTIVE });
+    });
+
+    it('responde 404 con un id que no existe', async () => {
+      await expect(
+        service.activateByTechnician(randomUUID(), technicianA),
+      ).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('filtra por tecnico en la consulta bloqueante y no despues', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      await expect(
+        service.activateByTechnician(remoteSessionId, technicianB),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      // La sesion ajena ni siquiera se bloquea: la pertenencia viaja en el
+      // WHERE, no en un `if` posterior.
+      expect(lockedRows).not.toContain(`RemoteSession:${remoteSessionId}`);
+    });
+
+    it('la sesion ACTIVE sigue siendo la actual de los dos extremos', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      await service.activateByTechnician(remoteSessionId, technicianA);
+
+      await expect(
+        service.findCurrentForTechnician(technicianA.id),
+      ).resolves.toMatchObject({
+        remoteSession: {
+          id: remoteSessionId,
+          status: RemoteSessionStatus.ACTIVE,
+        },
+      });
+
+      await expect(
+        service.findCurrentForDevice(deviceA.id),
+      ).resolves.toMatchObject({
+        remoteSession: {
+          id: remoteSessionId,
+          status: RemoteSessionStatus.ACTIVE,
+        },
+      });
+    });
+
+    it('se puede cerrar una sesion ya activa, conservando connectedAt', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+
+      const { connectedAt } = await service.activateByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+
+      const closed = await service.closeByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+
+      expect(closed).toMatchObject({
+        status: RemoteSessionStatus.CLOSED,
+        endedBy: RemoteSessionEndedBy.TECHNICIAN,
+        connectedAt,
+      });
+      expect(sessionRow(remoteSessionId).connectedAt).toEqual(connectedAt);
+      // El flujo existente no cambia: cerrar sigue completando la solicitud.
+      expect(requestRow(supportRequestId).status).toBe(
+        SupportRequestStatus.COMPLETED,
+      );
+    });
+
+    it('tambien puede cerrarla el dispositivo estando ACTIVE', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+
+      await service.activateByTechnician(remoteSessionId, technicianA);
+
+      await expect(
+        service.closeByDevice(remoteSessionId, deviceA),
+      ).resolves.toMatchObject({
+        status: RemoteSessionStatus.CLOSED,
+        endedBy: RemoteSessionEndedBy.DEVICE,
+      });
+      expect(requestRow(supportRequestId).status).toBe(
+        SupportRequestStatus.COMPLETED,
+      );
+    });
+  });
+
+  describe('remote-session:active', () => {
+    it('avisa a los dos extremos con el payload minimo', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      await service.activateByTechnician(remoteSessionId, technicianA);
+
+      expect(emitToDevice).toHaveBeenCalledTimes(1);
+      expect(emitToDevice).toHaveBeenCalledWith(
+        deviceA.id,
+        REMOTE_SESSION_ACTIVE_EVENT,
+        { remoteSessionId },
+      );
+
+      expect(emitToTechnician).toHaveBeenCalledTimes(1);
+      expect(emitToTechnician).toHaveBeenCalledWith(
+        technicianA.id,
+        REMOTE_SESSION_ACTIVE_EVENT,
+        { remoteSessionId },
+      );
+    });
+
+    it('no lleva nada mas que el id de la sesion', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      await service.activateByTechnician(remoteSessionId, technicianA);
+
+      const [, , payload] = emitToDevice.mock.calls[0] as [
+        string,
+        string,
+        Record<string, unknown>,
+      ];
+
+      // REST es la fuente de verdad: el evento es un disparador, no el estado.
+      expect(Object.keys(payload)).toEqual(['remoteSessionId']);
+    });
+
+    it('no vuelve a emitir cuando la sesion ya estaba ACTIVE', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      await service.activateByTechnician(remoteSessionId, technicianA);
+
+      emitToDevice.mockClear();
+      emitToTechnician.mockClear();
+
+      await service.activateByTechnician(remoteSessionId, technicianA);
+
+      // Solo la transicion real avisa; un reintento no.
+      expect(emitToDevice).not.toHaveBeenCalled();
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it('no emite cuando la activacion falla', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      await service.closeByTechnician(remoteSessionId, technicianA);
+      emitToDevice.mockClear();
+
+      await expect(
+        service.activateByTechnician(remoteSessionId, technicianA),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(emitToDevice).not.toHaveBeenCalled();
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it('mantiene la activacion aunque falle el aviso a la tablet', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      emitToDevice.mockImplementation(() => {
+        throw new Error('transporte caido');
+      });
+
+      await expect(
+        service.activateByTechnician(remoteSessionId, technicianA),
+      ).resolves.toMatchObject({ status: RemoteSessionStatus.ACTIVE });
+
+      expect(sessionRow(remoteSessionId).status).toBe(
+        RemoteSessionStatus.ACTIVE,
+      );
+      expect(sessionRow(remoteSessionId).connectedAt).toBeInstanceOf(Date);
+      // Un extremo caido no puede dejar al otro sin enterarse.
+      expect(emitToTechnician).toHaveBeenCalledTimes(1);
+    });
+
+    it('mantiene la activacion aunque falle el aviso al tecnico', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      emitToTechnician.mockImplementation(() => {
+        throw new Error('transporte caido');
+      });
+
+      // La persistencia es la fuente de verdad: el aviso no la deshace ni
+      // convierte una activacion correcta en un 500.
+      await expect(
+        service.activateByTechnician(remoteSessionId, technicianA),
+      ).resolves.toMatchObject({ status: RemoteSessionStatus.ACTIVE });
+
+      expect(sessionRow(remoteSessionId).status).toBe(
+        RemoteSessionStatus.ACTIVE,
+      );
+      expect(emitToDevice).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('carrera entre activar y cerrar', () => {
+    /** Ningun final puede dejar la sesion fuera de estos estados. */
+    const expectConsistent = (
+      remoteSessionId: string,
+      supportRequestId: string,
+    ): void => {
+      const row = sessionRow(remoteSessionId);
+
+      expect([
+        RemoteSessionStatus.ACTIVE,
+        RemoteSessionStatus.CLOSED,
+      ]).toContain(row.status);
+
+      if (row.status === RemoteSessionStatus.CLOSED) {
+        expect(row.endedAt).toBeInstanceOf(Date);
+        expect(row.endedBy).not.toBeNull();
+        expect(requestRow(supportRequestId).status).toBe(
+          SupportRequestStatus.COMPLETED,
+        );
+
+        // Si llego a activarse, la conexion siempre es anterior al cierre.
+        if (row.connectedAt)
+          expect(row.connectedAt.getTime()).toBeLessThanOrEqual(
+            (row.endedAt as Date).getTime(),
+          );
+      } else {
+        expect(row.connectedAt).toBeInstanceOf(Date);
+        expect(row.endedAt).toBeNull();
+        expect(requestRow(supportRequestId).status).toBe(
+          SupportRequestStatus.ACCEPTED,
+        );
+      }
+    };
+
+    it('cerrar antes deja el activate en 409 y la sesion CLOSED', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+
+      const closed = await service.closeByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+
+      await expect(
+        service.activateByTechnician(remoteSessionId, technicianA),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(sessionRow(remoteSessionId).endedAt).toEqual(closed.endedAt);
+      expectConsistent(remoteSessionId, supportRequestId);
+    });
+
+    it('activar antes deja que el cierre haga ACTIVE -> CLOSED', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+
+      await service.activateByTechnician(remoteSessionId, technicianA);
+
+      await expect(
+        service.closeByTechnician(remoteSessionId, technicianA),
+      ).resolves.toMatchObject({ status: RemoteSessionStatus.CLOSED });
+
+      expectConsistent(remoteSessionId, supportRequestId);
+    });
+
+    it('activate y close simultaneos no dejan un estado imposible', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+
+      const results = await Promise.allSettled([
+        service.activateByTechnician(remoteSessionId, technicianA),
+        service.closeByDevice(remoteSessionId, deviceA),
+      ]);
+
+      const [activate] = results;
+
+      // Perder la carrera es 409, nunca un 500 ni una sesion reabierta.
+      if (activate.status === 'rejected')
+        expect(activate.reason).toBeInstanceOf(ConflictException);
+
+      expectConsistent(remoteSessionId, supportRequestId);
+      expect(sessionRow(remoteSessionId).status).toBe(
+        RemoteSessionStatus.CLOSED,
+      );
+    });
+
+    it('tampoco al revés: cerrar y activar a la vez', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+
+      const results = await Promise.allSettled([
+        service.closeByDevice(remoteSessionId, deviceA),
+        service.activateByTechnician(remoteSessionId, technicianA),
+      ]);
+
+      const [, activate] = results;
+
+      if (activate.status === 'rejected')
+        expect(activate.reason).toBeInstanceOf(ConflictException);
+
+      expectConsistent(remoteSessionId, supportRequestId);
+      // CLOSED es terminal: una activacion que llegue tarde no lo deshace.
+      expect(sessionRow(remoteSessionId).status).toBe(
+        RemoteSessionStatus.CLOSED,
+      );
     });
   });
 

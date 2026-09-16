@@ -63,6 +63,23 @@ export class RemoteSessionsController {
   }
 
   /**
+   * El tecnico informa de que WebRTC quedo conectado: `CONNECTING -> ACTIVE`.
+   *
+   * Sin `@Body()` a proposito, igual que el cierre: el cuerpo ni siquiera se
+   * lee, asi que no hay forma de sugerir un `status`, un `connectedAt` ni otro
+   * tecnico. La sesion sale del path y el tecnico del token.
+   *
+   * Responde `200` y no `201`: no crea nada, cambia el estado de una sesion que
+   * ya existe. Es idempotente, asi que un reintento sobre una sesion ya
+   * `ACTIVE` vuelve a responder `200` con la misma sesion.
+   */
+  @Post(':id/activate')
+  @HttpCode(HttpStatus.OK)
+  activate(@Param('id', ParseUUIDPipe) id: string, @GetUser() user: User) {
+    return this.remoteSessionsService.activateByTechnician(id, user);
+  }
+
+  /**
    * El tecnico finaliza la asistencia: la sesion pasa a `CLOSED` y su solicitud
    * a `COMPLETED`, en la misma transaccion.
    *

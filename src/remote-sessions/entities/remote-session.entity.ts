@@ -132,8 +132,9 @@ export class RemoteSession {
   /**
    * Momento en que la conexion remota quedo establecida.
    *
-   * Permanece `null` mientras no exista WebRTC: se escribira cuando la sesion
-   * pase de verdad a `ACTIVE`.
+   * `null` mientras la sesion siga `CONNECTING`. Lo escribe el backend, nunca
+   * el cliente, en la transicion `CONNECTING -> ACTIVE` y una sola vez: como
+   * ningun estado vuelve a `CONNECTING`, un segundo `/activate` no lo toca.
    */
   @Column({ type: 'timestamp', nullable: true })
   connectedAt: Date | null;
