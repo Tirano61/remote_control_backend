@@ -1,4 +1,4 @@
-import { ConflictException } from '@nestjs/common';
+import { ConflictException, NotFoundException } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { randomUUID } from 'crypto';
@@ -15,6 +15,7 @@ import {
   ACTIVE_TECHNICIAN_REMOTE_SESSION_INDEX,
   RemoteSession,
 } from '../src/remote-sessions/entities/remote-session.entity';
+import { RemoteSessionEndedBy } from '../src/remote-sessions/enums/remote-session-ended-by.enum';
 import {
   ACTIVE_REMOTE_SESSION_STATUSES,
   RemoteSessionStatus,
@@ -224,6 +225,46 @@ describe('remote_sessions contra PostgreSQL', () => {
       endedAt: null,
       endedBy: null,
     });
+
+  /** Tecnico, solicitud ACCEPTED y sesion CONNECTING, por el flujo real. */
+  const seedLiveSession = async (): Promise<{
+    technician: User;
+    supportRequestId: string;
+    remoteSessionId: string;
+  }> => {
+    const technician = await seedTechnician();
+    const request = await seedRequest(technician);
+
+    const { id } = await service.create(
+      { supportRequestId: request.id },
+      technician,
+    );
+
+    return {
+      technician,
+      supportRequestId: request.id,
+      remoteSessionId: id,
+    };
+  };
+
+  const storedSession = (id: string): Promise<RemoteSession> =>
+    dataSource.getRepository(RemoteSession).findOneByOrFail({ id });
+
+  const storedRequest = (id: string): Promise<SupportRequest> =>
+    dataSource.getRepository(SupportRequest).findOneByOrFail({ id });
+
+  /** `CONNECTING | ACTIVE -> CLOSED` a pelo, para poder dejarlo sin confirmar. */
+  const closeSessionRaw = (runner: QueryRunner, id: string): Promise<unknown> =>
+    runner.manager
+      .createQueryBuilder()
+      .update(RemoteSession)
+      .set({
+        status: RemoteSessionStatus.CLOSED,
+        endedAt: new Date(),
+        endedBy: RemoteSessionEndedBy.TECHNICIAN,
+      })
+      .where('id = :id', { id })
+      .execute();
 
   // ---------------------------------------------------------------------------
   // El indice
@@ -445,6 +486,272 @@ describe('remote_sessions contra PostgreSQL', () => {
 
       expect(await liveSessionsOfTechnician(technicianA.id)).toBe(1);
       expect(await liveSessionsOfTechnician(technicianB.id)).toBe(1);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Activacion
+  // ---------------------------------------------------------------------------
+
+  describe('CONNECTING -> ACTIVE', () => {
+    it('activa la sesion y escribe connectedAt una sola vez', async () => {
+      const { technician, remoteSessionId, supportRequestId } =
+        await seedLiveSession();
+
+      expect((await storedSession(remoteSessionId)).connectedAt).toBeNull();
+
+      const activated = await service.activateByTechnician(
+        remoteSessionId,
+        technician,
+      );
+
+      expect(activated.status).toBe(RemoteSessionStatus.ACTIVE);
+      expect(activated.connectedAt).toBeInstanceOf(Date);
+
+      const stored = await storedSession(remoteSessionId);
+
+      expect(stored.status).toBe(RemoteSessionStatus.ACTIVE);
+      expect(stored.connectedAt).toEqual(activated.connectedAt);
+
+      // La solicitud no se toca al activar: sigue asociada a la asistencia
+      // hasta que la sesion cierre.
+      expect((await storedRequest(supportRequestId)).status).toBe(
+        SupportRequestStatus.ACCEPTED,
+      );
+
+      // Y sigue siendo la unica sesion viva del tecnico: ACTIVE tambien cuenta.
+      expect(await liveSessionsOfTechnician(technician.id)).toBe(1);
+    });
+
+    it('un reintento devuelve la misma sesion sin mover connectedAt', async () => {
+      const { technician, remoteSessionId } = await seedLiveSession();
+
+      const first = await service.activateByTechnician(
+        remoteSessionId,
+        technician,
+      );
+
+      const second = await service.activateByTechnician(
+        remoteSessionId,
+        technician,
+      );
+
+      expect(second.status).toBe(RemoteSessionStatus.ACTIVE);
+      expect(second.connectedAt).toEqual(first.connectedAt);
+      expect((await storedSession(remoteSessionId)).connectedAt).toEqual(
+        first.connectedAt,
+      );
+    });
+
+    it('una sesion CLOSED no vuelve a abrirse', async () => {
+      const { technician, remoteSessionId } = await seedLiveSession();
+
+      const closed = await service.closeByTechnician(
+        remoteSessionId,
+        technician,
+      );
+
+      await expect(
+        service.activateByTechnician(remoteSessionId, technician),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      const stored = await storedSession(remoteSessionId);
+
+      expect(stored.status).toBe(RemoteSessionStatus.CLOSED);
+      expect(stored.endedAt).toEqual(closed.endedAt);
+      expect(stored.connectedAt).toBeNull();
+    });
+
+    it('la sesion de otro tecnico responde 404 y no se activa', async () => {
+      const { remoteSessionId } = await seedLiveSession();
+      const other = await seedTechnician();
+
+      await expect(
+        service.activateByTechnician(remoteSessionId, other),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      expect((await storedSession(remoteSessionId)).status).toBe(
+        RemoteSessionStatus.CONNECTING,
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // La carrera activate / close
+  // ---------------------------------------------------------------------------
+
+  describe('activar y cerrar a la vez', () => {
+    it('el motor bloquea el activate mientras el cierre no confirma, y despues responde 409', async () => {
+      const { technician, remoteSessionId } = await seedLiveSession();
+
+      const runner = dataSource.createQueryRunner();
+
+      await runner.connect();
+
+      try {
+        await runner.startTransaction();
+
+        // Cierre sin confirmar: la fila queda bloqueada.
+        await closeSessionRaw(runner, remoteSessionId);
+
+        // El `SELECT ... FOR UPDATE` de la activacion no puede leer la fila ni
+        // decidir nada hasta saber que hace el cierre. Ninguna comprobacion de
+        // aplicacion podria producir esto.
+        let settled = false;
+        const blocked = service
+          .activateByTechnician(remoteSessionId, technician)
+          .finally(() => {
+            settled = true;
+          });
+
+        blocked.catch(() => undefined);
+
+        await delay(1_000);
+
+        expect(settled).toBe(false);
+
+        await runner.commitTransaction();
+
+        // Al reevaluar la fila bloqueada ya lee CLOSED: terminal.
+        await expect(blocked).rejects.toBeInstanceOf(ConflictException);
+      } finally {
+        await runner.release();
+      }
+
+      const stored = await storedSession(remoteSessionId);
+
+      expect(stored.status).toBe(RemoteSessionStatus.CLOSED);
+      expect(stored.connectedAt).toBeNull();
+    });
+
+    it('el cierre espera a la activacion y despues hace ACTIVE -> CLOSED', async () => {
+      const { technician, remoteSessionId, supportRequestId } =
+        await seedLiveSession();
+
+      const runner = dataSource.createQueryRunner();
+
+      await runner.connect();
+
+      try {
+        await runner.startTransaction();
+
+        // Activacion sin confirmar, con el mismo lock que toma el servicio.
+        await runner.manager.findOne(RemoteSession, {
+          where: { id: remoteSessionId },
+          lock: { mode: 'pessimistic_write' },
+        });
+
+        await runner.manager
+          .createQueryBuilder()
+          .update(RemoteSession)
+          .set({
+            status: RemoteSessionStatus.ACTIVE,
+            connectedAt: new Date(),
+          })
+          .where('id = :id', { id: remoteSessionId })
+          .execute();
+
+        let settled = false;
+        const blocked = service
+          .closeByTechnician(remoteSessionId, technician)
+          .finally(() => {
+            settled = true;
+          });
+
+        blocked.catch(() => undefined);
+
+        await delay(1_000);
+
+        expect(settled).toBe(false);
+
+        await runner.commitTransaction();
+
+        // El UPDATE condicional reevalua la fila ya ACTIVE, que sigue viva.
+        await expect(blocked).resolves.toMatchObject({
+          status: RemoteSessionStatus.CLOSED,
+          endedBy: RemoteSessionEndedBy.TECHNICIAN,
+        });
+      } finally {
+        await runner.release();
+      }
+
+      const stored = await storedSession(remoteSessionId);
+
+      expect(stored.status).toBe(RemoteSessionStatus.CLOSED);
+      // La conexion queda registrada aunque la sesion termine.
+      expect(stored.connectedAt).toBeInstanceOf(Date);
+      expect((await storedRequest(supportRequestId)).status).toBe(
+        SupportRequestStatus.COMPLETED,
+      );
+    });
+
+    it('activate y close simultaneos no dejan un estado imposible', async () => {
+      const { technician, remoteSessionId, supportRequestId } =
+        await seedLiveSession();
+
+      const [activate, close] = await Promise.allSettled([
+        service.activateByTechnician(remoteSessionId, technician),
+        service.closeByTechnician(remoteSessionId, technician),
+      ]);
+
+      // Quien pierde ve un 409, nunca un 500 ni el error del driver.
+      for (const result of [activate, close])
+        if (result.status === 'rejected')
+          expect(result.reason).toBeInstanceOf(ConflictException);
+
+      const stored = await storedSession(remoteSessionId);
+
+      expect([
+        RemoteSessionStatus.ACTIVE,
+        RemoteSessionStatus.CLOSED,
+      ]).toContain(stored.status);
+
+      if (stored.status === RemoteSessionStatus.CLOSED) {
+        expect(close.status).toBe('fulfilled');
+        expect(stored.endedAt).toBeInstanceOf(Date);
+        expect(stored.endedBy).not.toBeNull();
+        expect((await storedRequest(supportRequestId)).status).toBe(
+          SupportRequestStatus.COMPLETED,
+        );
+
+        // CLOSED es terminal: si llego a activarse, fue antes del cierre.
+        if (stored.connectedAt)
+          expect(stored.connectedAt.getTime()).toBeLessThanOrEqual(
+            (stored.endedAt as Date).getTime(),
+          );
+      } else {
+        // El cierre perdio: entonces tuvo que fallar y la solicitud sigue viva.
+        expect(activate.status).toBe('fulfilled');
+        expect(stored.connectedAt).toBeInstanceOf(Date);
+        expect(stored.endedAt).toBeNull();
+        expect((await storedRequest(supportRequestId)).status).toBe(
+          SupportRequestStatus.ACCEPTED,
+        );
+      }
+    });
+
+    it('nunca deja CLOSED volver a ACTIVE, se llame como se llame', async () => {
+      const { technician, remoteSessionId } = await seedLiveSession();
+
+      await service.activateByTechnician(remoteSessionId, technician);
+      await service.closeByTechnician(remoteSessionId, technician);
+
+      // Varios reintentos tardios del cliente sobre una sesion ya cerrada.
+      const retries = await Promise.allSettled([
+        service.activateByTechnician(remoteSessionId, technician),
+        service.activateByTechnician(remoteSessionId, technician),
+      ]);
+
+      for (const retry of retries) {
+        expect(retry.status).toBe('rejected');
+        expect((retry as PromiseRejectedResult).reason).toBeInstanceOf(
+          ConflictException,
+        );
+      }
+
+      expect((await storedSession(remoteSessionId)).status).toBe(
+        RemoteSessionStatus.CLOSED,
+      );
     });
   });
 

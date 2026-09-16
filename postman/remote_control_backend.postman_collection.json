@@ -1118,7 +1118,7 @@
     },
     {
       "name": "06 - Remote sessions",
-      "description": "The technician routes are mounted under /remote-sessions (User JWT) and the\ndevice ones under /device/remote-sessions (Device JWT).\n\nEvery technician route is ownership-scoped: the session must belong to the\nauthenticated technician. Being admin is not an exemption — it answers 404 like\nanybody else, and /remote-sessions/current answers remoteSession null.\n\nThe two close requests are alternatives: whoever closes first wins and the\nother side gets 409. Each close notifies the other end over Socket.IO.",
+      "description": "The technician routes are mounted under /remote-sessions (User JWT) and the\ndevice ones under /device/remote-sessions (Device JWT).\n\nEvery technician route is ownership-scoped: the session must belong to the\nauthenticated technician. Being admin is not an exemption — it answers 404 like\nanybody else, and /remote-sessions/current answers remoteSession null.\n\nActivate reports that WebRTC came up: CONNECTING -> ACTIVE with connectedAt. It is\nidempotent, so a retry answers 200 with the same session, and it never reopens a\nCLOSED one.\n\nThe two close requests are alternatives: whoever closes first wins and the\nother side gets 409. Each close notifies the other end over Socket.IO.",
       "item": [
         {
           "name": "Create remote session - Technician",
@@ -1369,6 +1369,88 @@
           "response": []
         },
         {
+          "name": "Activate remote session - Technician",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status code is 200 or 409', function () {",
+                  "  pm.expect(pm.response.code).to.be.oneOf([200, 409]);",
+                  "});",
+                  "",
+                  "if (pm.response.code === 409) {",
+                  "  // Expected only when the session is already CLOSED: a closed session never",
+                  "  // reopens. Being already ACTIVE is NOT a conflict, it answers 200.",
+                  "  pm.test('409 explains itself', function () {",
+                  "    const body = pm.response.json();",
+                  "",
+                  "    pm.expect(body.message).to.be.a('string').and.to.not.be.empty;",
+                  "  });",
+                  "}",
+                  "",
+                  "if (pm.response.code === 200) {",
+                  "  const body = pm.response.json();",
+                  "",
+                  "  pm.test('The session is ACTIVE', function () {",
+                  "    pm.expect(body.status).to.eql('ACTIVE');",
+                  "  });",
+                  "",
+                  "  pm.test('connectedAt is set by the backend', function () {",
+                  "    pm.expect(body.connectedAt).to.not.be.null;",
+                  "    pm.expect(Date.parse(body.connectedAt)).to.not.be.NaN;",
+                  "  });",
+                  "",
+                  "  pm.test('It is the requested session and it is not closed', function () {",
+                  "    pm.expect(body.id).to.eql(pm.environment.get('remoteSessionId'));",
+                  "    pm.expect(body.endedAt).to.be.null;",
+                  "    pm.expect(body.endedBy).to.be.null;",
+                  "  });",
+                  "",
+                  "  // Idempotency seen from the client: running this request again must answer",
+                  "  // 200 with this very same connectedAt.",
+                  "  if (typeof body.connectedAt === 'string') {",
+                  "    const previous = pm.environment.get('remoteSessionConnectedAt');",
+                  "",
+                  "    if (previous) {",
+                  "      pm.test('A retry does not move connectedAt', function () {",
+                  "        pm.expect(body.connectedAt).to.eql(previous);",
+                  "      });",
+                  "    }",
+                  "",
+                  "    pm.environment.set('remoteSessionConnectedAt', body.connectedAt);",
+                  "  }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Authorization",
+                "value": "Bearer {{userToken}}",
+                "type": "text"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/remote-sessions/{{remoteSessionId}}/activate",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "remote-sessions",
+                "{{remoteSessionId}}",
+                "activate"
+              ]
+            },
+            "description": "Step 13 of the end-to-end flow.\n\nThe technician reports that WebRTC is connected and the \"control\" DataChannel\nis open: the session goes CONNECTING -> ACTIVE and the backend sets connectedAt\nwith its own clock.\n\nEMPTY BODY. The request body is not read at all, so a status, a connectedAt or a\ntechnicianId sent here would change nothing. The session comes from the URL and\nthe technician from {{userToken}}.\n\nIdempotent: running it again on an ACTIVE session answers 200 with the same\nsession and the same connectedAt, and emits no second event. That covers the\nreal case of a lost response over a network that has just come up.\n\n404 if the session belongs to another technician (admin included: there is no\ntakeover). 409 only if the session is already CLOSED.\n\nOn the real transition the backend emits remote-session:active to the device and\nto the technician; both answer it with their GET current.\n\nStores: remoteSessionConnectedAt, to check the retry."
+          },
+          "response": []
+        },
+        {
           "name": "Close remote session - Technician",
           "event": [
             {
@@ -1412,7 +1494,7 @@
                 "close"
               ]
             },
-            "description": "Step 13 of the end-to-end flow.\n\nThe technician ends the assistance: the session becomes CLOSED with\nendedBy TECHNICIAN and its support request becomes COMPLETED in the same\ntransaction. Emits remote-session:closed to the device."
+            "description": "Step 14 of the end-to-end flow.\n\nThe technician ends the assistance: the session becomes CLOSED with\nendedBy TECHNICIAN and its support request becomes COMPLETED in the same\ntransaction. Emits remote-session:closed to the device."
           },
           "response": []
         },

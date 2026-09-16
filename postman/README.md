@@ -169,8 +169,16 @@ The token lasts 2 hours. When it expires, run *Login user* again or
 11  Create remote session                     06 - Remote sessions
 12a Get current remote session - Device       06 - Remote sessions
 12b Get current remote session - Technician   06 - Remote sessions
-13  Close remote session                      06 - Remote sessions
+13  Activate remote session                   06 - Remote sessions
+14  Close remote session                      06 - Remote sessions
 ```
+
+Step 13 is what `remote_control_web` sends once its `RTCPeerConnection` is
+connected and the `control` DataChannel is open: the session goes
+`CONNECTING -> ACTIVE` and the backend stamps `connectedAt`. It takes an empty
+body, it is safe to repeat (a retry answers `200` with the same `connectedAt`),
+and it is not a precondition for step 14 — a session can be closed while still
+`CONNECTING`.
 
 Step 12b is what `remote_control_web` uses to recover its own session: it takes
 no id, only `{{userToken}}`, so a lost `remoteSessionId` is not a problem. It is
@@ -206,6 +214,8 @@ supportRequestId   Create support request, Get current support request
 remoteSessionId    Create remote session,
                    Get current remote session - Device,
                    Get current remote session - Technician
+remoteSessionConnectedAt
+                   Activate remote session
 ```
 
 Filled in by hand:

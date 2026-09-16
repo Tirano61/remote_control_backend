@@ -13,9 +13,11 @@ export enum RemoteSessionStatus {
   /**
    * La conexion remota quedo establecida.
    *
-   * Todavia no se usa: no hay signaling/WebRTC, asi que no existe una condicion
-   * real que permita afirmarlo. Por eso NO hay ningun endpoint que marque una
-   * sesion como `ACTIVE`; llegara con el bloque de signaling.
+   * Lo escribe unicamente `POST /remote-sessions/:id/activate`, cuando el
+   * tecnico informa de que su `RTCPeerConnection` esta conectada y el
+   * DataChannel de control abierto: el backend no participa en WebRTC y no
+   * puede deducirlo por si mismo. El signaling NO cambia el estado de la
+   * sesion.
    */
   ACTIVE = 'ACTIVE',
 

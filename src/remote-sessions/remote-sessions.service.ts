@@ -50,6 +50,18 @@ export const REMOTE_SESSION_CREATED_EVENT = 'remote-session:created';
  */
 export const REMOTE_SESSION_CLOSED_EVENT = 'remote-session:closed';
 
+/**
+ * Aviso de que la conexion remota quedo establecida, hacia los DOS extremos.
+ *
+ * Mismo nombre y mismo payload en `/devices` y en `/technicians`: un unico
+ * contrato para un unico hecho, igual que `remote-session:closed`.
+ *
+ * NO es signaling: es un evento de dominio y tiene que llegar aunque el
+ * destinatario no haya ejecutado `remote-session:join`. Solo se emite en la
+ * transicion real `CONNECTING -> ACTIVE`.
+ */
+export const REMOTE_SESSION_ACTIVE_EVENT = 'remote-session:active';
+
 /** Payload de `remote-session:created`. Sin email, sin roles y sin tokens. */
 export interface RemoteSessionCreatedPayload {
   remoteSessionId: string;
@@ -61,6 +73,17 @@ export interface RemoteSessionCreatedPayload {
 export interface RemoteSessionClosedPayload {
   remoteSessionId: string;
   endedBy: RemoteSessionEndedBy;
+}
+
+/**
+ * Payload de `remote-session:active`. Deliberadamente minimo.
+ *
+ * El evento es un disparador, no el estado: el cliente responde leyendo la
+ * sesion por REST (`GET /remote-sessions/current` o
+ * `GET /device/remote-sessions/current`).
+ */
+export interface RemoteSessionActivePayload {
+  remoteSessionId: string;
 }
 
 /** Forma minima del error que devuelve el driver de PostgreSQL. */
@@ -236,6 +259,85 @@ export class RemoteSessionsService {
     return this.toResponse(await this.findOwnedByTechnicianOrFail(id, user.id));
   }
 
+  /**
+   * El tecnico informa de que la conexion remota quedo establecida.
+   *
+   * Lo llama `remote_control_web` cuando su `RTCPeerConnection` esta
+   * `connected` y el DataChannel de control abierto. El backend no lo puede
+   * saber por si mismo: no participa en WebRTC y el signaling nunca cambia el
+   * estado de la sesion.
+   *
+   * Del cliente no llega NADA: el tecnico sale del User JWT, la sesion del path
+   * y `connectedAt` lo genera el backend. Un `connectedAt` o un `status`
+   * enviados por Flutter no se leerian aunque viajaran en el body.
+   *
+   * Idempotente a proposito, porque este aviso viaja justo cuando la red acaba
+   * de establecerse y su respuesta puede perderse: un segundo `/activate` sobre
+   * una sesion que ya esta `ACTIVE` devuelve la misma sesion, con el
+   * `connectedAt` original y sin volver a emitir nada.
+   *
+   * La pertenencia es la misma que en el resto de endpoints del tecnico: la
+   * sesion de otro responde `404`, tambien para `admin`. No hay takeover.
+   */
+  async activateByTechnician(
+    id: string,
+    user: User,
+  ): Promise<RemoteSessionResponseDto> {
+    // Transaccion con la fila bloqueada: es el punto de serializacion con el
+    // cierre. Mientras este lock este tomado, ningun `close` puede colarse
+    // entre la lectura del estado y el UPDATE.
+    const { remoteSession, activated } = await this.dataSource.transaction(
+      async (manager) => {
+        const locked = await this.lockSessionOwnedByTechnicianOrFail(
+          manager,
+          id,
+          user.id,
+        );
+
+        // `CLOSED` es terminal: una sesion cerrada no vuelve a abrirse nunca,
+        // ni siquiera por un reintento del cliente.
+        if (locked.status === RemoteSessionStatus.CLOSED)
+          throw new ConflictException(
+            `Remote session with id ${id} is already closed`,
+          );
+
+        // Reintento sobre una sesion ya activa: se devuelve tal cual. No se
+        // toca `connectedAt` ni se vuelve a avisar por Socket.IO.
+        if (locked.status === RemoteSessionStatus.ACTIVE)
+          return {
+            remoteSession: await this.withRelations(manager, locked, user),
+            activated: false,
+          };
+
+        const connectedAt = new Date();
+
+        // Condicionado al estado, igual que el cierre: aunque aqui el lock ya
+        // lo garantiza, la comprobacion y la escritura siguen ocurriendo en la
+        // misma sentencia.
+        if (!(await this.activateSession(manager, id, connectedAt)))
+          throw new ConflictException(
+            `Remote session with id ${id} is already closed`,
+          );
+
+        Object.assign(locked, {
+          status: RemoteSessionStatus.ACTIVE,
+          connectedAt,
+        });
+
+        return {
+          remoteSession: await this.withRelations(manager, locked, user),
+          activated: true,
+        };
+      },
+    );
+
+    // Solo cuando ocurrio de verdad `CONNECTING -> ACTIVE`, y solo despues del
+    // commit: no se anuncia una activacion que todavia pudiera deshacerse.
+    if (activated) this.notifyActivated(remoteSession);
+
+    return this.toResponse(remoteSession);
+  }
+
   /** El tecnico finaliza la asistencia. */
   async closeByTechnician(
     id: string,
@@ -392,6 +494,34 @@ export class RemoteSessionsService {
   }
 
   /**
+   * `CONNECTING -> ACTIVE` en un unico UPDATE condicional.
+   *
+   * `connectedAt` se escribe aqui y en ningun otro sitio, y solo desde
+   * `CONNECTING`: como `ACTIVE` y `CLOSED` no vuelven nunca a `CONNECTING`, la
+   * columna no puede escribirse dos veces. Un segundo `/activate` no llega a
+   * ejecutar esta sentencia.
+   *
+   * Devuelve `false` cuando la sesion ya no estaba `CONNECTING`.
+   */
+  private async activateSession(
+    manager: EntityManager,
+    id: string,
+    connectedAt: Date,
+  ): Promise<boolean> {
+    const result = await manager
+      .createQueryBuilder()
+      .update(RemoteSession)
+      .set({ status: RemoteSessionStatus.ACTIVE, connectedAt })
+      .where('id = :id', { id })
+      .andWhere('status IN (:...from)', {
+        from: [RemoteSessionStatus.CONNECTING],
+      })
+      .execute();
+
+    return result.affected === 1;
+  }
+
+  /**
    * `ACCEPTED -> COMPLETED`, tambien condicional.
    *
    * Solo escribe `status` y `closedAt`: `respondedAt`, `technicianId` y
@@ -448,6 +578,57 @@ export class RemoteSessionsService {
 
     if (!remoteSession)
       throw new NotFoundException(`Remote session with id ${id} not found`);
+
+    return remoteSession;
+  }
+
+  /**
+   * Bloquea la fila de la sesion del tecnico autenticado.
+   *
+   * Es el `SELECT ... FOR UPDATE` que serializa la activacion con el cierre:
+   * un `close` concurrente espera a este lock, y despues reevalua la fila.
+   * Quien llegue segundo ve lo que dejo el primero, nunca el estado anterior.
+   *
+   * La pertenencia viaja en el WHERE, igual que en `findOwnedOrFail`: la sesion
+   * de otro tecnico se comporta como inexistente (`404`) y ni siquiera se
+   * bloquea.
+   *
+   * Sin relaciones, por el mismo motivo que en la solicitud: TypeORM las
+   * resolveria con LEFT JOIN y PostgreSQL no admite `FOR UPDATE` sobre el lado
+   * nullable de un outer join. Las carga despues `withRelations`.
+   */
+  private async lockSessionOwnedByTechnicianOrFail(
+    manager: EntityManager,
+    id: string,
+    technicianId: string,
+  ): Promise<RemoteSession> {
+    const remoteSession = await manager.findOne(RemoteSession, {
+      where: { id, technicianId },
+      lock: { mode: 'pessimistic_write' },
+    });
+
+    if (!remoteSession)
+      throw new NotFoundException(`Remote session with id ${id} not found`);
+
+    return remoteSession;
+  }
+
+  /**
+   * Completa la sesion bloqueada con lo que necesita la respuesta.
+   *
+   * El tecnico es el usuario autenticado, asi que no hay que ir a buscarlo; el
+   * dispositivo se lee aparte porque la consulta bloqueante no puede arrastrar
+   * relaciones. Es lo mismo que hace `create` tras insertar.
+   */
+  private async withRelations(
+    manager: EntityManager,
+    remoteSession: RemoteSession,
+    technician: User,
+  ): Promise<RemoteSession> {
+    remoteSession.device = await manager.findOneByOrFail(Device, {
+      id: remoteSession.deviceId,
+    });
+    remoteSession.technician = technician;
 
     return remoteSession;
   }
@@ -590,6 +771,61 @@ export class RemoteSessionsService {
       REMOTE_SESSION_CREATED_EVENT,
       payload,
     );
+  }
+
+  /**
+   * Avisa a los DOS extremos de que la sesion quedo activa.
+   *
+   * Cada uno por su room personal y no por la de la sesion: es un evento de
+   * dominio, no signaling, y tiene que llegar aunque el destinatario no haya
+   * ejecutado `remote-session:join`.
+   *
+   * Ninguno de los dos envios forma parte de la transaccion: la sesion ya esta
+   * `ACTIVE` en PostgreSQL y nada de lo que ocurra aqui puede deshacerlo ni
+   * convertir una activacion correcta en un `500`. Por eso cada envio va por
+   * separado: un transporte caido en un extremo no debe impedir el aviso al
+   * otro. Quien no lo reciba recupera el estado por REST.
+   */
+  private notifyActivated(remoteSession: RemoteSession): void {
+    const payload: RemoteSessionActivePayload = {
+      remoteSessionId: remoteSession.id,
+    };
+
+    this.deliverActive(remoteSession, `device ${remoteSession.deviceId}`, () =>
+      this.deviceRealtimeService.emitToDevice(
+        remoteSession.deviceId,
+        REMOTE_SESSION_ACTIVE_EVENT,
+        payload,
+      ),
+    );
+
+    this.deliverActive(
+      remoteSession,
+      `technician ${remoteSession.technicianId}`,
+      () =>
+        this.technicianRealtimeService.emitToTechnician(
+          remoteSession.technicianId,
+          REMOTE_SESSION_ACTIVE_EVENT,
+          payload,
+        ),
+    );
+  }
+
+  /** Envia el aviso de activacion y registra el fallo sin propagarlo. */
+  private deliverActive(
+    remoteSession: RemoteSession,
+    recipient: string,
+    emit: () => void,
+  ): void {
+    try {
+      emit();
+    } catch (error) {
+      // Solo ids: nada de tokens ni de SDP.
+      this.logger.error(
+        `Remote session ${remoteSession.id} is ACTIVE, but ${REMOTE_SESSION_ACTIVE_EVENT} could not be delivered to its ${recipient}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+    }
   }
 
   /** Avisa a la tablet de que el tecnico termino la sesion. */

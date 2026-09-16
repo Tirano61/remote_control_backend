@@ -109,6 +109,7 @@ describe('RemoteSessions controllers (HTTP)', () => {
   const remoteSessionsService = {
     create: jest.fn(),
     findOneForTechnician: jest.fn(),
+    activateByTechnician: jest.fn(),
     closeByTechnician: jest.fn(),
     findCurrentForDevice: jest.fn(),
     closeByDevice: jest.fn(),
@@ -204,6 +205,88 @@ describe('RemoteSessions controllers (HTTP)', () => {
         id,
         technician,
       );
+    });
+
+    it('activa la sesion con el tecnico autenticado y responde 200', async () => {
+      const id = randomUUID();
+
+      remoteSessionsService.activateByTechnician.mockResolvedValue({});
+
+      await request(server)
+        .post(`/remote-sessions/${id}/activate`)
+        .set(asTechnician)
+        .expect(200);
+
+      expect(remoteSessionsService.activateByTechnician).toHaveBeenCalledWith(
+        id,
+        technician,
+      );
+    });
+
+    it('ignora por completo el body al activar', async () => {
+      const id = randomUUID();
+
+      remoteSessionsService.activateByTechnician.mockResolvedValue({});
+
+      await request(server)
+        .post(`/remote-sessions/${id}/activate`)
+        .set(asTechnician)
+        .send({
+          status: 'CLOSED',
+          connectedAt: '1999-01-01T00:00:00.000Z',
+          technicianId: randomUUID(),
+        })
+        .expect(200);
+
+      // El handler no declara `@Body()`: el servicio solo recibe el id del path
+      // y el usuario del token, asi que nada de lo enviado puede influir en el
+      // estado, en el timestamp ni en el tecnico.
+      expect(remoteSessionsService.activateByTechnician).toHaveBeenCalledWith(
+        id,
+        technician,
+      );
+    });
+
+    it('deja que un admin active (la pertenencia la valida el servicio)', async () => {
+      const id = randomUUID();
+
+      remoteSessionsService.activateByTechnician.mockResolvedValue({});
+
+      await request(server)
+        .post(`/remote-sessions/${id}/activate`)
+        .set({ Authorization: `Bearer ${ADMIN_TOKEN}` })
+        .expect(200);
+
+      expect(remoteSessionsService.activateByTechnician).toHaveBeenCalledWith(
+        id,
+        admin,
+      );
+    });
+
+    it('responde 401 al activar sin token', async () => {
+      await request(server)
+        .post(`/remote-sessions/${randomUUID()}/activate`)
+        .expect(401);
+
+      expect(remoteSessionsService.activateByTechnician).not.toHaveBeenCalled();
+    });
+
+    it('responde 403 al activar con un rol que no es admin ni tecnico', async () => {
+      await request(server)
+        .post(`/remote-sessions/${randomUUID()}/activate`)
+        .set({ Authorization: `Bearer ${USER_TOKEN}` })
+        .expect(403);
+
+      expect(remoteSessionsService.activateByTechnician).not.toHaveBeenCalled();
+    });
+
+    it('responde 400 al activar con un :id que no es UUID', async () => {
+      await request(server)
+        .post('/remote-sessions/no-es-uuid/activate')
+        .set(asTechnician)
+        .expect(400);
+
+      expect(remoteSessionsService.activateByTechnician).not.toHaveBeenCalled();
     });
 
     it('cierra la sesion con el tecnico autenticado', async () => {

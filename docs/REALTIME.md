@@ -43,7 +43,9 @@ What realtime is **not** used for:
 
 * no media. Video, audio and the WebRTC DataChannel never pass through NestJS;
 * no persistence. SDP and ICE candidates are relayed and immediately forgotten;
-* no state changes. Signaling never moves a `RemoteSession` to `ACTIVE`;
+* no state changes. No Socket.IO message moves a `RemoteSession` to `ACTIVE` or
+  closes it. Those are REST calls (`POST /remote-sessions/:id/activate`,
+  `.../close`); realtime only announces what already happened;
 * no technician presence. `/technicians` keeps no registry of connected users,
   and no REST field exposes whether a technician is connected.
 
@@ -220,6 +222,48 @@ This is the tablet's cue to send `remote-session:join` with this
 Best-effort, as above: the session is recoverable with
 `GET /device/remote-sessions/current`.
 
+### remote-session:active
+
+```text
+Direction     server -> device
+Namespace     /devices
+Sent by       backend, after POST /remote-sessions/:id/activate commits
+Received by   every authenticated socket of that device
+ACK           none
+Precondition  the session really moved CONNECTING -> ACTIVE
+```
+
+Payload:
+
+```json
+{ "remoteSessionId": "3d1b9e64-9a0f-4c88-9d0a-6f2a5c7e8b10" }
+```
+
+Notes:
+The technician reports that WebRTC is connected and the `control` DataChannel is
+open; the backend writes `ACTIVE` and `connectedAt` and announces it to both
+ends. The same event name and the same payload reach `/technicians` — one
+contract for one fact.
+
+This is **not** signaling and `remote-session:join` is not required: it is
+addressed to the device, not to the session room, so it arrives on a socket that
+has only authenticated.
+
+The payload is deliberately minimal. Treat the event as a trigger and read the
+state:
+
+```text
+remote-session:active  ->  GET /device/remote-sessions/current
+```
+
+Emitted **only** on the real transition. A retried `/activate` on a session that
+is already `ACTIVE` answers `200` and emits nothing, so the tablet never sees
+this event twice for the same session — and must not rely on receiving it at
+all: delivery is best-effort and nothing is replayed.
+
+Emitted only after the transaction commits, so the session named here is already
+`ACTIVE` in PostgreSQL. If delivery fails, the activation stands.
+
 ### remote-session:closed
 
 ```text
@@ -327,8 +371,9 @@ A user with only `user` or `sales` cannot open this namespace.
 
 ## Scope of this namespace
 
-`/technicians` carries WebRTC signaling and exactly one server notification,
-`remote-session:closed`. It keeps no presence registry and persists nothing.
+`/technicians` carries WebRTC signaling and two server notifications,
+`remote-session:active` and `remote-session:closed`. It keeps no presence
+registry and persists nothing.
 
 Everything else is still read over REST. A technician is **not** told over
 Socket.IO when a device accepts, rejects or cancels a support request: that state
@@ -341,10 +386,11 @@ contract, and membership is a consequence of authenticating.
 
 ## Realtime is a trigger, never the state
 
-`remote_control_web` must treat `remote-session:closed` as *something changed,
+`remote_control_web` must treat every server notification as *something changed,
 go and read it*:
 
 ```text
+remote-session:active  ->  GET /remote-sessions/current
 remote-session:closed  ->  GET /remote-sessions/current
 ```
 
@@ -352,10 +398,11 @@ Not as the state itself. The reasons are the same ones that apply to the tablet:
 
 * delivery is best-effort. A socket that was reconnecting when the device closed
   never sees the event, and nothing is replayed;
-* the event carries no session object, only its id and who ended it;
-* REST is the source of truth. A close is committed to PostgreSQL before any
-  event is emitted, so REST is never behind the event — it can only be ahead of
-  it.
+* the event carries no session object — only its id, plus who ended it in the
+  case of a close;
+* REST is the source of truth. An activation and a close are committed to
+  PostgreSQL before any event is emitted, so REST is never behind the event — it
+  can only be ahead of it.
 
 The same rule covers the case where no event exists at all: after a page reload
 the web app has no socket history, and `GET /remote-sessions/current` is what
@@ -381,10 +428,50 @@ disconnects on its own. What still protects the system in the meantime:
 
 Force-closing a technician's sockets would require a technician presence
 registry, which does not exist today. The handshake room used to deliver
-`remote-session:closed` is not one: it addresses sockets, it does not track who
-is connected, and nothing reads it back.
+`remote-session:active` and `remote-session:closed` is not one: it addresses
+sockets, it does not track who is connected, and nothing reads it back.
 
 ## Events received by remote_control_web
+
+### remote-session:active
+
+```text
+Direction     server -> technician
+Namespace     /technicians
+Sent by       backend, after POST /remote-sessions/:id/activate commits
+Received by   every authenticated socket of the technician who owns the session
+ACK           none
+Precondition  the session really moved CONNECTING -> ACTIVE
+```
+
+Payload:
+
+```json
+{ "remoteSessionId": "3d1b9e64-9a0f-4c88-9d0a-6f2a5c7e8b10" }
+```
+
+Notes:
+Same event name and same payload as the one `/devices` receives. The web app
+gets it even though it is the side that called `/activate`: this is not an echo
+of an HTTP response but the confirmation of a committed state change, and it
+also reaches the technician's other tabs.
+
+`remote-session:join` is **not** required — it is a domain notification
+addressed to the technician, not to the session room.
+
+Answer it by reading the state, never by taking the event as the state:
+
+```text
+remote-session:active  ->  GET /remote-sessions/current
+```
+
+It reaches only the technician the session belongs to; another connected
+technician receives nothing.
+
+Emitted only on the real transition: a retried `/activate` on an `ACTIVE`
+session emits nothing. Emitted only after the transaction commits, and if
+delivery fails the activation stands — realtime never rolls back persisted
+state.
 
 ### remote-session:closed
 
@@ -860,13 +947,14 @@ device:<deviceId>                 internal. Namespace /devices only.
                                   deviceId in the validated token. It is how the
                                   backend addresses a specific tablet
                                   (support:assigned, remote-session:created,
-                                  remote-session:closed).
+                                  remote-session:active, remote-session:closed).
 
 <per-technician room>             internal. Namespace /technicians only.
                                   Joined automatically at handshake, from the
                                   user id in the validated token. It is how the
                                   backend addresses a specific technician
-                                  (remote-session:closed). Its name is not part
+                                  (remote-session:active,
+                                  remote-session:closed). Its name is not part
                                   of this contract and may change.
 
 remote-session:<remoteSessionId>  joined by the server as the result of a
@@ -883,8 +971,8 @@ Points that matter for the Flutter clients:
   is no event to join or leave a room directly. Room membership is a consequence
   of authenticating and of `remote-session:join`;
 * the two handshake rooms carry domain notifications, the session room carries
-  signaling. That is why `remote-session:closed` arrives without having joined
-  anything, while a `webrtc:*` message does not;
+  signaling. That is why `remote-session:active` and `remote-session:closed`
+  arrive without having joined anything, while a `webrtc:*` message does not;
 * membership of the session room is also the whole implementation of readiness:
   `peerJoined` and `remote-session:peer-joined` are answers about who is in
   `remote-session:<id>` in the *other* namespace, and nothing is stored;
@@ -912,9 +1000,11 @@ For signaling, the client must join the RemoteSession again.
 Details that apply to the current implementation:
 
 * **Domain state survives.** Disconnecting affects device presence only. A
-  `RemoteSession` stays `CONNECTING` and a `SupportRequest` keeps its status; no
-  timeout closes either of them today, and `RemoteSessionEndedBy.SYSTEM` is
-  never written.
+  `RemoteSession` keeps its status — `CONNECTING` or `ACTIVE` — and so does a
+  `SupportRequest`; no timeout closes either of them today, nothing moves a
+  session back out of `ACTIVE`, and `RemoteSessionEndedBy.SYSTEM` is never
+  written. Losing the Socket.IO connection does not mean the WebRTC connection
+  is gone, and the backend does not infer anything about it.
 * **The handshake must carry a valid token again.** The Socket.IO client
   resends `auth` on each reconnection attempt, so a client holding an expired
   Device JWT must refresh it (`POST /device-auth/login`) before reconnecting, or
