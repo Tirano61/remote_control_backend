@@ -20,6 +20,7 @@ import { DevicePresenceService } from '../devices/presence/device-presence.servi
 import { DeviceRealtimeService } from '../devices/realtime/device-realtime.service';
 import { RemoteSession } from '../remote-sessions/entities/remote-session.entity';
 import { ACTIVE_REMOTE_SESSION_STATUSES } from '../remote-sessions/enums/remote-session-status.enum';
+import { TechnicianRealtimeService } from '../signaling/realtime/technician-realtime.service';
 import { QuerySupportRequestsDto } from './dto/query-support-requests.dto';
 import {
   CurrentSupportRequestResponseDto,
@@ -39,6 +40,18 @@ export const SUPPORT_ASSIGNED_EVENT = 'support:assigned';
 export interface SupportAssignedPayload {
   supportRequestId: string;
   technician: SupportRequestTechnicianDto;
+}
+
+/**
+ * Aviso al tecnico asignado de que el dispositivo cambio su solicitud.
+ *
+ * Es solo un disparador: la web vuelve a leer `GET /support-requests`.
+ */
+export const SUPPORT_REQUEST_UPDATED_EVENT = 'support-request:updated';
+
+/** Payload de `support-request:updated`. Sin estado: REST es la fuente de verdad. */
+export interface SupportRequestUpdatedPayload {
+  supportRequestId: string;
 }
 
 /** Forma minima del error que devuelve el driver de PostgreSQL. */
@@ -70,6 +83,8 @@ export class SupportRequestsService {
     private readonly devicePresenceService: DevicePresenceService,
 
     private readonly deviceRealtimeService: DeviceRealtimeService,
+
+    private readonly technicianRealtimeService: TechnicianRealtimeService,
   ) {}
 
   // ---------------------------------------------------------------------------
@@ -230,7 +245,12 @@ export class SupportRequestsService {
         );
     });
 
-    return SupportRequestResponseDto.forDevice(await this.findByIdOrFail(id));
+    // La transaccion ya hizo commit: el aviso nunca puede adelantarse al estado.
+    const cancelled = await this.findByIdOrFail(id);
+
+    this.notifyTechnicianUpdated(cancelled);
+
+    return SupportRequestResponseDto.forDevice(cancelled);
   }
 
   // ---------------------------------------------------------------------------
@@ -334,7 +354,14 @@ export class SupportRequestsService {
         `Support request with id ${id} cannot change from ${supportRequest.status} to ${changes.status}`,
       );
 
-    return SupportRequestResponseDto.forDevice(await this.findByIdOrFail(id));
+    // El UPDATE se ejecuta fuera de una transaccion explicita, asi que al volver
+    // ya esta confirmado. Solo se llega aqui con una transicion real: repetir la
+    // operacion es un `409` y no genera un segundo aviso.
+    const updated = await this.findByIdOrFail(id);
+
+    this.notifyTechnicianUpdated(updated);
+
+    return SupportRequestResponseDto.forDevice(updated);
   }
 
   /**
@@ -471,6 +498,41 @@ export class SupportRequestsService {
       SUPPORT_ASSIGNED_EVENT,
       payload,
     );
+  }
+
+  /**
+   * Avisa al tecnico asignado de que el dispositivo cambio la solicitud.
+   *
+   * El destinatario es el `technicianId` persistido, nunca un dato del cliente,
+   * y el aviso va a su room personal: tiene que llegar aunque todavia no exista
+   * ninguna `RemoteSession` ni se haya hecho `remote-session:join`. Sin tecnico
+   * (una cancelacion desde `WAITING`) no hay a quien avisar.
+   *
+   * El aviso NO es la fuente de verdad ni forma parte de la transicion: si el
+   * transporte falla, el estado ya esta en PostgreSQL y no se deshace nada. Por
+   * eso el error se registra y no se propaga: convertirlo en un `500` haria creer
+   * al dispositivo que su respuesta no quedo guardada.
+   */
+  private notifyTechnicianUpdated(supportRequest: SupportRequest): void {
+    if (!supportRequest.technicianId) return;
+
+    const payload: SupportRequestUpdatedPayload = {
+      supportRequestId: supportRequest.id,
+    };
+
+    try {
+      this.technicianRealtimeService.emitToTechnician(
+        supportRequest.technicianId,
+        SUPPORT_REQUEST_UPDATED_EVENT,
+        payload,
+      );
+    } catch (error) {
+      // Solo el id de la solicitud: nada de tokens ni de secretos.
+      this.logger.error(
+        `Support request ${supportRequest.id} is ${supportRequest.status}, but ${SUPPORT_REQUEST_UPDATED_EVENT} could not be delivered to its technician`,
+        error instanceof Error ? error.stack : undefined,
+      );
+    }
   }
 
   private toTechnicianResponse(
