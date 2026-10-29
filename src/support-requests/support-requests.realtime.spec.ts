@@ -25,6 +25,7 @@ import {
 } from '../devices/gateway/devices.gateway';
 import { RemoteSession } from '../remote-sessions/entities/remote-session.entity';
 import { SignalingRealtimeService } from '../signaling/realtime/signaling-realtime.service';
+import { TechnicianRealtimeService } from '../signaling/realtime/technician-realtime.service';
 import { SignalingService } from '../signaling/signaling.service';
 import { SupportRequest } from './entities/support-request.entity';
 import { SupportRequestStatus } from './enums/support-request-status.enum';
@@ -223,6 +224,8 @@ describe('support:assigned (Socket.IO)', () => {
         DeviceAuthService,
         DeviceCredentialsService,
         SupportRequestsService,
+        // `assign` no avisa al tecnico; sin gateway de `/technicians` no emite.
+        TechnicianRealtimeService,
         // Dependencias de signaling del gateway: no se ejercitan aqui.
         SignalingService,
         SignalingRealtimeService,

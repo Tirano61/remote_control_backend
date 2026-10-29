@@ -904,6 +904,10 @@ Notes:
 `ACCEPTED` only means the user authorized that technician. It does **not** create
 a remote session; the technician still has to call `POST /remote-sessions`.
 
+After the change is committed, the assigned technician receives
+`support-request:updated` over Socket.IO — see [REALTIME.md](REALTIME.md).
+Delivery is best-effort and never alters this response.
+
 ## POST /support-requests/:id/reject
 
 ```text
@@ -937,6 +941,11 @@ Errors:
 404 — The request does not exist, or belongs to another device.
 409 — The request is not in ASSIGNED.
 ```
+
+Notes:
+After the change is committed, the assigned technician receives
+`support-request:updated` over Socket.IO — see [REALTIME.md](REALTIME.md).
+Delivery is best-effort and never alters this response.
 
 ## POST /support-requests/:id/cancel
 
@@ -980,6 +989,11 @@ closes the session and completes the request together. Both `409` cases share
 the status code, so the client should re-read state
 (`GET /support-requests/current`, `GET /device/remote-sessions/current`) rather
 than parse the message.
+
+When the request already had an assigned technician (`ASSIGNED` or `ACCEPTED`),
+that technician receives `support-request:updated` over Socket.IO after the
+commit — see [REALTIME.md](REALTIME.md). Cancelling a `WAITING` request notifies
+no one.
 
 ---
 
@@ -1705,6 +1719,8 @@ the Device JWTs issued from it, and force-closes the device sockets.
 4a. POST  /support-requests/:id/accept       (Device JWT)  -> ACCEPTED
 4b. POST  /support-requests/:id/reject       (Device JWT)  -> REJECTED (terminal)
 4c. POST  /support-requests/:id/cancel       (Device JWT)  -> CANCELLED (terminal)
+          -> 4a/4b, and 4c when a technician is assigned, emit
+             support-request:updated to that technician
 
 At any point the tablet reads GET /support-requests/current to recover state.
 ```

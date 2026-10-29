@@ -5,6 +5,7 @@ import { DeviceAuthModule } from '../devices/auth/device-auth.module';
 import { DevicePresenceModule } from '../devices/presence/device-presence.module';
 import { DeviceRealtimeModule } from '../devices/realtime/device-realtime.module';
 import { RemoteSession } from '../remote-sessions/entities/remote-session.entity';
+import { TechnicianRealtimeModule } from '../signaling/realtime/technician-realtime.module';
 import { DeviceSupportRequestsController } from './device-support-requests.controller';
 import { SupportRequest } from './entities/support-request.entity';
 import { SupportRequestsController } from './support-requests.controller';
@@ -46,6 +47,9 @@ import { SupportRequestsService } from './support-requests.service';
     DevicePresenceModule,
     // Salida de eventos hacia la tablet (`support:assigned`).
     DeviceRealtimeModule,
+    // Salida de eventos hacia el tecnico asignado (`support-request:updated`).
+    // Es un modulo sin dependencias: no arrastra el signaling.
+    TechnicianRealtimeModule,
   ],
   exports: [TypeOrmModule, SupportRequestsService],
 })

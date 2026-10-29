@@ -15,6 +15,7 @@ import { DevicePresenceService } from '../devices/presence/device-presence.servi
 import { DeviceRealtimeService } from '../devices/realtime/device-realtime.service';
 import { RemoteSession } from '../remote-sessions/entities/remote-session.entity';
 import { RemoteSessionStatus } from '../remote-sessions/enums/remote-session-status.enum';
+import { TechnicianRealtimeService } from '../signaling/realtime/technician-realtime.service';
 import {
   ACTIVE_SUPPORT_REQUEST_INDEX,
   SupportRequest,
@@ -25,6 +26,7 @@ import {
 } from './enums/support-request-status.enum';
 import {
   SUPPORT_ASSIGNED_EVENT,
+  SUPPORT_REQUEST_UPDATED_EVENT,
   SupportRequestsService,
 } from './support-requests.service';
 
@@ -260,6 +262,7 @@ describe('SupportRequestsService', () => {
   let repository: FakeSupportRequestRepository;
   let remoteSessions: FakeRemoteSessionStore;
   let emitToDevice: jest.Mock;
+  let emitToTechnician: jest.Mock;
   let online: Set<string>;
 
   let deviceA: Device;
@@ -282,6 +285,7 @@ describe('SupportRequestsService', () => {
     }
 
     emitToDevice.mockClear();
+    emitToTechnician.mockClear();
 
     return id;
   };
@@ -306,6 +310,7 @@ describe('SupportRequestsService', () => {
     repository = new FakeSupportRequestRepository();
     remoteSessions = new FakeRemoteSessionStore();
     emitToDevice = jest.fn().mockReturnValue(true);
+    emitToTechnician = jest.fn().mockReturnValue(true);
     online = new Set<string>([deviceA.id, deviceB.id]);
 
     // `EntityManager` con lo justo que usa el servicio. `findOne` ignora el
@@ -347,6 +352,10 @@ describe('SupportRequestsService', () => {
           useValue: { isOnline: (deviceId: string) => online.has(deviceId) },
         },
         { provide: DeviceRealtimeService, useValue: { emitToDevice } },
+        {
+          provide: TechnicianRealtimeService,
+          useValue: { emitToTechnician },
+        },
       ],
     }).compile();
 
@@ -705,6 +714,130 @@ describe('SupportRequestsService', () => {
         status: SupportRequestStatus.CANCELLED,
       });
     });
+  });
+
+  describe('aviso support-request:updated al tecnico asignado', () => {
+    it('avisa tras ASSIGNED -> ACCEPTED, una vez y al tecnico persistido', async () => {
+      const id = await seedRequest(deviceA, SupportRequestStatus.ASSIGNED);
+
+      await service.acceptByDevice(id, deviceA);
+
+      expect(statusOf(id)).toBe(SupportRequestStatus.ACCEPTED);
+      expect(emitToTechnician).toHaveBeenCalledTimes(1);
+      expect(emitToTechnician).toHaveBeenCalledWith(
+        technicianA.id,
+        SUPPORT_REQUEST_UPDATED_EVENT,
+        { supportRequestId: id },
+      );
+    });
+
+    it('avisa tras ASSIGNED -> REJECTED al tecnico persistido', async () => {
+      const id = await seedRequest(deviceA, SupportRequestStatus.ASSIGNED);
+
+      await service.rejectByDevice(id, deviceA);
+
+      expect(statusOf(id)).toBe(SupportRequestStatus.REJECTED);
+      expect(emitToTechnician).toHaveBeenCalledTimes(1);
+      expect(emitToTechnician).toHaveBeenCalledWith(
+        technicianA.id,
+        SUPPORT_REQUEST_UPDATED_EVENT,
+        { supportRequestId: id },
+      );
+    });
+
+    it('el payload solo lleva supportRequestId', async () => {
+      const id = await seedRequest(deviceA, SupportRequestStatus.ASSIGNED);
+
+      await service.acceptByDevice(id, deviceA);
+
+      const [, , payload] = emitToTechnician.mock.calls[0] as [
+        string,
+        string,
+        Record<string, unknown>,
+      ];
+
+      // Ni estado, ni dispositivo, ni tecnico: la web lo relee por REST.
+      expect(Object.keys(payload)).toEqual(['supportRequestId']);
+    });
+
+    it.each([SupportRequestStatus.ASSIGNED, SupportRequestStatus.ACCEPTED])(
+      'avisa tras cancelar desde %s, que ya tiene tecnico',
+      async (status) => {
+        const id = await seedRequest(deviceA, status);
+
+        await service.cancelByDevice(id, deviceA);
+
+        expect(emitToTechnician).toHaveBeenCalledTimes(1);
+        expect(emitToTechnician).toHaveBeenCalledWith(
+          technicianA.id,
+          SUPPORT_REQUEST_UPDATED_EVENT,
+          { supportRequestId: id },
+        );
+      },
+    );
+
+    it('no avisa a nadie al cancelar desde WAITING: no hay tecnico', async () => {
+      const id = await seedRequest(deviceA);
+
+      await service.cancelByDevice(id, deviceA);
+
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it('no repite el aviso al aceptar dos veces: la segunda es 409', async () => {
+      const id = await seedRequest(deviceA, SupportRequestStatus.ASSIGNED);
+
+      await service.acceptByDevice(id, deviceA);
+
+      await expect(service.acceptByDevice(id, deviceA)).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+
+      expect(emitToTechnician).toHaveBeenCalledTimes(1);
+    });
+
+    it('no avisa cuando la transicion no se aplica', async () => {
+      const id = await seedRequest(deviceA, SupportRequestStatus.ACCEPTED);
+
+      await expect(service.rejectByDevice(id, deviceA)).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+      await expect(service.acceptByDevice(id, deviceB)).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it('la asignacion no avisa al tecnico: ya tiene la respuesta HTTP', async () => {
+      const id = await seedRequest(deviceA);
+
+      await service.assign(id, technicianA);
+
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['acceptByDevice', SupportRequestStatus.ACCEPTED],
+      ['rejectByDevice', SupportRequestStatus.REJECTED],
+    ] as const)(
+      'si el aviso falla, %s responde bien y no deshace %s',
+      async (method, expected) => {
+        const id = await seedRequest(deviceA, SupportRequestStatus.ASSIGNED);
+
+        emitToTechnician.mockImplementation(() => {
+          throw new Error('transporte caido');
+        });
+
+        await expect(service[method](id, deviceA)).resolves.toMatchObject({
+          id,
+          status: expected,
+        });
+
+        expect(statusOf(id)).toBe(expected);
+        expect(emitToTechnician).toHaveBeenCalledTimes(1);
+      },
+    );
   });
 
   describe('estado COMPLETED', () => {
