@@ -54,6 +54,21 @@ export interface SupportRequestUpdatedPayload {
   supportRequestId: string;
 }
 
+/**
+ * Aviso a todos los tecnicos y admins conectados de que cambio la cola de
+ * solicitudes en espera: aparecio una `WAITING`, o una dejo de estarlo porque
+ * la tomaron o la cancelo el dispositivo.
+ *
+ * Tambien es solo un disparador: la web vuelve a leer `GET /support-requests`.
+ */
+export const SUPPORT_REQUEST_QUEUE_UPDATED_EVENT =
+  'support-request:queue-updated';
+
+/** Payload de `support-request:queue-updated`. Sin estado, igual que el anterior. */
+export interface SupportRequestQueueUpdatedPayload {
+  supportRequestId: string;
+}
+
 /** Forma minima del error que devuelve el driver de PostgreSQL. */
 interface PostgresError {
   code?: string;
@@ -112,10 +127,10 @@ export class SupportRequestsService {
       closedAt: null,
     });
 
-    try {
-      const created = await this.supportRequestRepository.save(supportRequest);
+    let created: SupportRequest;
 
-      return SupportRequestResponseDto.forDevice(created);
+    try {
+      created = await this.supportRequestRepository.save(supportRequest);
     } catch (error) {
       // La unicidad de la solicitud activa la impone el indice parcial de
       // PostgreSQL: no hay un SELECT previo que pudiera perder la carrera
@@ -129,6 +144,13 @@ export class SupportRequestsService {
 
       throw new InternalServerErrorException('Please check server logs');
     }
+
+    // El INSERT es autocommit: al volver de `save` la fila ya es visible por
+    // REST. El aviso queda fuera del try a proposito, para que nunca pueda
+    // acabar convertido en el `500` de arriba.
+    this.notifyQueueUpdated(created);
+
+    return SupportRequestResponseDto.forDevice(created);
   }
 
   /** Solicitud activa del dispositivo autenticado, o `null` si no tiene. */
@@ -203,6 +225,9 @@ export class SupportRequestsService {
     id: string,
     device: Device,
   ): Promise<SupportRequestResponseDto> {
+    // Estado desde el que se cancela: decide a quien avisar tras el commit.
+    let previousStatus: SupportRequestStatus | undefined;
+
     await this.dataSource.transaction(async (manager) => {
       const supportRequest = await this.lockOwnedByDeviceOrFail(
         manager,
@@ -227,6 +252,9 @@ export class SupportRequestsService {
           `Remote assistance for support request with id ${id} already started, close the remote session instead`,
         );
 
+      // Leido con la fila bloqueada y antes del UPDATE.
+      previousStatus = supportRequest.status;
+
       const cancelled = await this.applyTransition(
         manager,
         id,
@@ -248,7 +276,11 @@ export class SupportRequestsService {
     // La transaccion ya hizo commit: el aviso nunca puede adelantarse al estado.
     const cancelled = await this.findByIdOrFail(id);
 
-    this.notifyTechnicianUpdated(cancelled);
+    // Desde `WAITING` la solicitud no tenia duenyo y lo que cambia es la cola
+    // comun; desde `ASSIGNED`/`ACCEPTED` solo le interesa al tecnico asignado.
+    if (previousStatus === SupportRequestStatus.WAITING)
+      this.notifyQueueUpdated(cancelled);
+    else this.notifyTechnicianUpdated(cancelled);
 
     return SupportRequestResponseDto.forDevice(cancelled);
   }
@@ -322,6 +354,11 @@ export class SupportRequestsService {
     const updated = await this.findByIdOrFail(id);
 
     this.notifyAssigned(updated, technician);
+
+    // La solicitud sale de la cola `WAITING`: las demas consolas tienen que
+    // dejar de ofrecerla. El tecnico que la tomo tambien recibe el aviso, y le
+    // sirve igual para reconciliar su vista.
+    this.notifyQueueUpdated(updated);
 
     return this.toTechnicianResponse(updated);
   }
@@ -530,6 +567,35 @@ export class SupportRequestsService {
       // Solo el id de la solicitud: nada de tokens ni de secretos.
       this.logger.error(
         `Support request ${supportRequest.id} is ${supportRequest.status}, but ${SUPPORT_REQUEST_UPDATED_EVENT} could not be delivered to its technician`,
+        error instanceof Error ? error.stack : undefined,
+      );
+    }
+  }
+
+  /**
+   * Avisa a todos los tecnicos y admins conectados de que la cola `WAITING`
+   * cambio.
+   *
+   * Solo se llama despues de una transicion real que entra o sale de `WAITING`
+   * (creacion, asignacion, cancelacion desde `WAITING`) y siempre con el cambio
+   * ya confirmado en PostgreSQL. Igual que `notifyTechnicianUpdated`, un fallo
+   * del transporte se registra y no se propaga: el estado no se deshace y la
+   * respuesta HTTP no cambia.
+   */
+  private notifyQueueUpdated(supportRequest: SupportRequest): void {
+    const payload: SupportRequestQueueUpdatedPayload = {
+      supportRequestId: supportRequest.id,
+    };
+
+    try {
+      this.technicianRealtimeService.emitToAllTechnicians(
+        SUPPORT_REQUEST_QUEUE_UPDATED_EVENT,
+        payload,
+      );
+    } catch (error) {
+      // Solo el id de la solicitud: nada de tokens ni de secretos.
+      this.logger.error(
+        `Support request ${supportRequest.id} is ${supportRequest.status}, but ${SUPPORT_REQUEST_QUEUE_UPDATED_EVENT} could not be delivered to technicians`,
         error instanceof Error ? error.stack : undefined,
       );
     }

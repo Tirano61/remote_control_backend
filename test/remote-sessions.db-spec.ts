@@ -126,7 +126,10 @@ describe('remote_sessions contra PostgreSQL', () => {
         },
         {
           provide: TechnicianRealtimeService,
-          useValue: { emitToTechnician: () => true },
+          useValue: {
+            emitToTechnician: () => true,
+            emitToAllTechnicians: () => true,
+          },
         },
       ],
     }).compile();

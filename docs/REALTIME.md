@@ -371,22 +371,36 @@ A user with only `user` or `sales` cannot open this namespace.
 
 ## Scope of this namespace
 
-`/technicians` carries WebRTC signaling and three server notifications,
-`support-request:updated`, `remote-session:active` and `remote-session:closed`.
-It keeps no presence registry and persists nothing.
+`/technicians` carries WebRTC signaling and four server notifications,
+`support-request:queue-updated`, `support-request:updated`,
+`remote-session:active` and `remote-session:closed`. It keeps no presence
+registry and persists nothing.
 
-When the device accepts, rejects or cancels a support request that already has
-an assigned technician, that technician is told with `support-request:updated`.
+Support requests produce three different events, each with its own audience:
 
-Everything else is still read over REST. In particular, a technician is **not**
-told over Socket.IO when a new `WAITING` request appears, nor when a request is
-cancelled while still `WAITING` (it has no technician to address): the queue
-comes from `GET /support-requests`, polled or re-read after a user action.
+```text
+support:assigned               /devices      the device whose request was taken
+support-request:updated        /technicians  the technician who owns a request
+                                             that is already assigned
+support-request:queue-updated  /technicians  every connected technician/admin,
+                                             because the shared WAITING queue
+                                             changed
+```
 
-On connecting, the server puts the socket in a private room derived from the
-authenticated user, which is how a notification reaches that technician. The room
-is internal: there is no event to join or leave it, its name is not part of this
-contract, and membership is a consequence of authenticating.
+* `support-request:queue-updated` covers the shared queue: a new `WAITING`
+  request, a `WAITING` request taken by a technician (`ASSIGNED`), and a
+  `WAITING` request cancelled by the device (`CANCELLED`).
+* `support-request:updated` covers a request that already has an owner: the
+  device accepts, rejects or cancels it from `ASSIGNED` or `ACCEPTED`.
+
+No transition emits both events to technicians.
+
+On connecting, the server puts the socket in two rooms: a private room derived
+from the authenticated user, which is how a notification reaches that technician,
+and a room shared by every authenticated socket of this namespace, which is how
+the queue notification reaches all of them. Both rooms are internal: there is no
+event to join or leave them, their names are not part of this contract, and
+membership is a consequence of authenticating.
 
 ## Realtime is a trigger, never the state
 
@@ -394,9 +408,10 @@ contract, and membership is a consequence of authenticating.
 go and read it*:
 
 ```text
-support-request:updated  ->  GET /support-requests
-remote-session:active    ->  GET /remote-sessions/current
-remote-session:closed    ->  GET /remote-sessions/current
+support-request:queue-updated  ->  GET /support-requests
+support-request:updated        ->  GET /support-requests
+remote-session:active          ->  GET /remote-sessions/current
+remote-session:closed          ->  GET /remote-sessions/current
 ```
 
 Not as the state itself. The reasons are the same ones that apply to the tablet:
@@ -432,12 +447,83 @@ disconnects on its own. What still protects the system in the meantime:
   `webrtc:*` message re-validates the session.
 
 Force-closing a technician's sockets would require a technician presence
-registry, which does not exist today. The handshake room used to deliver
-`support-request:updated`, `remote-session:active` and `remote-session:closed`
-is not one: it addresses sockets, it does not track who is connected, and
-nothing reads it back.
+registry, which does not exist today. The handshake rooms used to deliver
+`support-request:queue-updated`, `support-request:updated`,
+`remote-session:active` and `remote-session:closed` are not one: they address
+sockets, they do not track who is connected, and nothing reads them back.
+
+A consequence for the queue: a socket whose user lost the `admin`/`tecnico` role
+after connecting keeps receiving `support-request:queue-updated` until it
+disconnects. The event carries only a support request id; reading the queue still
+requires `GET /support-requests`, which rejects that user immediately.
 
 ## Events received by remote_control_web
+
+### support-request:queue-updated
+
+```text
+Direction     server -> technicians/admins
+Namespace     /technicians
+Scope         shared support queue (WAITING requests)
+Sent by       backend, after one of these transitions commits:
+                POST /support-requests              (device)      new request -> WAITING
+                POST /support-requests/:id/assign   (technician)  WAITING -> ASSIGNED
+                POST /support-requests/:id/cancel   (device)      WAITING -> CANCELLED
+Received by   every authenticated socket of /technicians (roles admin, tecnico)
+ACK           none
+Precondition  the request really entered or left WAITING
+```
+
+Payload:
+
+```json
+{ "supportRequestId": "8f14e45f-ceea-4d3c-b4e2-2f4b3c9a1d77" }
+```
+
+Notes:
+A trigger only: *the queue visible to technicians changed, read it again*.
+Answer it with:
+
+```text
+support-request:queue-updated  ->  GET /support-requests
+```
+
+and let the REST response decide what the UI shows: a new `WAITING` request
+appears, an `ASSIGNED` or `CANCELLED` one leaves the waiting list.
+
+* It does **not** contain the status, the device, the technician, timestamps or
+  any other field. Never infer the new state from the event; read it.
+* It is **not** the source of truth. REST is.
+* It does **not** require a `RemoteSession` and `remote-session:join` is **not**
+  required. It arrives as soon as the socket is authenticated.
+* It reaches **every** socket authenticated in `/technicians` — every
+  technician and every admin, not only the one involved. Only users holding
+  `admin` or `tecnico` can open this namespace, so a user with only `user` or
+  `sales`, an unauthenticated socket and a device never receive it.
+* Every tab receives it. A user with two open tabs gets one event per tab; the
+  server does not deduplicate per user.
+* The technician who assigned the request receives it too, alongside the HTTP
+  response of its own `POST /support-requests/:id/assign`. Re-reading the list is
+  harmless and reconciles that tab.
+* On an assignment the device receives `support:assigned` on `/devices` as well.
+  They are two different events for two different audiences; neither replaces
+  the other.
+
+Not emitted for transitions of a request that already has an owner —
+`ASSIGNED -> ACCEPTED`, `ASSIGNED -> REJECTED`, `ASSIGNED | ACCEPTED -> CANCELLED`.
+Those use `support-request:updated`, addressed only to the owner.
+
+Emitted only on a real transition. A create, assign or cancel that answers
+`409` or `404` emits nothing, so repeating a cancel does not emit twice, and when
+two technicians assign the same request at the same time only the winner's
+assignment emits.
+
+Emitted only after the change is committed, so `GET /support-requests` already
+reflects it. If delivery fails, the transition stands and the REST call still
+returns its normal response (`201` for the create, `200` for assign and cancel) —
+realtime never rolls back persisted state. Delivery is best-effort and nothing is
+replayed: a console that was disconnected re-reads `GET /support-requests` after
+reconnecting.
 
 ### support-request:updated
 
@@ -477,8 +563,8 @@ It reaches only the technician whose id is stored on the request. The recipient
 comes from the persisted request, never from anything the device sends. Another
 technician, and an `admin` who is not the assigned technician, receive nothing.
 
-A cancellation of a request that is still `WAITING` emits nothing: it has no
-technician to address.
+A cancellation of a request that is still `WAITING` does not emit this event: it
+has no technician to address. It emits `support-request:queue-updated` instead.
 
 Emitted only on a real transition. Repeating accept, reject or cancel on a
 request that already left that state answers `409` and emits nothing.
@@ -992,7 +1078,7 @@ acknowledgement never hangs.
 
 # Rooms
 
-Three rooms exist. All of them are **assigned by the server**; a client never
+Four rooms exist. All of them are **assigned by the server**; a client never
 names, requests or constructs a room.
 
 ```text
@@ -1012,6 +1098,16 @@ device:<deviceId>                 internal. Namespace /devices only.
                                   remote-session:closed). Its name is not part
                                   of this contract and may change.
 
+<all-technicians room>            internal. Namespace /technicians only.
+                                  Every socket joins it automatically at
+                                  handshake, after its token and role were
+                                  validated. It is how the backend addresses
+                                  every technician and admin at once
+                                  (support-request:queue-updated). It is not
+                                  related to the per-technician rooms nor to
+                                  any remote-session room. Its name is not part
+                                  of this contract and may change.
+
 remote-session:<remoteSessionId>  joined by the server as the result of a
                                   successful remote-session:join, in the
                                   namespace the socket belongs to. It is how a
@@ -1025,10 +1121,10 @@ Points that matter for the Flutter clients:
 * the client does **not** choose the room it is put in at handshake, and there
   is no event to join or leave a room directly. Room membership is a consequence
   of authenticating and of `remote-session:join`;
-* the two handshake rooms carry domain notifications, the session room carries
-  signaling. That is why `support-request:updated`, `remote-session:active` and
-  `remote-session:closed` arrive without having joined anything, while a
-  `webrtc:*` message does not;
+* the handshake rooms carry domain notifications, the session room carries
+  signaling. That is why `support-request:queue-updated`,
+  `support-request:updated`, `remote-session:active` and `remote-session:closed`
+  arrive without having joined anything, while a `webrtc:*` message does not;
 * membership of the session room is also the whole implementation of readiness:
   `peerJoined` and `remote-session:peer-joined` are answers about who is in
   `remote-session:<id>` in the *other* namespace, and nothing is stored;
@@ -1039,8 +1135,9 @@ Points that matter for the Flutter clients:
 * because of that split, a sender never receives its own relayed message: its
   socket lives in the origin namespace and the emission targets the destination
   one;
-* there is no broadcast anywhere in the realtime layer. Every emission targets
-  one specific room.
+* there is no namespace-wide broadcast anywhere in the realtime layer. Every
+  emission targets one specific room; the widest one is the all-technicians
+  room, which only holds sockets authenticated as `admin` or `tecnico`.
 
 ---
 

@@ -578,7 +578,8 @@ describe('RemoteSessionsService', () => {
         { provide: DeviceRealtimeService, useValue: { emitToDevice } },
         {
           provide: TechnicianRealtimeService,
-          useValue: { emitToTechnician },
+          // La cola comun no es lo que se prueba aqui.
+          useValue: { emitToTechnician, emitToAllTechnicians: () => true },
         },
       ],
     }).compile();
