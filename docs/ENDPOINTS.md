@@ -806,6 +806,11 @@ A device may have only one support request in an active state (`WAITING`,
 in PostgreSQL, not by a prior read, so two simultaneous requests cannot both
 succeed.
 
+After the request is stored, every technician and admin connected to
+`/technicians` receives `support-request:queue-updated` over Socket.IO — see
+[REALTIME.md](REALTIME.md). A `409` emits nothing. Delivery is best-effort and
+never alters this response.
+
 ## GET /support-requests/current
 
 ```text
@@ -992,8 +997,10 @@ than parse the message.
 
 When the request already had an assigned technician (`ASSIGNED` or `ACCEPTED`),
 that technician receives `support-request:updated` over Socket.IO after the
-commit — see [REALTIME.md](REALTIME.md). Cancelling a `WAITING` request notifies
-no one.
+commit — see [REALTIME.md](REALTIME.md). Cancelling a `WAITING` request has no
+owner to notify; instead every technician and admin connected to `/technicians`
+receives `support-request:queue-updated`, because the waiting queue changed.
+Delivery is best-effort and never alters this response.
 
 ---
 
@@ -1140,6 +1147,12 @@ because the device may reconnect.
 On success the backend emits `support:assigned` to the device over Socket.IO.
 Delivery is best-effort: if the tablet dropped in between, the assignment is
 still valid and the tablet picks it up with `GET /support-requests/current`.
+
+On success the backend also emits `support-request:queue-updated` to every
+technician and admin connected to `/technicians`, including the caller, so other
+consoles drop the request from their waiting list — see
+[REALTIME.md](REALTIME.md). A failed assignment (`404`, `409`) emits neither
+event. Delivery is best-effort and never alters this response.
 
 ---
 
@@ -1708,21 +1721,28 @@ the Device JWTs issued from it, and force-closes the device sockets.
 ```text
 1. POST   /support-requests                  (Device JWT)
           -> WAITING
+          -> emits support-request:queue-updated to every technician/admin
 
 2. GET    /support-requests?status=WAITING   (User JWT, admin|tecnico)
           -> the queue, oldest first, with device.isOnline
+          -> re-read on every support-request:queue-updated
 
 3. POST   /support-requests/:id/assign       (User JWT, admin|tecnico)
           -> ASSIGNED; requires the device to be ONLINE
           -> emits support:assigned to the device
+          -> emits support-request:queue-updated to every technician/admin
 
 4a. POST  /support-requests/:id/accept       (Device JWT)  -> ACCEPTED
 4b. POST  /support-requests/:id/reject       (Device JWT)  -> REJECTED (terminal)
 4c. POST  /support-requests/:id/cancel       (Device JWT)  -> CANCELLED (terminal)
-          -> 4a/4b, and 4c when a technician is assigned, emit
-             support-request:updated to that technician
+          -> 4a/4b emit support-request:updated to the assigned technician
+          -> 4c from ASSIGNED/ACCEPTED emits support-request:updated to the
+             assigned technician
+          -> 4c from WAITING (before step 3) has no owner and emits
+             support-request:queue-updated to every technician/admin
 
-At any point the tablet reads GET /support-requests/current to recover state.
+At any point the tablet reads GET /support-requests/current to recover state,
+and the web app reads GET /support-requests.
 ```
 
 ### Remote session

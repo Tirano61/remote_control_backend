@@ -5,6 +5,16 @@ export const technicianRoom = (technicianId: string): string =>
   `technician:${technicianId}`;
 
 /**
+ * Room comun a todos los sockets autenticados de `/technicians`.
+ *
+ * Tambien la asigna el servidor: el gateway mete en ella a cada socket al
+ * conectarse, despues de validar el JWT y el rol (`admin` o `tecnico`). No hay
+ * evento para entrar ni salir, y no tiene relacion con las rooms personales ni
+ * con las de `remote-session:<id>`.
+ */
+export const ALL_TECHNICIANS_ROOM = 'technicians:all';
+
+/**
  * Lo minimo que hace falta para hacer llegar un evento a un tecnico.
  *
  * Es a proposito una interfaz y no el `Namespace` de Socket.IO, igual que en
@@ -20,7 +30,7 @@ export interface TechnicianEventTarget {
  *
  * Es el equivalente de `DeviceRealtimeService` en el namespace `/technicians`:
  * `TechniciansGateway` registra aqui su namespace al inicializarse y los
- * modulos de dominio solo ven `emitToTechnician`.
+ * modulos de dominio solo ven `emitToTechnician` y `emitToAllTechnicians`.
  *
  * NO es lo mismo que `SignalingRealtimeService`, que emite a la room de una
  * sesion remota y solo sirve para el relay de SDP/ICE. La diferencia importa:
@@ -69,6 +79,29 @@ export class TechnicianRealtimeService {
     }
 
     this.target.to(technicianRoom(technicianId)).emit(event, payload);
+
+    return true;
+  }
+
+  /**
+   * Envia un evento a todas las conexiones autenticadas de `/technicians`, de
+   * todos los tecnicos y admins a la vez.
+   *
+   * Es para avisos de interes comun, como un cambio en la cola de solicitudes
+   * en espera. No se deduplica por usuario: cada pestana recibe su copia.
+   *
+   * Mismo contrato que `emitToTechnician`: `false` sin transporte, y `true` solo
+   * significa que el evento se entrego al transporte.
+   */
+  emitToAllTechnicians(event: string, payload: unknown): boolean {
+    if (!this.target) {
+      this.logger.warn(
+        `No realtime transport available: event ${event} for all technicians was not delivered`,
+      );
+      return false;
+    }
+
+    this.target.to(ALL_TECHNICIANS_ROOM).emit(event, payload);
 
     return true;
   }

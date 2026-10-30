@@ -25,6 +25,7 @@ import {
 } from '../interfaces/signaling-participant.interface';
 import { SignalingRealtimeService } from '../realtime/signaling-realtime.service';
 import {
+  ALL_TECHNICIANS_ROOM,
   TechnicianRealtimeService,
   technicianRoom,
 } from '../realtime/technician-realtime.service';
@@ -99,7 +100,10 @@ type TechnicianNamespace = Namespace<
  * - el signaling de WebRTC, sobre la room `remote-session:<id>`, a la que solo
  *   se entra con `remote-session:join`;
  * - los avisos de dominio dirigidos al tecnico (hoy `remote-session:closed`),
- *   sobre su room personal, en la que entra al conectarse.
+ *   sobre su room personal, en la que entra al conectarse;
+ * - los avisos comunes a todos los tecnicos (hoy
+ *   `support-request:queue-updated`), sobre la room `technicians:all`, en la
+ *   que tambien entra al conectarse.
  *
  * CORS: el servidor de Socket.IO es uno solo para todos los namespaces, asi que
  * la configuracion no va en este decorador sino en el adaptador que instala
@@ -165,6 +169,12 @@ export class TechniciansGateway
     // interna y no forma parte del contrato publico; existe para que un aviso de
     // dominio le llegue aunque todavia no haya hecho `remote-session:join`.
     await client.join(technicianRoom(context.userId));
+
+    // Room comun de los avisos dirigidos a todos los tecnicos (hoy la cola de
+    // solicitudes en espera). Solo se llega aqui despues del middleware, que ya
+    // rechazo cualquier rol fuera de `TECHNICIAN_SOCKET_ROLES`: ni un usuario
+    // con rol `user`, ni un dispositivo, ni un socket sin token entran en ella.
+    await client.join(ALL_TECHNICIANS_ROOM);
 
     this.logger.log(`Technician connected: ${context.userId}`);
   }

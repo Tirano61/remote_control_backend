@@ -26,6 +26,7 @@ import {
 } from './enums/support-request-status.enum';
 import {
   SUPPORT_ASSIGNED_EVENT,
+  SUPPORT_REQUEST_QUEUE_UPDATED_EVENT,
   SUPPORT_REQUEST_UPDATED_EVENT,
   SupportRequestsService,
 } from './support-requests.service';
@@ -263,6 +264,7 @@ describe('SupportRequestsService', () => {
   let remoteSessions: FakeRemoteSessionStore;
   let emitToDevice: jest.Mock;
   let emitToTechnician: jest.Mock;
+  let emitToAllTechnicians: jest.Mock;
   let online: Set<string>;
 
   let deviceA: Device;
@@ -286,6 +288,7 @@ describe('SupportRequestsService', () => {
 
     emitToDevice.mockClear();
     emitToTechnician.mockClear();
+    emitToAllTechnicians.mockClear();
 
     return id;
   };
@@ -311,6 +314,7 @@ describe('SupportRequestsService', () => {
     remoteSessions = new FakeRemoteSessionStore();
     emitToDevice = jest.fn().mockReturnValue(true);
     emitToTechnician = jest.fn().mockReturnValue(true);
+    emitToAllTechnicians = jest.fn().mockReturnValue(true);
     online = new Set<string>([deviceA.id, deviceB.id]);
 
     // `EntityManager` con lo justo que usa el servicio. `findOne` ignora el
@@ -354,7 +358,7 @@ describe('SupportRequestsService', () => {
         { provide: DeviceRealtimeService, useValue: { emitToDevice } },
         {
           provide: TechnicianRealtimeService,
-          useValue: { emitToTechnician },
+          useValue: { emitToTechnician, emitToAllTechnicians },
         },
       ],
     }).compile();
@@ -838,6 +842,197 @@ describe('SupportRequestsService', () => {
         expect(emitToTechnician).toHaveBeenCalledTimes(1);
       },
     );
+  });
+
+  describe('aviso support-request:queue-updated a todos los tecnicos', () => {
+    /** Llamadas a la salida comun, como pares `[evento, payload]`. */
+    const queueCalls = (): unknown[][] =>
+      emitToAllTechnicians.mock.calls as unknown[][];
+
+    it('avisa una vez tras crear una solicitud WAITING ya persistida', async () => {
+      const created = await service.createForDevice(deviceA);
+
+      expect(statusOf(created.id)).toBe(SupportRequestStatus.WAITING);
+      expect(queueCalls()).toEqual([
+        [SUPPORT_REQUEST_QUEUE_UPDATED_EVENT, { supportRequestId: created.id }],
+      ]);
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it('el payload solo lleva supportRequestId', async () => {
+      await service.createForDevice(deviceA);
+
+      const [, payload] = emitToAllTechnicians.mock.calls[0] as [
+        string,
+        Record<string, unknown>,
+      ];
+
+      // Ni estado, ni dispositivo, ni tecnico, ni fechas: se relee por REST.
+      expect(Object.keys(payload)).toEqual(['supportRequestId']);
+    });
+
+    it('no avisa si la creacion falla con 409', async () => {
+      await seedRequest(deviceA);
+
+      await expect(service.createForDevice(deviceA)).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+
+      expect(emitToAllTechnicians).not.toHaveBeenCalled();
+    });
+
+    it('avisa a la cola y a la tablet al asignar, uno de cada uno', async () => {
+      const id = await seedRequest(deviceA);
+
+      await service.assign(id, technicianA);
+
+      expect(statusOf(id)).toBe(SupportRequestStatus.ASSIGNED);
+      expect(emitToDevice).toHaveBeenCalledTimes(1);
+      expect(emitToDevice).toHaveBeenCalledWith(
+        deviceA.id,
+        SUPPORT_ASSIGNED_EVENT,
+        expect.objectContaining({ supportRequestId: id }),
+      );
+      expect(queueCalls()).toEqual([
+        [SUPPORT_REQUEST_QUEUE_UPDATED_EVENT, { supportRequestId: id }],
+      ]);
+      // El aviso al propietario es para lo que hace el dispositivo, no esto.
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it('no avisa cuando la asignacion no ocurre (409 o 404)', async () => {
+      const id = await seedRequest(deviceA);
+      await service.assign(id, technicianA);
+      emitToAllTechnicians.mockClear();
+
+      await expect(service.assign(id, technicianB)).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+      await expect(
+        service.assign(randomUUID(), technicianB),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      const offlineId = await seedRequest(deviceB);
+      online.delete(deviceB.id);
+
+      await expect(
+        service.assign(offlineId, technicianB),
+      ).rejects.toBeInstanceOf(ConflictException);
+
+      expect(emitToAllTechnicians).not.toHaveBeenCalled();
+    });
+
+    it('solo avisa una vez cuando dos tecnicos asignan a la vez', async () => {
+      const id = await seedRequest(deviceA);
+
+      await Promise.allSettled([
+        service.assign(id, technicianA),
+        service.assign(id, technicianB),
+      ]);
+
+      expect(emitToAllTechnicians).toHaveBeenCalledTimes(1);
+    });
+
+    it('avisa a la cola y a ningun propietario al cancelar desde WAITING', async () => {
+      const id = await seedRequest(deviceA);
+
+      await service.cancelByDevice(id, deviceA);
+
+      expect(statusOf(id)).toBe(SupportRequestStatus.CANCELLED);
+      expect(queueCalls()).toEqual([
+        [SUPPORT_REQUEST_QUEUE_UPDATED_EVENT, { supportRequestId: id }],
+      ]);
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it('no repite el aviso al cancelar dos veces: la segunda es 409', async () => {
+      const id = await seedRequest(deviceA);
+
+      await service.cancelByDevice(id, deviceA);
+
+      await expect(service.cancelByDevice(id, deviceA)).rejects.toBeInstanceOf(
+        ConflictException,
+      );
+
+      expect(emitToAllTechnicians).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([SupportRequestStatus.ASSIGNED, SupportRequestStatus.ACCEPTED])(
+      'cancelar desde %s solo avisa al propietario, no a la cola',
+      async (status) => {
+        const id = await seedRequest(deviceA, status);
+
+        await service.cancelByDevice(id, deviceA);
+
+        expect(emitToTechnician).toHaveBeenCalledTimes(1);
+        expect(emitToTechnician).toHaveBeenCalledWith(
+          technicianA.id,
+          SUPPORT_REQUEST_UPDATED_EVENT,
+          { supportRequestId: id },
+        );
+        expect(emitToAllTechnicians).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      ['acceptByDevice', SupportRequestStatus.ACCEPTED],
+      ['rejectByDevice', SupportRequestStatus.REJECTED],
+    ] as const)(
+      '%s solo avisa al propietario, no a la cola',
+      async (method, expected) => {
+        const id = await seedRequest(deviceA, SupportRequestStatus.ASSIGNED);
+
+        await service[method](id, deviceA);
+
+        expect(statusOf(id)).toBe(expected);
+        expect(emitToTechnician).toHaveBeenCalledTimes(1);
+        expect(emitToAllTechnicians).not.toHaveBeenCalled();
+      },
+    );
+
+    describe('si el aviso a la cola falla', () => {
+      beforeEach(() => {
+        emitToAllTechnicians.mockImplementation(() => {
+          throw new Error('transporte caido');
+        });
+      });
+
+      it('la creacion responde bien y la solicitud queda WAITING', async () => {
+        const created = await service.createForDevice(deviceA);
+
+        expect(created.status).toBe(SupportRequestStatus.WAITING);
+        expect(statusOf(created.id)).toBe(SupportRequestStatus.WAITING);
+        expect(emitToAllTechnicians).toHaveBeenCalledTimes(1);
+      });
+
+      it('la asignacion responde bien, no deshace ASSIGNED y avisa a la tablet', async () => {
+        const id = await seedRequest(deviceA);
+
+        await expect(service.assign(id, technicianA)).resolves.toMatchObject({
+          id,
+          status: SupportRequestStatus.ASSIGNED,
+          technicianId: technicianA.id,
+        });
+
+        expect(statusOf(id)).toBe(SupportRequestStatus.ASSIGNED);
+        expect(emitToDevice).toHaveBeenCalledTimes(1);
+        expect(emitToAllTechnicians).toHaveBeenCalledTimes(1);
+      });
+
+      it('la cancelacion desde WAITING responde bien y no deshace CANCELLED', async () => {
+        const id = await seedRequest(deviceA);
+
+        await expect(
+          service.cancelByDevice(id, deviceA),
+        ).resolves.toMatchObject({
+          id,
+          status: SupportRequestStatus.CANCELLED,
+        });
+
+        expect(statusOf(id)).toBe(SupportRequestStatus.CANCELLED);
+        expect(emitToAllTechnicians).toHaveBeenCalledTimes(1);
+      });
+    });
   });
 
   describe('estado COMPLETED', () => {
