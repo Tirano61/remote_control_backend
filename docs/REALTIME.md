@@ -32,7 +32,8 @@ mix: a device never joins `/technicians` and a technician never joins `/devices`
 What realtime is used for today:
 
 ```text
-device presence (ONLINE/OFFLINE)      — /devices only, server-side
+device presence (ONLINE/OFFLINE)      — tracked from /devices sockets, server-side
+device presence notices               — /technicians, server -> client
 support request notices               — both namespaces, server -> client
 remote session notices                — both namespaces, server -> client
 WebRTC signaling relay                — both namespaces, bidirectional
@@ -112,6 +113,11 @@ A device may hold more than one socket at once (this happens normally during a
 reconnection, when the new socket arrives before the old one is detected as
 dead). It goes `OFFLINE` when the last one closes.
 
+Every effective transition — `OFFLINE -> ONLINE` on the first socket,
+`ONLINE -> OFFLINE` when the last one goes away — is announced to the technician
+consoles with [`device:presence-updated`](#devicepresence-updated) on
+`/technicians`. The device itself receives nothing about its own presence.
+
 Presence has direct REST consequences: `POST /support-requests/:id/assign` and
 `POST /remote-sessions` both refuse with `409` when the device is `OFFLINE`.
 
@@ -128,6 +134,10 @@ POST  /device-enrollment/activate (success)   -> all sockets of that device clos
 The second case is a re-enrollment: the previous credential is revoked, so the
 sockets authenticated with it are no longer authorized. The tablet reconnects
 with the Device JWT obtained from its new `deviceSecret`.
+
+If the device had at least one socket, closing them is an `ONLINE -> OFFLINE`
+transition and the technicians receive exactly one `device:presence-updated`,
+however many sockets were closed. If it had none, nothing is emitted.
 
 ## Events received by remote_control_device
 
@@ -371,10 +381,10 @@ A user with only `user` or `sales` cannot open this namespace.
 
 ## Scope of this namespace
 
-`/technicians` carries WebRTC signaling and four server notifications,
-`support-request:queue-updated`, `support-request:updated`,
-`remote-session:active` and `remote-session:closed`. It keeps no presence
-registry and persists nothing.
+`/technicians` carries WebRTC signaling and five server notifications,
+`device:presence-updated`, `support-request:queue-updated`,
+`support-request:updated`, `remote-session:active` and `remote-session:closed`.
+It keeps no presence registry of technicians and persists nothing.
 
 Support requests produce three different events, each with its own audience:
 
@@ -398,7 +408,7 @@ No transition emits both events to technicians.
 On connecting, the server puts the socket in two rooms: a private room derived
 from the authenticated user, which is how a notification reaches that technician,
 and a room shared by every authenticated socket of this namespace, which is how
-the queue notification reaches all of them. Both rooms are internal: there is no
+the queue and device presence notifications reach all of them. Both rooms are internal: there is no
 event to join or leave them, their names are not part of this contract, and
 membership is a consequence of authenticating.
 
@@ -408,6 +418,8 @@ membership is a consequence of authenticating.
 go and read it*:
 
 ```text
+device:presence-updated        ->  GET /devices
+                                   GET /support-requests
 support-request:queue-updated  ->  GET /support-requests
 support-request:updated        ->  GET /support-requests
 remote-session:active          ->  GET /remote-sessions/current
@@ -421,8 +433,9 @@ Not as the state itself. The reasons are the same ones that apply to the tablet:
 * the event carries no session or support request object — only its id, plus
   who ended it in the case of a session close;
 * REST is the source of truth. A support request transition, an activation and
-  a close are committed to PostgreSQL before any event is emitted, so REST is
-  never behind the event — it can only be ahead of it.
+  a close are committed to PostgreSQL before any event is emitted, and a device
+  presence change is applied to the presence registry before its event is
+  emitted, so REST is never behind the event — it can only be ahead of it.
 
 The same rule covers the case where no event exists at all: after a page reload
 the web app has no socket history, and `GET /remote-sessions/current` is what
@@ -448,14 +461,16 @@ disconnects on its own. What still protects the system in the meantime:
 
 Force-closing a technician's sockets would require a technician presence
 registry, which does not exist today. The handshake rooms used to deliver
-`support-request:queue-updated`, `support-request:updated`,
-`remote-session:active` and `remote-session:closed` are not one: they address
+`device:presence-updated`, `support-request:queue-updated`,
+`support-request:updated`, `remote-session:active` and `remote-session:closed`
+are not one: they address
 sockets, they do not track who is connected, and nothing reads them back.
 
 A consequence for the queue: a socket whose user lost the `admin`/`tecnico` role
-after connecting keeps receiving `support-request:queue-updated` until it
-disconnects. The event carries only a support request id; reading the queue still
-requires `GET /support-requests`, which rejects that user immediately.
+after connecting keeps receiving `support-request:queue-updated` and
+`device:presence-updated` until it disconnects. Those events carry only an id;
+reading the queue or the devices still requires `GET /support-requests` or
+`GET /devices`, which reject that user immediately.
 
 ## Events received by remote_control_web
 
@@ -524,6 +539,104 @@ returns its normal response (`201` for the create, `200` for assign and cancel) 
 realtime never rolls back persisted state. Delivery is best-effort and nothing is
 replayed: a console that was disconnected re-reads `GET /support-requests` after
 reconnecting.
+
+### device:presence-updated
+
+```text
+Direction     server -> technicians/admins
+Namespace     /technicians
+Scope         realtime presence (isOnline) of one device
+Sent by       backend, when the device's effective presence changes:
+                OFFLINE -> ONLINE   its first authenticated /devices socket
+                                    is registered
+                ONLINE  -> OFFLINE  its last socket goes away: the tablet
+                                    disconnects, or the backend force-closes
+                                    its sockets (PATCH /devices/:id with
+                                    isActive: false, successful
+                                    POST /device-enrollment/activate)
+Received by   every authenticated socket of /technicians (roles admin, tecnico)
+ACK           none
+```
+
+Payload:
+
+```json
+{ "deviceId": "550e8400-e29b-41d4-a716-446655440000" }
+```
+
+`deviceId` is the device's internal id — the `id` of `GET /devices` and the
+`device.id` of `GET /support-requests`. The payload has no other field: not the
+new state, not the `publicId`, no socket ids, no tokens or credentials.
+
+Notes:
+A cache-invalidation trigger only: *the presence of this device changed, read it
+again*. It is not a snapshot. Answer it with:
+
+```text
+device:presence-updated  ->  GET /devices
+                             GET /support-requests
+```
+
+The first gives `isOnline` of the device; the second gives `device.isOnline` of
+every support request row of that device. Re-read whichever of the two the
+console is showing (or both); the `deviceId` tells it which rows are affected.
+
+* It does **not** say whether the device is now `ONLINE` or `OFFLINE`. Never
+  infer the state from the event, and never toggle a local flag on receipt; read
+  it. Two quick transitions produce two events, and only REST tells which one
+  is current.
+* It is **not** the source of truth. REST is. The presence registry is updated
+  before the event is emitted, so a `GET` issued on receipt already returns the
+  new state (or a newer one).
+* It does **not** require a `RemoteSession` and `remote-session:join` is **not**
+  required. It arrives as soon as the socket is authenticated.
+* It reaches **every** socket authenticated in `/technicians` — every technician
+  and every admin, through the same shared room as
+  `support-request:queue-updated`. A user with only `user` or `sales`, an
+  unauthenticated socket and a device never receive it.
+* Every tab receives it; the server does not deduplicate per user.
+* It is not a support request event and does not replace any: a device going
+  `OFFLINE` emits no `support-request:queue-updated` or `support-request:updated`,
+  and a support request transition emits no `device:presence-updated`.
+
+Emitted only on an **effective** transition, once per transition:
+
+```text
+0 sockets -> 1 socket                    one event (ONLINE)
+1 socket  -> 2 sockets                   nothing (already ONLINE)
+2 sockets -> 1 socket                    nothing (still ONLINE)
+1 socket  -> 0 sockets                   one event (OFFLINE)
+a socket that is no longer registered    nothing
+  disconnects (repeated or late
+  disconnect)
+forced close of N sockets                one event (OFFLINE), not N
+forced close of a device already         nothing
+  OFFLINE
+```
+
+Reconnections: during a reconnection the new socket often arrives before the old
+one is detected as dead. While either of them is registered the device stays
+`ONLINE`, so the late disconnect of the old socket emits nothing — there is no
+false `OFFLINE`, and the new socket emits no second `ONLINE`. A reconnection
+produces events only when the old socket was dropped before the new one arrived:
+one `OFFLINE` followed by one `ONLINE`.
+
+Re-enrollment: a successful activation emits one `OFFLINE` (if the device had
+sockets); when the tablet reconnects with its new credential it emits one
+`ONLINE`. A socket whose handshake is rejected (revoked credential, deactivated
+device, bad token) is never registered and emits nothing.
+
+Each event concerns exactly one device. A change on device A never emits an event
+for device B.
+
+Delivery is best-effort and nothing is replayed. If delivery fails, the presence
+change stands — the tablet stays connected, or stays disconnected — and REST
+still reflects it. A console that was disconnected re-reads `GET /devices` and
+`GET /support-requests` after reconnecting.
+
+Presence is held in memory by a single backend instance (see
+[Presence](#presence)); with more than one instance, this event would only
+reflect the sockets of the instance that emits it.
 
 ### support-request:updated
 
@@ -1103,7 +1216,8 @@ device:<deviceId>                 internal. Namespace /devices only.
                                   handshake, after its token and role were
                                   validated. It is how the backend addresses
                                   every technician and admin at once
-                                  (support-request:queue-updated). It is not
+                                  (support-request:queue-updated,
+                                  device:presence-updated). It is not
                                   related to the per-technician rooms nor to
                                   any remote-session room. Its name is not part
                                   of this contract and may change.
@@ -1122,9 +1236,10 @@ Points that matter for the Flutter clients:
   is no event to join or leave a room directly. Room membership is a consequence
   of authenticating and of `remote-session:join`;
 * the handshake rooms carry domain notifications, the session room carries
-  signaling. That is why `support-request:queue-updated`,
-  `support-request:updated`, `remote-session:active` and `remote-session:closed`
-  arrive without having joined anything, while a `webrtc:*` message does not;
+  signaling. That is why `device:presence-updated`,
+  `support-request:queue-updated`, `support-request:updated`,
+  `remote-session:active` and `remote-session:closed` arrive without having
+  joined anything, while a `webrtc:*` message does not;
 * membership of the session room is also the whole implementation of readiness:
   `peerJoined` and `remote-session:peer-joined` are answers about who is in
   `remote-session:<id>` in the *other* namespace, and nothing is stored;
@@ -1176,13 +1291,16 @@ Details that apply to the current implementation:
 remote_control_device   GET /support-requests/current
                         GET /device/remote-sessions/current
 
-remote_control_web      GET /support-requests
+remote_control_web      GET /devices
+                        GET /support-requests
                         GET /remote-sessions/current
 ```
 
 * **Presence may briefly show two sockets.** A device can hold the old and the
   new socket at the same time; it reads `ONLINE` throughout, and both sockets
-  receive the device-addressed events until the stale one closes.
+  receive the device-addressed events until the stale one closes. The
+  technicians receive no `device:presence-updated` for this overlap, because the
+  effective presence never changed.
 * **A forced disconnection is not a transient failure.** If the backend closed
   the socket because the device was deactivated or re-enrolled, reconnecting
   with the same token fails: the tablet needs a new `deviceSecret` (re-enroll)
