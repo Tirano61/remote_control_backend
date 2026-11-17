@@ -38,17 +38,24 @@ support request notices               — both namespaces, server -> client
 remote session notices                — both namespaces, server -> client
 WebRTC signaling relay                — both namespaces, bidirectional
 signaling readiness                   — both namespaces, server -> client
+session participation                 — tracked from remote-session:join, server-side
 ```
 
 What realtime is **not** used for:
 
 * no media. Video, audio and the WebRTC DataChannel never pass through NestJS;
 * no persistence. SDP and ICE candidates are relayed and immediately forgotten;
-* no state changes. No Socket.IO message moves a `RemoteSession` to `ACTIVE` or
-  closes it. Those are REST calls (`POST /remote-sessions/:id/activate`,
-  `.../close`); realtime only announces what already happened;
+* no state changes requested by a client. No Socket.IO message moves a
+  `RemoteSession` to `ACTIVE` or closes it. Those are REST calls
+  (`POST /remote-sessions/:id/activate`, `.../close`). The only server-side
+  exception is the automatic close: a session whose participants stay away
+  longer than the grace period, or that never reaches `ACTIVE`, is closed by the
+  backend with `endedBy: "SYSTEM"` — see
+  [Remote session lifecycle](#remote-session-lifecycle-automatic-close);
 * no technician presence. `/technicians` keeps no registry of connected users,
-  and no REST field exposes whether a technician is connected.
+  and no REST field exposes whether a technician is connected. The backend only
+  tracks which sockets are *joined to a session*, and that is not exposed
+  either.
 
 ### CORS
 
@@ -279,8 +286,9 @@ Emitted only after the transaction commits, so the session named here is already
 ```text
 Direction     server -> device
 Namespace     /devices
-Sent by       backend, on a successful POST /remote-sessions/:id/close
-              (the TECHNICIAN-initiated close only)
+Sent by       backend, after the close commits, when the device did NOT close:
+              - POST /remote-sessions/:id/close   (endedBy TECHNICIAN)
+              - automatic close by the backend    (endedBy SYSTEM)
 Received by   every authenticated socket of that device
 ACK           none
 ```
@@ -294,7 +302,8 @@ Payload:
 }
 ```
 
-`endedBy` is a `RemoteSessionEndedBy` value.
+`endedBy` is a `RemoteSessionEndedBy` value: `TECHNICIAN` or `SYSTEM` on this
+namespace. Treat any other or unknown value the same way — the session is over.
 
 Notes:
 This event is **not** emitted into `/devices` when the device itself closes the
@@ -302,10 +311,20 @@ session through `POST /device/remote-sessions/:id/close` — the closing side
 already receives the closed session in its HTTP response. That close emits the
 same event into `/technicians` instead.
 
+A `SYSTEM` close (see
+[Remote session lifecycle](#remote-session-lifecycle-automatic-close)) was
+requested by nobody, so it is emitted to **both** namespaces, with the same
+payload.
+
 The backend does not leave the session room on the device's behalf. The tablet
 should tear down its peer connection when it receives this. Any further
 `webrtc:*` it sends would be rejected with `UNAUTHORIZED`, since the session is
 no longer live.
+
+Delivery is best-effort: a tablet that is disconnected when the close happens
+never sees this event. That is precisely the situation in which a `SYSTEM`
+close for `DEVICE_ABSENT` occurs, so the tablet must not rely on it — after
+every reconnection it re-reads `GET /device/remote-sessions/current`.
 
 ### webrtc:offer / webrtc:answer / webrtc:ice-candidate
 
@@ -731,8 +750,9 @@ state.
 ```text
 Direction     server -> technician
 Namespace     /technicians
-Sent by       backend, after POST /device/remote-sessions/:id/close commits
-              (the DEVICE-initiated close only)
+Sent by       backend, after the close commits, when the technician did NOT close:
+              - POST /device/remote-sessions/:id/close   (endedBy DEVICE)
+              - automatic close by the backend           (endedBy SYSTEM)
 Received by   every authenticated socket of the technician who owns the session
 ACK           none
 ```
@@ -747,8 +767,13 @@ Payload:
 ```
 
 Same event name and same payload as the one `/devices` receives — one contract
-for one fact. `endedBy` is a `RemoteSessionEndedBy` value and is `DEVICE` here,
-because this is the close the technician did not perform.
+for one fact. `endedBy` is a `RemoteSessionEndedBy` value: `DEVICE` or `SYSTEM`
+here, because those are the closes the technician did not perform. Treat any
+other or unknown value the same way — the session is over.
+
+A `SYSTEM` close reaches every socket of the owning technician, including tabs
+that never joined the session. See
+[Remote session lifecycle](#remote-session-lifecycle-automatic-close).
 
 Notes:
 `remote-session:join` is **not** required. This is a domain notification, not
@@ -1026,7 +1051,12 @@ who the other end of their session is; the event only says *when*.
 
 There is no `remote-session:peer-left` today. A peer that goes away is detected
 through the WebRTC/ICE connection state once WebRTC is in place, and through
-`remote-session:closed` when the session ends.
+`remote-session:closed` when the session ends — including the automatic
+`SYSTEM` close when that peer stays away longer than the grace period.
+
+The same room membership has a second use: it is how the backend knows that a
+participant is still *taking part* in the session. See
+[Remote session lifecycle](#remote-session-lifecycle-automatic-close).
 
 ## webrtc:offer
 
@@ -1243,6 +1273,9 @@ Points that matter for the Flutter clients:
 * membership of the session room is also the whole implementation of readiness:
   `peerJoined` and `remote-session:peer-joined` are answers about who is in
   `remote-session:<id>` in the *other* namespace, and nothing is stored;
+* the same membership is what the automatic close calls *participation*: a side
+  with no socket in the session room for longer than the grace period gets its
+  `ACTIVE` session closed with `endedBy: "SYSTEM"`;
 * `/devices` and `/technicians` are separate namespaces with **separate rooms**.
   `remote-session:<id>` in `/devices` and `remote-session:<id>` in
   `/technicians` are two different rooms that merely share a name. Relaying "to
@@ -1259,20 +1292,27 @@ Points that matter for the Flutter clients:
 # Reconnection
 
 ```text
-Socket.IO disconnect does not close a RemoteSession.
-Socket.IO disconnect does not change a SupportRequest.
+Socket.IO disconnect does not close a RemoteSession immediately.
+It starts a grace period if it was the last socket of that side in the session.
+Rejoining the session (remote-session:join) within the grace period keeps it.
 After reconnecting, the client must authenticate again through the handshake.
-For signaling, the client must join the RemoteSession again.
+For signaling AND for keeping the session alive, the client must join again.
 ```
 
 Details that apply to the current implementation:
 
-* **Domain state survives.** Disconnecting affects device presence only. A
-  `RemoteSession` keeps its status — `CONNECTING` or `ACTIVE` — and so does a
-  `SupportRequest`; no timeout closes either of them today, nothing moves a
-  session back out of `ACTIVE`, and `RemoteSessionEndedBy.SYSTEM` is never
-  written. Losing the Socket.IO connection does not mean the WebRTC connection
-  is gone, and the backend does not infer anything about it.
+* **Domain state survives a short disconnection.** A `RemoteSession` keeps its
+  status while a side is away for less than the grace period
+  (`REMOTE_SESSION_DISCONNECT_GRACE_MS`, 60 s by default). If the side does not
+  rejoin in time, the session is closed with `endedBy: "SYSTEM"` and its
+  `SupportRequest` becomes `COMPLETED` — see
+  [Remote session lifecycle](#remote-session-lifecycle-automatic-close). A
+  disconnection never changes a `SupportRequest` by itself. Losing the Socket.IO
+  connection does not mean the WebRTC connection is gone, and the backend does
+  not infer anything about WebRTC; what it closes is the *authorization*.
+* **Reconnecting is not enough: rejoin.** A freshly connected socket that has not
+  sent `remote-session:join` does not count as taking part in the session and
+  does not stop the grace period.
 * **The handshake must carry a valid token again.** The Socket.IO client
   resends `auth` on each reconnection attempt, so a client holding an expired
   Device JWT must refresh it (`POST /device-auth/login`) before reconnecting, or
@@ -1304,4 +1344,171 @@ remote_control_web      GET /devices
 * **A forced disconnection is not a transient failure.** If the backend closed
   the socket because the device was deactivated or re-enrolled, reconnecting
   with the same token fails: the tablet needs a new `deviceSecret` (re-enroll)
-  or an administrator has to re-enable the device.
+  or an administrator has to re-enable the device. A live session of that
+  device therefore ends with `SYSTEM` once the grace period expires.
+
+---
+
+# Remote session lifecycle (automatic close)
+
+The backend closes remote sessions that nobody is taking part in any more, and
+sessions that never got connected. Such a close is recorded with
+`endedBy: "SYSTEM"`. It is the only state change the backend makes on its own.
+
+```text
+ACTIVE  ->  a side loses its last joined socket  ->  grace period
+              ├── that side rejoins in time      ->  stays ACTIVE
+              └── it does not                    ->  CLOSED, endedBy SYSTEM
+                                                     SupportRequest COMPLETED
+                                                     remote-session:closed to BOTH ends
+
+CONNECTING  ->  createdAt + TTL reached without ACTIVE  ->  CLOSED, endedBy SYSTEM
+```
+
+## Participant
+
+A side (device or technician) **takes part** in a session while it has at least
+one authenticated socket joined to that session through a successful
+`remote-session:join` — the same room membership that drives readiness. It is
+evaluated per backend instance, from the server side only.
+
+```text
+Counts                                       Does not count
+-------------------------------------------  -------------------------------------------
+a socket joined to the session room          a socket that only authenticated
+  (validated: live session, owned by caller)   (console open, tablet ONLINE)
+any one of several tabs / sockets            a WebRTC peer connection: the backend relays
+                                               signaling and cannot see WebRTC, so it
+                                               never pretends to
+```
+
+Consequences:
+
+* several sockets on one side (two browser tabs, or the old and new socket of a
+  reconnecting tablet) count as one participant: the side is absent only when
+  the **last** joined socket goes away;
+* a socket can only remove itself. The late disconnect of an old socket cannot
+  make a side absent while a newer socket is joined, and cannot cancel anything;
+* nothing a client sends declares it "alive": there is no heartbeat event. The
+  only thing that ends a grace period is a `remote-session:join` that passes
+  every check (session exists, is live, belongs to the authenticated identity).
+  A join to a `CLOSED` session is rejected and never reopens it;
+* for the device, losing its last `/devices` socket (going `OFFLINE`) always
+  makes it absent, because joined sockets are a subset of presence sockets. The
+  reverse is not true: a tablet that is `ONLINE` but has not rejoined is absent.
+  Presence (`device:presence-updated`) is unchanged by any of this.
+
+Both current clients already rejoin automatically after every reconnection,
+including while the session is `ACTIVE`, and stay joined for the whole session.
+
+## Timings
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `REMOTE_SESSION_DISCONNECT_GRACE_MS` | `60000` | How long an `ACTIVE` session survives a side with no joined socket. |
+| `REMOTE_SESSION_CONNECTING_TTL_MS` | `120000` | Maximum life of a `CONNECTING` session, counted from `createdAt`. |
+| `REMOTE_SESSION_STARTUP_RECOVERY_MS` | `90000` | After the backend starts, no session is closed before this window ends. |
+
+Integer milliseconds between `5000` and `3600000`; an invalid value prevents the
+backend from starting. These are server settings, not part of any payload.
+
+Why these defaults (they are starting values, to be confirmed by the physical
+validation):
+
+* **Grace 60 s.** With Socket.IO defaults (`pingInterval` 25 s, `pingTimeout`
+  20 s) the server notices a connection that died without a clean close up to
+  ~45 s after the network dropped; the grace starts there. The clients retry
+  with `reconnectionDelayMax` 10 s (web) and 20 s (tablet), so 60 s covers
+  several reconnection attempts plus the automatic rejoin. Worst case from
+  network loss to close is therefore about 45 s + 60 s.
+* **TTL 120 s.** Covers `remote-session:created` reaching the tablet, the user
+  accepting Android's screen-capture dialog, SDP/ICE negotiation and the
+  technician's `/activate`. A healthy negotiation takes seconds.
+* **Startup recovery 90 s.** After a restart the participation registry is
+  empty; this is the grace plus a margin for clients that are retrying at their
+  maximum delay.
+
+## CONNECTING TTL
+
+A `CONNECTING` session is closed at `createdAt + REMOTE_SESSION_CONNECTING_TTL_MS`
+whatever happens meanwhile — no SDP, no ICE, a side that never joined, a failed
+negotiation, or an `/activate` that never arrives. Signaling traffic does **not**
+renew it. If the session became `ACTIVE` first, the TTL no longer applies; if it
+closed first, nothing happens. The participation rule above applies only to
+`ACTIVE` sessions; a `CONNECTING` session is governed by its TTL alone.
+
+An `/activate` that arrives after the TTL close answers `409`, like any other
+`CLOSED` session.
+
+## The SYSTEM close
+
+It is the same transition as the technician and device closes — one transaction
+that moves the session to `CLOSED` (`endedAt`, `endedBy: "SYSTEM"`) and the
+support request to `COMPLETED`. Before writing, the backend locks the session
+row and re-evaluates the condition, so:
+
+* it never closes a session that recovered, was activated, or was already closed
+  in the meantime;
+* if a technician or device close races with it, exactly one wins; the loser
+  gets `409` (REST) or does nothing (SYSTEM), and the recorded `endedBy` /
+  `endedAt` are the winner's;
+* a stale timer can only cause an extra read: it never touches another session.
+
+After the commit, and only then, `remote-session:closed` is emitted to **both**
+`/devices` and `/technicians` with `{ remoteSessionId, endedBy: "SYSTEM" }`.
+Technician and device closes keep their existing behaviour (event only to the
+side that did not close).
+
+## Delivery limits
+
+Delivery is best-effort. The side whose absence caused the close is, by
+definition, not connected when the event is sent, and nothing is replayed. Both
+clients must reconcile over REST after every reconnection:
+
+```text
+remote_control_device   GET /device/remote-sessions/current   -> null when closed
+remote_control_web      GET /remote-sessions/current          -> null when closed
+                        GET /remote-sessions/:id              -> CLOSED, endedBy SYSTEM
+```
+
+A `remote-session:join` for a session that was closed meanwhile answers
+`UNAUTHORIZED`; treat that as a cue to re-read REST as well.
+
+## Backend restart
+
+Participation lives in memory and timers do not survive a restart; PostgreSQL
+keeps the sessions. On start the backend reads the live sessions once and:
+
+* closes nothing immediately;
+* gives every `ACTIVE` session until the end of the recovery window for both
+  sides to reconnect and rejoin; a side still absent then is closed with
+  `SYSTEM`;
+* closes, at the end of the window, every `CONNECTING` session whose TTL expired
+  while the backend was down.
+
+There is no periodic polling of the database: deadlines come from that startup
+read, from session creation/activation/close, and from participants leaving.
+A failed evaluation is retried after 15 s.
+
+## WebRTC is not cut by this event alone
+
+The backend does not relay media and cannot stop a peer-to-peer connection that
+is already established. Closing the session revokes the *authorization*:
+signaling is refused immediately (`UNAUTHORIZED`) and REST reports the session
+as `CLOSED`. Actually stopping the screen capture and the control channel is the
+clients' job:
+
+* **remote_control_device** must tear down its peer connection and the capture
+  when it receives `remote-session:closed`, and also when, after reconnecting,
+  `GET /device/remote-sessions/current` no longer returns the session — even if
+  its WebRTC link is still up;
+* **remote_control_web** should re-read `GET /remote-sessions/current` after
+  every reconnection and when a `remote-session:join` is refused, so a session
+  closed while it was disconnected does not stay on screen.
+
+## Limitations
+
+* Single backend instance, like device presence: participation is per process.
+  Several instances would need a shared adapter and a shared registry.
+* Closing the browser tab is detected only through the socket disconnect, i.e.
+  the session closes about one grace period later, not instantly.

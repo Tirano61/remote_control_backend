@@ -185,6 +185,23 @@ no id, only `{{userToken}}`, so a lost `remoteSessionId` is not a problem. It is
 also the request to repeat after the device closes the session, which is
 announced on `/technicians` with `remote-session:closed`.
 
+### Steps 11–14 have time limits
+
+The backend closes sessions on its own (`endedBy: "SYSTEM"`, see the automatic
+close in `docs/REALTIME.md`):
+
+```text
+CONNECTING  closed 120 s after step 11 if step 13 was not sent
+ACTIVE      closed 60 s after step 13 while no Socket.IO client of a side is
+            joined to the session (remote-session:join)
+```
+
+Postman cannot join a session over Socket.IO. Driven only from this collection,
+send steps 13 and 14 within those windows, or keep the Flutter apps joined to
+the session; otherwise steps 13 and 14 answer `409` because the session is
+already `CLOSED` with `endedBy: "SYSTEM"`. The windows are configurable with
+`REMOTE_SESSION_CONNECTING_TTL_MS` and `REMOTE_SESSION_DISCONNECT_GRACE_MS`.
+
 ### Step 09 needs the device to be ONLINE
 
 `POST /support-requests/:id/assign` answers `409` when the device is offline, and
