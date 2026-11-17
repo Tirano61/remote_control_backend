@@ -437,6 +437,11 @@ Presence is held in memory by the backend instance that serves the request, so
 with more than one instance a device connected elsewhere would read as
 `isOnline: false`. Single-instance deployment is the current assumption.
 
+Every change of a device's `isOnline` is announced on `/technicians` with
+`device:presence-updated` (payload `{ deviceId }` only), so a console that shows
+this list re-reads it on that event — see [REALTIME.md](REALTIME.md). The event
+is only a trigger: this response is the source of truth.
+
 ## GET /devices/:id
 
 ```text
@@ -519,7 +524,9 @@ Errors:
 Notes:
 Setting `isActive: false` immediately **force-closes every open Socket.IO
 connection** of that device, so it also becomes `isOnline: false`. Authorization
-is not left to expire with the Device JWT.
+is not left to expire with the Device JWT. If the device was online, the
+technicians receive one `device:presence-updated` — see
+[REALTIME.md](REALTIME.md).
 
 A deactivated device also stops passing `@DeviceAuth()`, so all its REST calls
 start failing with `401`.
@@ -1020,7 +1027,9 @@ User JWT — roles: `admin`, `tecnico`.
 
 Description:
 Support request queue, oldest first (`createdAt ASC`), so the longest-waiting
-request is on top. Each row carries the device and its realtime `isOnline`.
+request is on top. Each row carries the device and its realtime `isOnline`;
+when it changes, `device:presence-updated` is emitted on `/technicians` — see
+[REALTIME.md](REALTIME.md).
 
 Query params:
 
@@ -1726,6 +1735,7 @@ the Device JWTs issued from it, and force-closes the device sockets.
 2. GET    /support-requests?status=WAITING   (User JWT, admin|tecnico)
           -> the queue, oldest first, with device.isOnline
           -> re-read on every support-request:queue-updated
+             and on every device:presence-updated
 
 3. POST   /support-requests/:id/assign       (User JWT, admin|tecnico)
           -> ASSIGNED; requires the device to be ONLINE

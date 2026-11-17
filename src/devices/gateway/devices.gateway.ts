@@ -140,15 +140,16 @@ export class DevicesGateway
     // puede elegir la de otro dispositivo.
     await client.join(deviceRoom(context.deviceId));
 
-    this.devicePresenceService.register(context.deviceId, client);
+    // Si se desconecto mientras se unia a la room, `handleDisconnect` ya corrio
+    // y no habia nada que dar de baja: no se registra, para no dejar presencia
+    // fantasma. Se comprueba ANTES de registrar (y sin `await` entre medias) para
+    // no anunciar a los tecnicos un ONLINE seguido de un OFFLINE que nunca fue
+    // presencia real.
+    if (client.disconnected) return;
 
-    // Si se desconecto mientras se autenticaba, `handleDisconnect` ya corrio y
-    // no habia nada que dar de baja: se hace aqui para no dejar presencia
-    // fantasma.
-    if (client.disconnected) {
-      this.devicePresenceService.unregister(context.deviceId, client.id);
-      return;
-    }
+    // Registrar es lo que avisa `device:presence-updated` si era el primer
+    // socket: la presencia ya esta actualizada cuando sale el aviso.
+    this.devicePresenceService.register(context.deviceId, client);
 
     client.emit(DEVICE_CONNECTED_EVENT, {
       deviceId: context.deviceId,

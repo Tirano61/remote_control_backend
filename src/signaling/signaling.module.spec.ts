@@ -4,6 +4,12 @@ import { getDataSourceToken, getEntityManagerToken } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { DevicesModule } from '../devices/devices.module';
 import { DevicesGateway } from '../devices/gateway/devices.gateway';
+import { DevicePresenceModule } from '../devices/presence/device-presence.module';
+import {
+  DEVICE_PRESENCE_UPDATED_EVENT,
+  DevicePresenceService,
+} from '../devices/presence/device-presence.service';
+import { SupportRequestsModule } from '../support-requests/support-requests.module';
 import { RemoteSessionsModule } from '../remote-sessions/remote-sessions.module';
 import { RemoteSessionsService } from '../remote-sessions/remote-sessions.service';
 import { TechniciansGateway } from './gateway/technicians.gateway';
@@ -73,6 +79,49 @@ describe('SignalingModule (cableado)', () => {
     expect(
       moduleRef.get(SignalingRealtimeService, { strict: false }),
     ).toBeInstanceOf(SignalingRealtimeService);
+
+    await moduleRef.close();
+  });
+
+  it('la presencia avisa por la MISMA salida que registra el gateway de tecnicos', async () => {
+    // Mismos modulos que `AppModule`: si `DevicePresenceModule` acabara con su
+    // propia instancia de `TechnicianRealtimeService`, el aviso
+    // `device:presence-updated` saldria por un servicio sin namespace y no
+    // llegaria nunca a la web.
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        FakeDatabaseModule,
+        DevicesModule,
+        SupportRequestsModule,
+        RemoteSessionsModule,
+        SignalingModule,
+      ],
+    }).compile();
+
+    const fromSignaling = moduleRef
+      .select(SignalingModule)
+      .get(TechnicianRealtimeService);
+    const fromPresence = moduleRef
+      .select(DevicePresenceModule)
+      .get(TechnicianRealtimeService);
+
+    expect(fromPresence).toBe(fromSignaling);
+
+    // Y de verdad es por donde sale el aviso al registrar el primer socket.
+    const emit = jest.fn();
+    fromSignaling.bind({ to: () => ({ emit }) });
+
+    moduleRef
+      .select(DevicePresenceModule)
+      .get(DevicePresenceService)
+      .register('550e8400-e29b-41d4-a716-446655440000', {
+        id: 'socket-1',
+        disconnect: () => undefined,
+      });
+
+    expect(emit).toHaveBeenCalledWith(DEVICE_PRESENCE_UPDATED_EVENT, {
+      deviceId: '550e8400-e29b-41d4-a716-446655440000',
+    });
 
     await moduleRef.close();
   });

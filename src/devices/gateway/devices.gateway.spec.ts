@@ -15,6 +15,7 @@ import {
 import { DevicesService } from '../devices.service';
 import { RemoteSession } from '../../remote-sessions/entities/remote-session.entity';
 import { SignalingRealtimeService } from '../../signaling/realtime/signaling-realtime.service';
+import { TechnicianRealtimeService } from '../../signaling/realtime/technician-realtime.service';
 import { SignalingService } from '../../signaling/signaling.service';
 import { DeviceCredential } from '../entities/device-credential.entity';
 import { Device } from '../entities/device.entity';
@@ -164,6 +165,10 @@ describe('DevicesGateway (Socket.IO)', () => {
         // dependencias tienen que poder resolverse.
         SignalingService,
         SignalingRealtimeService,
+        // La presencia avisa a los tecnicos de cada transicion. Aqui no hay
+        // namespace de tecnicos: el aviso se descarta sin afectar a nada (eso
+        // se prueba en `device-presence.realtime.spec.ts`).
+        TechnicianRealtimeService,
         {
           provide: getRepositoryToken(RemoteSession),
           useValue: { findOne: () => Promise.resolve(null) },
