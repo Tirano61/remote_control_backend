@@ -45,8 +45,9 @@ export const REMOTE_SESSION_CREATED_EVENT = 'remote-session:created';
  * Aviso de que la sesion termino, hacia el extremo que NO la cerro.
  *
  * Mismo nombre y mismo payload en los dos namespaces: `/devices` cuando cierra
- * el tecnico y `/technicians` cuando cierra el dispositivo. Un unico contrato
- * para un unico hecho.
+ * el tecnico, `/technicians` cuando cierra el dispositivo, y AMBOS cuando cierra
+ * el sistema (`endedBy: SYSTEM`), porque ninguno de los dos lo pidio. Un unico
+ * contrato para un unico hecho.
  */
 export const REMOTE_SESSION_CLOSED_EVENT = 'remote-session:closed';
 
@@ -86,6 +87,40 @@ export interface RemoteSessionActivePayload {
   remoteSessionId: string;
 }
 
+/**
+ * Aviso interno, en proceso, de que una sesion cambio de estado ya confirmado
+ * en PostgreSQL (creada, activada o cerrada). No es un evento de Socket.IO.
+ *
+ * Lo usa el cierre automatico para programar sus vencimientos sin que este
+ * servicio dependa de el. Recibe una copia minima, sin relaciones.
+ */
+export type RemoteSessionChangeListener = (
+  remoteSession: RemoteSessionLifecycleSnapshot,
+) => void;
+
+/** Lo minimo de una sesion para decidir su ciclo de vida. */
+export type RemoteSessionLifecycleSnapshot = Pick<
+  RemoteSession,
+  | 'id'
+  | 'supportRequestId'
+  | 'deviceId'
+  | 'technicianId'
+  | 'status'
+  | 'createdAt'
+  | 'connectedAt'
+>;
+
+/**
+ * Decision que el cierre automatico toma CON LA FILA BLOQUEADA.
+ *
+ * Recibe la sesion tal como esta en PostgreSQL en ese instante (ya viva) y la
+ * hora del cierre; devuelve `true` solo si todavia corresponde cerrarla.
+ */
+export type SystemCloseDecision = (
+  remoteSession: RemoteSessionLifecycleSnapshot,
+  now: Date,
+) => boolean;
+
 /** Forma minima del error que devuelve el driver de PostgreSQL. */
 interface PostgresError {
   code?: string;
@@ -95,9 +130,22 @@ interface PostgresError {
 /** unique_violation */
 const UNIQUE_VIOLATION = '23505';
 
+/** Columnas de `RemoteSessionLifecycleSnapshot`: nada de relaciones. */
+const LIFECYCLE_SNAPSHOT_SELECT = {
+  id: true,
+  supportRequestId: true,
+  deviceId: true,
+  technicianId: true,
+  status: true,
+  createdAt: true,
+  connectedAt: true,
+} as const;
+
 @Injectable()
 export class RemoteSessionsService {
   private readonly logger = new Logger(RemoteSessionsService.name);
+
+  private readonly changeListeners = new Set<RemoteSessionChangeListener>();
 
   constructor(
     @InjectRepository(RemoteSession)
@@ -208,6 +256,7 @@ export class RemoteSessionsService {
     // tablet se desconecto justo despues de comprobar la presencia, la sesion
     // sigue siendo valida: la recupera con GET /device/remote-sessions/current.
     this.notifyCreated(created);
+    this.notifyChanged(created);
 
     return this.toResponse(created);
   }
@@ -333,7 +382,10 @@ export class RemoteSessionsService {
 
     // Solo cuando ocurrio de verdad `CONNECTING -> ACTIVE`, y solo despues del
     // commit: no se anuncia una activacion que todavia pudiera deshacerse.
-    if (activated) this.notifyActivated(remoteSession);
+    if (activated) {
+      this.notifyActivated(remoteSession);
+      this.notifyChanged(remoteSession);
+    }
 
     return this.toResponse(remoteSession);
   }
@@ -409,20 +461,112 @@ export class RemoteSessionsService {
   }
 
   // ---------------------------------------------------------------------------
+  // Sistema (cierre automatico)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Suscribe un listener a los cambios de estado ya confirmados.
+   *
+   * Devuelve como darse de baja. Un listener que falla se registra y no afecta
+   * a la operacion que lo disparo.
+   */
+  onSessionChanged(listener: RemoteSessionChangeListener): () => void {
+    this.changeListeners.add(listener);
+
+    return () => this.changeListeners.delete(listener);
+  }
+
+  /** Sesiones vivas (`CONNECTING` / `ACTIVE`), sin relaciones. */
+  findLiveSessions(): Promise<RemoteSessionLifecycleSnapshot[]> {
+    return this.remoteSessionRepository.find({
+      where: { status: In([...ACTIVE_REMOTE_SESSION_STATUSES]) },
+      select: LIFECYCLE_SNAPSHOT_SELECT,
+    });
+  }
+
+  /** Una sesion concreta si sigue viva, o `null`. Sin relaciones. */
+  findLiveSession(id: string): Promise<RemoteSessionLifecycleSnapshot | null> {
+    return this.remoteSessionRepository.findOne({
+      where: { id, status: In([...ACTIVE_REMOTE_SESSION_STATUSES]) },
+      select: LIFECYCLE_SNAPSHOT_SELECT,
+    });
+  }
+
+  /**
+   * Cierre automatico del backend: `endedBy = SYSTEM`.
+   *
+   * Usa EXACTAMENTE la misma transicion que los cierres del tecnico y del
+   * dispositivo (`closeWithin`: sesion CLOSED + solicitud COMPLETED en la misma
+   * transaccion). Lo unico que anade es el lock y la decision:
+   *
+   * 1. bloquea la fila (`SELECT ... FOR UPDATE`), como `activate`;
+   * 2. si ya no esta viva, no hace nada;
+   * 3. vuelve a preguntar a `decide` con la fila bloqueada, porque entre la
+   *    programacion del vencimiento y este momento la sesion pudo activarse, o
+   *    el participante pudo volver;
+   * 4. cierra condicionado al estado leido, de modo que un vencimiento de
+   *    CONNECTING nunca toca una sesion que ya es ACTIVE.
+   *
+   * Frente a un cierre del tecnico o del dispositivo simultaneo, gana el primero
+   * que llega a la fila: el otro ve `CLOSED` (aqui, `null`; alli, `409`) y no
+   * reescribe `endedAt` ni `endedBy`.
+   *
+   * Solo despues del commit avisa a LOS DOS extremos con
+   * `remote-session:closed`. Devuelve la sesion cerrada, o `null` si no cerro.
+   */
+  async closeBySystem(
+    id: string,
+    decide: SystemCloseDecision,
+  ): Promise<RemoteSession | null> {
+    const closed = await this.dataSource.transaction(async (manager) => {
+      const locked = await manager.findOne(RemoteSession, {
+        where: { id },
+        lock: { mode: 'pessimistic_write' },
+      });
+
+      if (!locked || !ACTIVE_REMOTE_SESSION_STATUSES.includes(locked.status))
+        return null;
+
+      const endedAt = new Date();
+
+      if (!decide(locked, endedAt)) return null;
+
+      const done = await this.closeWithin(
+        manager,
+        locked,
+        endedAt,
+        RemoteSessionEndedBy.SYSTEM,
+        [locked.status],
+      );
+
+      if (!done) return null;
+
+      return Object.assign(locked, {
+        status: RemoteSessionStatus.CLOSED,
+        endedAt,
+        endedBy: RemoteSessionEndedBy.SYSTEM,
+      });
+    });
+
+    if (!closed) return null;
+
+    this.notifyClosedToBoth(closed);
+    this.notifyChanged(closed);
+
+    return closed;
+  }
+
+  // ---------------------------------------------------------------------------
   // Interno
   // ---------------------------------------------------------------------------
 
   /**
    * Cierra la sesion y completa su solicitud en una unica transaccion.
    *
-   * Los dos UPDATE se confirman juntos o no se confirma ninguno: no puede
-   * quedar una sesion `CLOSED` con su solicitud todavia `ACCEPTED`, ni una
-   * sesion cerrada cuya solicitud no haya podido pasar a `COMPLETED`.
-   *
    * El cierre va condicionado al estado actual, asi que si el tecnico y el
-   * dispositivo cierran a la vez solo uno hace la transicion; el segundo
-   * encuentra la fila ya cerrada, recibe `409` y no toca el `endedAt` ni el
-   * `endedBy` del primero.
+   * dispositivo (o el sistema) cierran a la vez solo uno hace la transicion; el
+   * segundo encuentra la fila ya cerrada, recibe `409` y no toca el `endedAt`
+   * ni el `endedBy` del primero.
    */
   private async close(
     remoteSession: RemoteSession,
@@ -431,63 +575,97 @@ export class RemoteSessionsService {
     const endedAt = new Date();
 
     await this.dataSource.transaction(async (manager) => {
-      const closed = await this.closeSession(
+      const closed = await this.closeWithin(
         manager,
-        remoteSession.id,
+        remoteSession,
         endedAt,
         endedBy,
+        ACTIVE_REMOTE_SESSION_STATUSES,
       );
 
       if (!closed)
         throw new ConflictException(
           `Remote session with id ${remoteSession.id} is already closed`,
         );
-
-      const completed = await this.completeSupportRequest(
-        manager,
-        remoteSession.supportRequestId,
-        endedAt,
-      );
-
-      // Una sesion viva implica una solicitud `ACCEPTED`: mientras exista la
-      // sesion, `cancelByDevice` no puede cerrarla. Que el UPDATE no afecte a
-      // exactamente una fila significa que el estado ya es inconsistente, asi
-      // que se aborta y se deshace tambien el cierre de la sesion. Antes solo
-      // se dejaba un `warn` y la sesion quedaba CLOSED sobre una solicitud que
-      // nunca llegaba a COMPLETED.
-      if (!completed)
-        throw new ConflictException(
-          `Support request with id ${remoteSession.supportRequestId} is not in a state that can complete the remote session`,
-        );
     });
 
-    return Object.assign(remoteSession, {
+    const result = Object.assign(remoteSession, {
       status: RemoteSessionStatus.CLOSED,
       endedAt,
       endedBy,
     });
+
+    this.notifyChanged(result);
+
+    return result;
   }
 
   /**
-   * `CONNECTING | ACTIVE -> CLOSED` en un unico UPDATE condicional.
+   * LA transicion de cierre, dentro de una transaccion ya abierta. Es la unica:
+   * la usan el tecnico, el dispositivo y el sistema.
+   *
+   * Los dos UPDATE se confirman juntos o no se confirma ninguno: no puede
+   * quedar una sesion `CLOSED` con su solicitud todavia `ACCEPTED`, ni una
+   * sesion cerrada cuya solicitud no haya podido pasar a `COMPLETED`.
+   *
+   * Devuelve `false` si la sesion ya no estaba en ninguno de los estados `from`
+   * (nada se escribio). Lanza `409` si la solicitud no puede completarse, lo que
+   * aborta la transaccion entera.
+   */
+  private async closeWithin(
+    manager: EntityManager,
+    remoteSession: Pick<RemoteSession, 'id' | 'supportRequestId'>,
+    endedAt: Date,
+    endedBy: RemoteSessionEndedBy,
+    from: readonly RemoteSessionStatus[],
+  ): Promise<boolean> {
+    const closed = await this.closeSession(
+      manager,
+      remoteSession.id,
+      endedAt,
+      endedBy,
+      from,
+    );
+
+    if (!closed) return false;
+
+    const completed = await this.completeSupportRequest(
+      manager,
+      remoteSession.supportRequestId,
+      endedAt,
+    );
+
+    // Una sesion viva implica una solicitud `ACCEPTED`: mientras exista la
+    // sesion, `cancelByDevice` no puede cerrarla. Que el UPDATE no afecte a
+    // exactamente una fila significa que el estado ya es inconsistente, asi
+    // que se aborta y se deshace tambien el cierre de la sesion.
+    if (!completed)
+      throw new ConflictException(
+        `Support request with id ${remoteSession.supportRequestId} is not in a state that can complete the remote session`,
+      );
+
+    return true;
+  }
+
+  /**
+   * `<from> -> CLOSED` en un unico UPDATE condicional.
    *
    * Es lo que evita las carreras: comprobacion y escritura ocurren en la misma
-   * sentencia. Devuelve `false` cuando la sesion ya estaba cerrada.
+   * sentencia. Devuelve `false` cuando la sesion ya no estaba en `from`.
    */
   private async closeSession(
     manager: EntityManager,
     id: string,
     endedAt: Date,
     endedBy: RemoteSessionEndedBy,
+    from: readonly RemoteSessionStatus[],
   ): Promise<boolean> {
     const result = await manager
       .createQueryBuilder()
       .update(RemoteSession)
       .set({ status: RemoteSessionStatus.CLOSED, endedAt, endedBy })
       .where('id = :id', { id })
-      .andWhere('status IN (:...from)', {
-        from: [...ACTIVE_REMOTE_SESSION_STATUSES],
-      })
+      .andWhere('status IN (:...from)', { from: [...from] })
       .execute();
 
     return result.affected === 1;
@@ -864,6 +1042,81 @@ export class RemoteSessionsService {
         `Remote session ${remoteSession.id} is closed, but ${REMOTE_SESSION_CLOSED_EVENT} could not be delivered to its technician`,
         error instanceof Error ? error.stack : undefined,
       );
+    }
+  }
+
+  /**
+   * Cierre del sistema: avisa a LOS DOS extremos, porque ninguno lo pidio.
+   *
+   * Mismo evento y mismo payload que los cierres normales, con
+   * `endedBy: "SYSTEM"`. Cada envio por separado y sin propagar errores: la
+   * sesion ya esta CLOSED en PostgreSQL, un transporte caido no lo deshace y
+   * no debe impedir el aviso al otro extremo. Es best-effort: un extremo
+   * desconectado no lo recibe y reconcilia por REST al volver.
+   */
+  private notifyClosedToBoth(remoteSession: RemoteSession): void {
+    const payload = this.closedPayload(remoteSession);
+
+    this.deliverClosed(remoteSession, `device ${remoteSession.deviceId}`, () =>
+      this.deviceRealtimeService.emitToDevice(
+        remoteSession.deviceId,
+        REMOTE_SESSION_CLOSED_EVENT,
+        payload,
+      ),
+    );
+
+    this.deliverClosed(
+      remoteSession,
+      `technician ${remoteSession.technicianId}`,
+      () =>
+        this.technicianRealtimeService.emitToTechnician(
+          remoteSession.technicianId,
+          REMOTE_SESSION_CLOSED_EVENT,
+          payload,
+        ),
+    );
+  }
+
+  /** Envia un aviso de cierre y registra el fallo sin propagarlo. */
+  private deliverClosed(
+    remoteSession: RemoteSession,
+    recipient: string,
+    emit: () => unknown,
+  ): void {
+    try {
+      emit();
+    } catch (error) {
+      this.logger.error(
+        `Remote session ${remoteSession.id} is closed, but ${REMOTE_SESSION_CLOSED_EVENT} could not be delivered to its ${recipient}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+    }
+  }
+
+  /**
+   * Avisa en proceso a los listeners (el cierre automatico) de un cambio ya
+   * confirmado. Un listener que falla no convierte la operacion en un error.
+   */
+  private notifyChanged(remoteSession: RemoteSession): void {
+    const snapshot: RemoteSessionLifecycleSnapshot = {
+      id: remoteSession.id,
+      supportRequestId: remoteSession.supportRequestId,
+      deviceId: remoteSession.deviceId,
+      technicianId: remoteSession.technicianId,
+      status: remoteSession.status,
+      createdAt: remoteSession.createdAt,
+      connectedAt: remoteSession.connectedAt,
+    };
+
+    for (const listener of this.changeListeners) {
+      try {
+        listener(snapshot);
+      } catch (error) {
+        this.logger.error(
+          `Remote session ${remoteSession.id} change listener failed`,
+          error instanceof Error ? error.stack : undefined,
+        );
+      }
     }
   }
 
