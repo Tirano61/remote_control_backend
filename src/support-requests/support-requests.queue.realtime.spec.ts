@@ -33,6 +33,7 @@ import { SignalingRealtimeService } from '../signaling/realtime/signaling-realti
 import { TechnicianRealtimeService } from '../signaling/realtime/technician-realtime.service';
 import { REMOTE_SESSION_JOIN_EVENT } from '../signaling/signaling.events';
 import { SignalingService } from '../signaling/signaling.service';
+import { SessionParticipationService } from '../signaling/participation/session-participation.service';
 import { SupportRequest } from './entities/support-request.entity';
 import { SupportRequestStatus } from './enums/support-request-status.enum';
 import {
@@ -376,6 +377,7 @@ describe('support-request:queue-updated hacia todos los tecnicos (Socket.IO)', (
         SupportRequestsService,
         // Dependencias de signaling de los gateways: no se ejercitan aqui.
         SignalingService,
+        SessionParticipationService,
         SignalingRealtimeService,
         {
           provide: AuthService,

@@ -21,6 +21,7 @@ import {
   SignalingParticipant,
   SignalingSocket,
 } from './interfaces/signaling-participant.interface';
+import { SessionParticipationService } from './participation/session-participation.service';
 import { SignalingRealtimeService } from './realtime/signaling-realtime.service';
 import {
   REMOTE_SESSION_PEER_JOINED_EVENT,
@@ -60,6 +61,11 @@ export class SignalingService {
     private readonly remoteSessionRepository: Repository<RemoteSession>,
 
     private readonly signalingRealtimeService: SignalingRealtimeService,
+
+    // Registro de quien esta unido a cada sesion. Es la senal que usa el cierre
+    // automatico por abandono; solo se escribe desde aqui, con la identidad del
+    // socket autenticado y despues de validar el join.
+    private readonly sessionParticipationService: SessionParticipationService,
   ) {}
 
   /**
@@ -91,7 +97,7 @@ export class SignalingService {
 
     if (!dto) return joinRejected(SignalingErrorCode.INVALID_PAYLOAD);
 
-    await this.leaveCurrentSession(socket);
+    await this.leaveCurrentSession(socket, identity);
 
     const remoteSession = await this.findJoinableSession(
       dto.remoteSessionId,
@@ -112,7 +118,25 @@ export class SignalingService {
       );
 
     await socket.join(remoteSessionRoom(remoteSession.id));
+
+    // Si el socket se desconecto durante los `await` anteriores, su
+    // `handleDisconnect` ya corrio sin sesion que dar de baja: registrarlo ahora
+    // dejaria un participante fantasma que mantendria viva la sesion.
+    if (socket.disconnected) {
+      await socket.leave(remoteSessionRoom(remoteSession.id));
+      return joinRejected(SignalingErrorCode.UNAUTHORIZED);
+    }
+
     socket.data.remoteSessionId = remoteSession.id;
+
+    // Participacion efectiva: es lo unico que cancela un periodo de gracia en
+    // curso, y solo se llega aqui con la sesion validada (viva y del que la
+    // pide). Un socket autenticado que no hace join no cuenta.
+    this.sessionParticipationService.join(
+      remoteSession.id,
+      identity.participant,
+      socket.id,
+    );
 
     // Solo se llega aqui con la sesion ya validada: viva y del que la pide. Un
     // socket no autorizado no produce readiness ni avisa a nadie.
@@ -185,15 +209,48 @@ export class SignalingService {
   }
 
   /**
-   * Un socket desaparece de sus rooms solo con desconectarse, asi que esto es
-   * unicamente para el cambio de sesion dentro de un mismo socket.
+   * El socket se desconecto: deja de participar en la sesion a la que estaba
+   * unido.
+   *
+   * Socket.IO ya lo saca de sus rooms; aqui solo se da de baja en el registro de
+   * participantes. La sesion sale del valor que el servidor escribio en el
+   * socket al validar el join, nunca de un payload. Si era el ultimo socket de
+   * ese extremo en la sesion, empieza su periodo de gracia.
    */
-  private async leaveCurrentSession(socket: SignalingSocket): Promise<void> {
+  handleDisconnect(socket: SignalingSocket, identity: SignalingIdentity): void {
     const current = socket.data.remoteSessionId;
 
     if (!current) return;
 
     socket.data.remoteSessionId = null;
+
+    this.sessionParticipationService.leave(
+      current,
+      identity.participant,
+      socket.id,
+    );
+  }
+
+  /**
+   * Cambio de sesion dentro de un mismo socket: abandona la room anterior y deja
+   * de participar en ella. (Un socket desaparece de sus rooms solo con
+   * desconectarse; eso lo cubre `handleDisconnect`.)
+   */
+  private async leaveCurrentSession(
+    socket: SignalingSocket,
+    identity: SignalingIdentity,
+  ): Promise<void> {
+    const current = socket.data.remoteSessionId;
+
+    if (!current) return;
+
+    socket.data.remoteSessionId = null;
+
+    this.sessionParticipationService.leave(
+      current,
+      identity.participant,
+      socket.id,
+    );
 
     await socket.leave(remoteSessionRoom(current));
   }

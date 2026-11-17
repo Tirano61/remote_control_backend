@@ -17,6 +17,7 @@ import { RemoteSession } from '../../remote-sessions/entities/remote-session.ent
 import { SignalingRealtimeService } from '../../signaling/realtime/signaling-realtime.service';
 import { TechnicianRealtimeService } from '../../signaling/realtime/technician-realtime.service';
 import { SignalingService } from '../../signaling/signaling.service';
+import { SessionParticipationService } from '../../signaling/participation/session-participation.service';
 import { DeviceCredential } from '../entities/device-credential.entity';
 import { Device } from '../entities/device.entity';
 import { DevicePresenceService } from '../presence/device-presence.service';
@@ -164,6 +165,7 @@ describe('DevicesGateway (Socket.IO)', () => {
         // pruebas no lo ejercitan (para eso esta `signaling.spec.ts`), pero sus
         // dependencias tienen que poder resolverse.
         SignalingService,
+        SessionParticipationService,
         SignalingRealtimeService,
         // La presencia avisa a los tecnicos de cada transicion. Aqui no hay
         // namespace de tecnicos: el aviso se descarta sin afectar a nada (eso

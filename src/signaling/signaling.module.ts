@@ -3,6 +3,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from '../auth/auth.module';
 import { RemoteSession } from '../remote-sessions/entities/remote-session.entity';
 import { TechniciansGateway } from './gateway/technicians.gateway';
+import { SessionParticipationModule } from './participation/session-participation.module';
 import { SignalingRealtimeService } from './realtime/signaling-realtime.service';
 import { TechnicianRealtimeModule } from './realtime/technician-realtime.module';
 import { SignalingService } from './signaling.service';
@@ -34,6 +35,10 @@ import { SignalingService } from './signaling.service';
     TypeOrmModule.forFeature([RemoteSession]),
     AuthModule,
     TechnicianRealtimeModule,
+    // Registro de participantes de cada sesion: el signaling lo alimenta con
+    // los joins validados y las desconexiones. Lo lee el cierre automatico de
+    // `RemoteSessionsModule`, que importa el mismo modulo sin depender de este.
+    SessionParticipationModule,
   ],
   exports: [SignalingService, SignalingRealtimeService],
 })

@@ -164,6 +164,13 @@ export class DevicesGateway
 
     if (!context) return;
 
+    // Participacion en la sesion remota: se da de baja SIEMPRE, tambien cuando
+    // la presencia ya lo saco (desconexion forzada). Si era el ultimo socket de
+    // la tablet unido a la sesion, empieza su periodo de gracia.
+    const identity = this.identityOf(client);
+
+    if (identity) this.signalingService.handleDisconnect(client, identity);
+
     const isOffline = this.devicePresenceService.unregister(
       context.deviceId,
       client.id,

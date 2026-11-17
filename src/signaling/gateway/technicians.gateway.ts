@@ -3,6 +3,7 @@ import {
   ConnectedSocket,
   MessageBody,
   OnGatewayConnection,
+  OnGatewayDisconnect,
   OnGatewayInit,
   SubscribeMessage,
   WebSocketGateway,
@@ -120,7 +121,8 @@ type TechnicianNamespace = Namespace<
 export class TechniciansGateway
   implements
     OnGatewayInit<TechnicianNamespace>,
-    OnGatewayConnection<TechnicianSocket>
+    OnGatewayConnection<TechnicianSocket>,
+    OnGatewayDisconnect<TechnicianSocket>
 {
   private readonly logger = new Logger(TechniciansGateway.name);
 
@@ -177,6 +179,20 @@ export class TechniciansGateway
     await client.join(ALL_TECHNICIANS_ROOM);
 
     this.logger.log(`Technician connected: ${context.userId}`);
+  }
+
+  /**
+   * Un socket del tecnico se fue.
+   *
+   * No hay presencia de tecnicos: lo unico que importa es si ese socket estaba
+   * unido a una sesion remota. Si era el ultimo del tecnico en ella, empieza el
+   * periodo de gracia del cierre automatico. Otra pestana que siga unida a la
+   * misma sesion lo evita.
+   */
+  handleDisconnect(client: TechnicianSocket): void {
+    const identity = this.identityOf(client);
+
+    if (identity) this.signalingService.handleDisconnect(client, identity);
   }
 
   /**

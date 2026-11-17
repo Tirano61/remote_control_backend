@@ -31,6 +31,7 @@ import {
 import { SignalingRealtimeService } from '../signaling/realtime/signaling-realtime.service';
 import { TechnicianRealtimeService } from '../signaling/realtime/technician-realtime.service';
 import { SignalingService } from '../signaling/signaling.service';
+import { SessionParticipationService } from '../signaling/participation/session-participation.service';
 import { RemoteSession } from './entities/remote-session.entity';
 import { RemoteSessionStatus } from './enums/remote-session-status.enum';
 import {
@@ -290,6 +291,7 @@ describe('remote-session:active (Socket.IO)', () => {
         DeviceCredentialsService,
         // Dependencias de signaling de los gateways: no se ejercitan aqui.
         SignalingService,
+        SessionParticipationService,
         SignalingRealtimeService,
         {
           provide: AuthService,
