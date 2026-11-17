@@ -762,6 +762,216 @@ describe('remote_sessions contra PostgreSQL', () => {
   // Cierre
   // ---------------------------------------------------------------------------
 
+  describe('cierre del sistema (SYSTEM)', () => {
+    const always = () => true;
+
+    const onlyIfConnecting = (session: { status: RemoteSessionStatus }) =>
+      session.status === RemoteSessionStatus.CONNECTING;
+
+    it('cierra con SYSTEM y completa la solicitud en la misma transaccion', async () => {
+      const { remoteSessionId, supportRequestId } = await seedLiveSession();
+
+      const closed = await service.closeBySystem(remoteSessionId, always);
+
+      expect(closed?.endedBy).toBe(RemoteSessionEndedBy.SYSTEM);
+
+      const stored = await storedSession(remoteSessionId);
+      const request = await storedRequest(supportRequestId);
+
+      expect(stored).toMatchObject({
+        status: RemoteSessionStatus.CLOSED,
+        endedBy: RemoteSessionEndedBy.SYSTEM,
+      });
+      expect(request.status).toBe(SupportRequestStatus.COMPLETED);
+      expect(request.closedAt?.getTime()).toBe(stored.endedAt?.getTime());
+    });
+
+    it('espera al lock de un cierre del tecnico sin confirmar y despues no hace nada', async () => {
+      const { remoteSessionId } = await seedLiveSession();
+
+      const runner = dataSource.createQueryRunner();
+
+      await runner.connect();
+
+      try {
+        await runner.startTransaction();
+
+        await closeSessionRaw(runner, remoteSessionId);
+
+        let settled = false;
+        const blocked = service
+          .closeBySystem(remoteSessionId, always)
+          .finally(() => {
+            settled = true;
+          });
+
+        blocked.catch(() => undefined);
+
+        await delay(1_000);
+
+        // El SELECT ... FOR UPDATE del sistema espera al cierre del tecnico.
+        expect(settled).toBe(false);
+
+        await runner.commitTransaction();
+
+        await expect(blocked).resolves.toBeNull();
+      } finally {
+        await runner.release();
+      }
+
+      expect((await storedSession(remoteSessionId)).endedBy).toBe(
+        RemoteSessionEndedBy.TECHNICIAN,
+      );
+    });
+
+    it('SYSTEM y tecnico simultaneos: una sola transicion y endedBy del ganador', async () => {
+      const { technician, remoteSessionId, supportRequestId } =
+        await seedLiveSession();
+
+      const [system, manual] = await Promise.allSettled([
+        service.closeBySystem(remoteSessionId, always),
+        service.closeByTechnician(remoteSessionId, technician),
+      ]);
+
+      const systemWon = system.status === 'fulfilled' && system.value !== null;
+      const manualWon = manual.status === 'fulfilled';
+
+      expect(Number(systemWon) + Number(manualWon)).toBe(1);
+
+      if (manual.status === 'rejected')
+        expect(manual.reason).toBeInstanceOf(ConflictException);
+
+      const stored = await storedSession(remoteSessionId);
+
+      expect(stored.endedBy).toBe(
+        systemWon
+          ? RemoteSessionEndedBy.SYSTEM
+          : RemoteSessionEndedBy.TECHNICIAN,
+      );
+      expect((await storedRequest(supportRequestId)).closedAt?.getTime()).toBe(
+        stored.endedAt?.getTime(),
+      );
+    });
+
+    it('dos cierres SYSTEM simultaneos: uno cierra y el otro no hace nada', async () => {
+      const { remoteSessionId } = await seedLiveSession();
+
+      const results = await Promise.all([
+        service.closeBySystem(remoteSessionId, always),
+        service.closeBySystem(remoteSessionId, always),
+      ]);
+
+      expect(results.filter((result) => result !== null)).toHaveLength(1);
+    });
+
+    it('un vencimiento de CONNECTING bloqueado tras un activate sin confirmar no cierra la sesion ya ACTIVE', async () => {
+      const { technician, remoteSessionId } = await seedLiveSession();
+
+      const runner = dataSource.createQueryRunner();
+
+      await runner.connect();
+
+      try {
+        await runner.startTransaction();
+
+        // Activacion sin confirmar, con el mismo lock que toma el servicio.
+        await runner.manager.findOne(RemoteSession, {
+          where: { id: remoteSessionId, technicianId: technician.id },
+          lock: { mode: 'pessimistic_write' },
+        });
+
+        await runner.manager
+          .createQueryBuilder()
+          .update(RemoteSession)
+          .set({
+            status: RemoteSessionStatus.ACTIVE,
+            connectedAt: new Date(),
+          })
+          .where('id = :id', { id: remoteSessionId })
+          .execute();
+
+        const blocked = service.closeBySystem(
+          remoteSessionId,
+          onlyIfConnecting,
+        );
+
+        blocked.catch(() => undefined);
+
+        await delay(500);
+        await runner.commitTransaction();
+
+        // Al reevaluar la fila bloqueada lee ACTIVE: el TTL ya no aplica.
+        await expect(blocked).resolves.toBeNull();
+      } finally {
+        await runner.release();
+      }
+
+      expect((await storedSession(remoteSessionId)).status).toBe(
+        RemoteSessionStatus.ACTIVE,
+      );
+    });
+
+    it('activate y vencimiento de CONNECTING simultaneos no dejan un estado imposible', async () => {
+      const { technician, remoteSessionId } = await seedLiveSession();
+
+      const [activate, expire] = await Promise.allSettled([
+        service.activateByTechnician(remoteSessionId, technician),
+        service.closeBySystem(remoteSessionId, onlyIfConnecting),
+      ]);
+
+      const stored = await storedSession(remoteSessionId);
+
+      if (activate.status === 'fulfilled') {
+        expect(stored.status).toBe(RemoteSessionStatus.ACTIVE);
+        expect(expire).toEqual({ status: 'fulfilled', value: null });
+      } else {
+        expect(activate.reason).toBeInstanceOf(ConflictException);
+        expect(stored).toMatchObject({
+          status: RemoteSessionStatus.CLOSED,
+          endedBy: RemoteSessionEndedBy.SYSTEM,
+          connectedAt: null,
+        });
+      }
+    });
+
+    it('una sesion CLOSED no vuelve a cerrarse ni cambia su endedBy', async () => {
+      const { technician, remoteSessionId } = await seedLiveSession();
+
+      const closed = await service.closeByTechnician(
+        remoteSessionId,
+        technician,
+      );
+
+      await expect(
+        service.closeBySystem(remoteSessionId, always),
+      ).resolves.toBeNull();
+
+      const stored = await storedSession(remoteSessionId);
+
+      expect(stored.endedBy).toBe(RemoteSessionEndedBy.TECHNICIAN);
+      expect(stored.endedAt?.getTime()).toBe(closed.endedAt?.getTime());
+    });
+
+    it('lista las sesiones vivas para la reconciliacion de arranque', async () => {
+      const { remoteSessionId } = await seedLiveSession();
+      const closedOne = await seedLiveSession();
+
+      await service.closeBySystem(closedOne.remoteSessionId, always);
+
+      const live = await service.findLiveSessions();
+      const ids = live.map((session) => session.id);
+
+      expect(ids).toContain(remoteSessionId);
+      expect(ids).not.toContain(closedOne.remoteSessionId);
+      expect(live.find((session) => session.id === remoteSessionId)).toEqual(
+        expect.objectContaining({
+          status: RemoteSessionStatus.CONNECTING,
+          createdAt: expect.any(Date) as Date,
+        }),
+      );
+    });
+  });
+
   describe('despues de cerrar', () => {
     it('el tecnico puede abrir otra sesion sin ninguna limpieza', async () => {
       const technician = await seedTechnician();
