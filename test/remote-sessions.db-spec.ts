@@ -20,7 +20,10 @@ import {
   ACTIVE_REMOTE_SESSION_STATUSES,
   RemoteSessionStatus,
 } from '../src/remote-sessions/enums/remote-session-status.enum';
-import { RemoteSessionsService } from '../src/remote-sessions/remote-sessions.service';
+import {
+  REMOTE_SESSION_CLOSED_EVENT,
+  RemoteSessionsService,
+} from '../src/remote-sessions/remote-sessions.service';
 import { TechnicianRealtimeService } from '../src/signaling/realtime/technician-realtime.service';
 import { SupportRequest } from '../src/support-requests/entities/support-request.entity';
 import { SupportRequestStatus } from '../src/support-requests/enums/support-request-status.enum';
@@ -76,6 +79,12 @@ describe('remote_sessions contra PostgreSQL', () => {
   let dataSource: DataSource;
   let service: RemoteSessionsService;
 
+  // El transporte no se prueba aqui, pero si CUANTOS avisos de cierre salen y
+  // con que `endedBy`: un cierre concurrente no puede producir avisos dobles ni
+  // contradictorios.
+  const emitToDevice = jest.fn().mockReturnValue(true);
+  const emitToTechnician = jest.fn().mockReturnValue(true);
+
   beforeAll(async () => {
     if (!DATABASE_URL)
       throw new Error(
@@ -122,12 +131,12 @@ describe('remote_sessions contra PostgreSQL', () => {
         { provide: DevicePresenceService, useValue: { isOnline: () => true } },
         {
           provide: DeviceRealtimeService,
-          useValue: { emitToDevice: () => true },
+          useValue: { emitToDevice },
         },
         {
           provide: TechnicianRealtimeService,
           useValue: {
-            emitToTechnician: () => true,
+            emitToTechnician,
             emitToAllTechnicians: () => true,
           },
         },
@@ -824,44 +833,163 @@ describe('remote_sessions contra PostgreSQL', () => {
       );
     });
 
-    it('SYSTEM y tecnico simultaneos: una sola transicion y endedBy del ganador', async () => {
-      const { technician, remoteSessionId, supportRequestId } =
-        await seedLiveSession();
-
-      const [system, manual] = await Promise.allSettled([
-        service.closeBySystem(remoteSessionId, always),
-        service.closeByTechnician(remoteSessionId, technician),
-      ]);
-
-      const systemWon = system.status === 'fulfilled' && system.value !== null;
-      const manualWon = manual.status === 'fulfilled';
-
-      expect(Number(systemWon) + Number(manualWon)).toBe(1);
-
-      if (manual.status === 'rejected')
-        expect(manual.reason).toBeInstanceOf(ConflictException);
-
-      const stored = await storedSession(remoteSessionId);
-
-      expect(stored.endedBy).toBe(
-        systemWon
-          ? RemoteSessionEndedBy.SYSTEM
-          : RemoteSessionEndedBy.TECHNICIAN,
-      );
-      expect((await storedRequest(supportRequestId)).closedAt?.getTime()).toBe(
-        stored.endedAt?.getTime(),
-      );
+    /** Avisos `remote-session:closed` emitidos, por destinatario. */
+    const closedNotices = () => ({
+      device: emitToDevice.mock.calls
+        .filter(([, event]) => event === REMOTE_SESSION_CLOSED_EVENT)
+        .map(([, , payload]) => payload as { endedBy: RemoteSessionEndedBy }),
+      technician: emitToTechnician.mock.calls
+        .filter(([, event]) => event === REMOTE_SESSION_CLOSED_EVENT)
+        .map(([, , payload]) => payload as { endedBy: RemoteSessionEndedBy }),
     });
 
-    it('dos cierres SYSTEM simultaneos: uno cierra y el otro no hace nada', async () => {
-      const { remoteSessionId } = await seedLiveSession();
+    /**
+     * Lo que tiene que quedar en PostgreSQL tras CUALQUIER carrera de cierre:
+     * una sola transicion terminal con el `endedBy` del ganador y la solicitud
+     * COMPLETED una sola vez, con el mismo instante que la sesion.
+     */
+    const expectSingleTerminalTransition = async (
+      remoteSessionId: string,
+      supportRequestId: string,
+      endedBy: RemoteSessionEndedBy,
+    ): Promise<void> => {
+      const stored = await storedSession(remoteSessionId);
+      const request = await storedRequest(supportRequestId);
 
-      const results = await Promise.all([
-        service.closeBySystem(remoteSessionId, always),
-        service.closeBySystem(remoteSessionId, always),
-      ]);
+      expect(stored).toMatchObject({
+        status: RemoteSessionStatus.CLOSED,
+        endedBy,
+      });
+      expect(request.status).toBe(SupportRequestStatus.COMPLETED);
+      // El `closedAt` es el del cierre ganador: nadie lo reescribio despues.
+      expect(request.closedAt?.getTime()).toBe(stored.endedAt?.getTime());
+    };
 
-      expect(results.filter((result) => result !== null)).toHaveLength(1);
+    /** Carreras repetidas: un orden fijo podria ocultar un fallo. */
+    const RACE_ROUNDS = 8;
+
+    /**
+     * Retraso (ms) con el que arranca el cierre SYSTEM en cada ronda.
+     *
+     * Los cierres manuales leen la sesion (pertenencia) antes de abrir su
+     * transaccion, asi que con arranque simultaneo casi siempre gana SYSTEM.
+     * Escalonar el arranque hace que el cierre manual llegue antes en algunas
+     * rondas y deja ejercitadas las dos ramas. No se exige un reparto concreto
+     * de ganadores: depende del motor y haria la prueba inestable.
+     */
+    const SYSTEM_START_OFFSETS_MS = [0, 0, 2, 4, 8, 12, 20, 30];
+
+    it.each([
+      ['el tecnico', RemoteSessionEndedBy.TECHNICIAN],
+      ['el dispositivo', RemoteSessionEndedBy.DEVICE],
+    ])(
+      'SYSTEM y %s simultaneos: una sola transicion, endedBy del ganador, solicitud COMPLETED y avisos coherentes',
+      async (_label, manualEndedBy) => {
+        const winners: string[] = [];
+
+        for (let round = 0; round < RACE_ROUNDS; round += 1) {
+          const { technician, remoteSessionId, supportRequestId } =
+            await seedLiveSession();
+          const { deviceId } = await storedSession(remoteSessionId);
+
+          emitToDevice.mockClear();
+          emitToTechnician.mockClear();
+
+          const manualClose = () =>
+            manualEndedBy === RemoteSessionEndedBy.TECHNICIAN
+              ? service.closeByTechnician(remoteSessionId, technician)
+              : service.closeByDevice(remoteSessionId, {
+                  id: deviceId,
+                } as Device);
+
+          // El cierre manual sale primero; SYSTEM, con el retraso de la ronda.
+          const manualCloseResult: Promise<unknown> = manualClose();
+          const systemClose = delay(SYSTEM_START_OFFSETS_MS[round]).then(() =>
+            service.closeBySystem(remoteSessionId, always),
+          );
+
+          const [system, manual] = await Promise.allSettled([
+            systemClose,
+            manualCloseResult,
+          ]);
+
+          const systemWon =
+            system.status === 'fulfilled' && system.value !== null;
+          const manualWon = manual.status === 'fulfilled';
+
+          expect(Number(systemWon) + Number(manualWon)).toBe(1);
+
+          if (manual.status === 'rejected')
+            expect(manual.reason).toBeInstanceOf(ConflictException);
+
+          const winner = systemWon
+            ? RemoteSessionEndedBy.SYSTEM
+            : manualEndedBy;
+
+          winners.push(winner);
+
+          await expectSingleTerminalTransition(
+            remoteSessionId,
+            supportRequestId,
+            winner,
+          );
+
+          // Avisos: todos con el `endedBy` ganador, y los que tocan.
+          const notices = closedNotices();
+          const all = [...notices.device, ...notices.technician];
+
+          expect(all.every((payload) => payload.endedBy === winner)).toBe(true);
+
+          if (winner === RemoteSessionEndedBy.SYSTEM) {
+            expect(notices.device).toHaveLength(1);
+            expect(notices.technician).toHaveLength(1);
+          } else if (winner === RemoteSessionEndedBy.TECHNICIAN) {
+            expect(notices.device).toHaveLength(1);
+            expect(notices.technician).toHaveLength(0);
+          } else {
+            expect(notices.device).toHaveLength(0);
+            expect(notices.technician).toHaveLength(1);
+          }
+        }
+
+        // Evidencia del reparto real de ganadores en esta ejecucion.
+        process.stdout.write(
+          `  [race SYSTEM vs ${manualEndedBy}] winners: ${winners.join(', ')}\n`,
+        );
+      },
+    );
+
+    it('tres cierres SYSTEM simultaneos: uno cierra, los demas no hacen nada', async () => {
+      for (let round = 0; round < RACE_ROUNDS; round += 1) {
+        const { remoteSessionId, supportRequestId } = await seedLiveSession();
+
+        emitToDevice.mockClear();
+        emitToTechnician.mockClear();
+
+        const results = await Promise.all([
+          service.closeBySystem(remoteSessionId, always),
+          service.closeBySystem(remoteSessionId, always),
+          service.closeBySystem(remoteSessionId, always),
+        ]);
+
+        expect(results.filter((result) => result !== null)).toHaveLength(1);
+
+        await expectSingleTerminalTransition(
+          remoteSessionId,
+          supportRequestId,
+          RemoteSessionEndedBy.SYSTEM,
+        );
+
+        // Un solo aviso por extremo, aunque hubiera tres intentos.
+        const notices = closedNotices();
+
+        expect(notices.device).toEqual([
+          { remoteSessionId, endedBy: RemoteSessionEndedBy.SYSTEM },
+        ]);
+        expect(notices.technician).toEqual([
+          { remoteSessionId, endedBy: RemoteSessionEndedBy.SYSTEM },
+        ]);
+      }
     });
 
     it('un vencimiento de CONNECTING bloqueado tras un activate sin confirmar no cierra la sesion ya ACTIVE', async () => {
