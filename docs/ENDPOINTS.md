@@ -1229,6 +1229,14 @@ Notes:
 "Live" means `status` is `CONNECTING` or `ACTIVE`. A `CLOSED` session is never
 returned here.
 
+The backend may close a session on its own (`endedBy: "SYSTEM"`) — when a side
+stays away from it longer than the grace period, or when it never becomes
+`ACTIVE` — see the automatic close in [REALTIME.md](REALTIME.md). The
+`remote-session:closed` event for such a close is lost if the tablet was
+disconnected, so this endpoint is how it finds out: read it after every
+reconnection, and when it answers `remoteSession: null` for a session the
+tablet believed live, stop the capture and the peer connection.
+
 A session is born `CONNECTING` with `connectedAt: null` and becomes `ACTIVE`
 with `connectedAt` set when the technician reports the remote connection through
 `POST /remote-sessions/:id/activate`. Signaling does not change the session
@@ -1268,7 +1276,8 @@ Errors:
 400 — id is not a valid UUID.
 401 — Not authenticated as a device.
 404 — The session does not exist, or belongs to another device.
-409 — The session is already closed, or its support request is not in a state
+409 — The session is already closed (by the technician, by the device or
+      automatically by the backend), or its support request is not in a state
       that can be completed.
 ```
 
@@ -1276,9 +1285,10 @@ Notes:
 Closing the session also closes the support request. The two updates are
 committed together: a `CLOSED` session with an `ACCEPTED` request cannot remain.
 
-If the technician and the device close at the same instant, only one wins; the
-other receives `409`, and the recorded `endedBy` / `endedAt` are those of the
-first.
+If the technician, the device and the backend's automatic close happen at the
+same instant, only one wins; the others receive `409` (or, for the backend, do
+nothing), and the recorded `endedBy` / `endedAt` are those of the first. For the
+tablet a `409` here means "already over": the local session must end anyway.
 
 The device does **not** receive `remote-session:closed` for its own close — the
 closing side already has the closed session in this HTTP response.
@@ -1389,6 +1399,12 @@ On success the backend emits `remote-session:created` to the device over
 Socket.IO, after the transaction commits. Delivery is best-effort; the tablet can
 always recover with `GET /device/remote-sessions/current`.
 
+The new session has a deadline: if it is not `ACTIVE` within
+`REMOTE_SESSION_CONNECTING_TTL_MS` (120 s by default) of `createdAt`, the backend
+closes it with `endedBy: "SYSTEM"` and the support request becomes `COMPLETED`.
+Signaling does not extend it. See the automatic close in
+[REALTIME.md](REALTIME.md).
+
 ## GET /remote-sessions/current
 
 ```text
@@ -1454,6 +1470,14 @@ Having no live session is normal, not an error: it answers `200` with
 
 "Live" means `status` is `CONNECTING` or `ACTIVE`. A `CLOSED` session is never
 returned here; read a closed one by id with `GET /remote-sessions/:id`.
+
+A session can stop being live without anyone pressing "end": the backend closes
+it with `endedBy: "SYSTEM"` when the technician or the device stays away from it
+longer than the grace period, or when it never becomes `ACTIVE` (see the
+automatic close in [REALTIME.md](REALTIME.md)). If the web app was disconnected
+at that moment it missed `remote-session:closed`; reading this endpoint after
+every reconnection is how it notices. An automatic close also frees the
+technician for a new session immediately.
 
 Ownership is part of the query, not a filter applied afterwards: only sessions
 whose `technicianId` is the authenticated user are considered. A live session
@@ -1551,7 +1575,9 @@ Errors:
 401 — Not authenticated.
 403 — Authenticated without role admin/tecnico.
 404 — The session does not exist, or belongs to another technician.
-409 — The session is CLOSED. A closed session never reopens.
+409 — The session is CLOSED. A closed session never reopens. This includes a
+      CONNECTING session the backend already closed because its TTL expired
+      (endedBy SYSTEM).
 ```
 
 Notes:
@@ -1580,6 +1606,12 @@ The transition runs inside a transaction that locks the session row, so an
 close first     -> the session is CLOSED and activate answers 409
 activate first  -> the session is ACTIVE and the close then does ACTIVE -> CLOSED
 ```
+
+The automatic `CONNECTING` TTL close takes the same lock: if `activate` wins, the
+TTL no longer applies and the session stays `ACTIVE`; if the TTL wins, `activate`
+answers `409`. Once `ACTIVE`, the session stays open only while both sides keep a
+socket joined to it (with a grace period for reconnections) — see the automatic
+close in [REALTIME.md](REALTIME.md).
 
 On a real transition the backend emits `remote-session:active` to the device and
 to the technician, after the transaction commits — see [REALTIME.md](REALTIME.md).
@@ -1626,8 +1658,9 @@ Errors:
 401 — Not authenticated.
 403 — Authenticated without role admin/tecnico.
 404 — The session does not exist, or belongs to another technician.
-409 — The session is already closed, or its support request is not in a state
-      that can be completed.
+409 — The session is already closed (by the device or automatically by the
+      backend), or its support request is not in a state that can be
+      completed.
 ```
 
 Notes:
@@ -1683,7 +1716,10 @@ Live statuses (only one at a time per device): `CONNECTING`, `ACTIVE`.
 ```text
 TECHNICIAN  Closed through POST /remote-sessions/:id/close
 DEVICE      Closed through POST /device/remote-sessions/:id/close
-SYSTEM      Reserved. No code path writes it today.
+SYSTEM      Closed automatically by the backend: a CONNECTING session reached
+            its TTL, an ACTIVE session lost a side for longer than the grace
+            period, or nobody recovered it after a backend restart. No client
+            can request it. See the automatic close in REALTIME.md.
 ```
 
 ### ValidRoles
@@ -1785,8 +1821,12 @@ and the web app reads GET /support-requests.
 4b. POST  /device/remote-sessions/:id/close   (Device JWT) endedBy DEVICE
                                                            -> emits remote-session:closed
                                                               to the technician
+4c. (no request) automatic close by the backend            endedBy SYSTEM
+          - CONNECTING not ACTIVE within the TTL (120 s)   -> emits remote-session:closed
+          - ACTIVE with a side away > grace (60 s)            to BOTH ends
+          - not recovered after a backend restart
 
-5. In both cases the SupportRequest becomes COMPLETED in the same transaction.
+5. In every case the SupportRequest becomes COMPLETED in the same transaction.
    A session closed after step 3 keeps its connectedAt.
 ```
 
@@ -1795,3 +1835,9 @@ Once the session exists, WebRTC negotiation happens over Socket.IO — see
 Socket.IO message changes the status of a session: `ACTIVE` is written only by
 `POST /remote-sessions/:id/activate`, which is the technician reporting what
 WebRTC did. Step 3 is not a precondition for signaling or for closing.
+
+The only status change no client requests is 4c. It depends on Socket.IO
+participation (`remote-session:join`), so a session driven only through REST —
+for example from Postman, with no Socket.IO client joined — is closed by the
+backend about one grace period after `/activate`, or at the CONNECTING TTL if
+it is never activated.

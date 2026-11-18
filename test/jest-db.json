@@ -4,6 +4,7 @@
   "testEnvironment": "node",
   "testRegex": ".db-spec.ts$",
   "testTimeout": 60000,
+  "globalSetup": "<rootDir>/db-global-setup.ts",
   "transform": {
     "^.+\\.(t|j)s$": "ts-jest"
   }

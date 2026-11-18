@@ -59,6 +59,11 @@ export interface SignalingSocketData {
 export interface SignalingSocket {
   readonly id: string;
   readonly data: SignalingSocketData;
+  /**
+   * `true` si el socket ya se desconecto. Opcional para los dobles de prueba:
+   * ausente se interpreta como conectado.
+   */
+  readonly disconnected?: boolean;
   join(room: string): void | Promise<void>;
   leave(room: string): void | Promise<void>;
 }

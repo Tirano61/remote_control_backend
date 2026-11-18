@@ -25,6 +25,7 @@ import {
 import { SignalingRealtimeService } from '../signaling/realtime/signaling-realtime.service';
 import { TechnicianRealtimeService } from '../signaling/realtime/technician-realtime.service';
 import { SignalingService } from '../signaling/signaling.service';
+import { SessionParticipationService } from '../signaling/participation/session-participation.service';
 import { SupportRequest } from '../support-requests/entities/support-request.entity';
 import { SupportRequestStatus } from '../support-requests/enums/support-request-status.enum';
 import { RemoteSession } from './entities/remote-session.entity';
@@ -245,6 +246,7 @@ describe('remote-session:closed hacia el tecnico (Socket.IO)', () => {
         DevicePresenceService,
         // Dependencias de signaling del gateway: no se ejercitan aqui.
         SignalingService,
+        SessionParticipationService,
         SignalingRealtimeService,
         {
           provide: AuthService,

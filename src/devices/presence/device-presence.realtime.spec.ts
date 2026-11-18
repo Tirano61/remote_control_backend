@@ -22,6 +22,7 @@ import {
 import { SignalingRealtimeService } from '../../signaling/realtime/signaling-realtime.service';
 import { TechnicianRealtimeService } from '../../signaling/realtime/technician-realtime.service';
 import { SignalingService } from '../../signaling/signaling.service';
+import { SessionParticipationService } from '../../signaling/participation/session-participation.service';
 import { SupportRequest } from '../../support-requests/entities/support-request.entity';
 import { SupportRequestStatus } from '../../support-requests/enums/support-request-status.enum';
 import { SupportRequestsController } from '../../support-requests/support-requests.controller';
@@ -362,6 +363,7 @@ describe('device:presence-updated de punta a punta (Socket.IO + REST)', () => {
         JwtStrategy,
         // Dependencias de signaling de los gateways: no se ejercitan aqui.
         SignalingService,
+        SessionParticipationService,
         SignalingRealtimeService,
         {
           provide: ConfigService,

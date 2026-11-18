@@ -49,6 +49,7 @@ import {
   WebrtcSdpPayload,
 } from './signaling.events';
 import { SignalingService } from './signaling.service';
+import { SessionParticipationService } from './participation/session-participation.service';
 
 /**
  * Signaling sobre conexiones Socket.IO reales.
@@ -132,6 +133,7 @@ describe('Signaling WebRTC (Socket.IO)', () => {
   let techniciansUrl: string;
   let presence: DevicePresenceService;
   let signalingRealtime: SignalingRealtimeService;
+  let participation: SessionParticipationService;
   let deviceJwt: JwtService;
   let userJwt: JwtService;
 
@@ -378,6 +380,7 @@ describe('Signaling WebRTC (Socket.IO)', () => {
         DevicesGateway,
         TechniciansGateway,
         SignalingService,
+        SessionParticipationService,
         SignalingRealtimeService,
         // El gateway de tecnicos tambien registra la salida de eventos de
         // dominio; aqui no se emite ninguno.
@@ -414,6 +417,7 @@ describe('Signaling WebRTC (Socket.IO)', () => {
 
     presence = app.get(DevicePresenceService);
     signalingRealtime = app.get(SignalingRealtimeService);
+    participation = app.get(SessionParticipationService);
     deviceJwt = app.get(JwtService);
     userJwt = new JwtService({
       secret: USER_JWT_SECRET,
@@ -509,6 +513,12 @@ describe('Signaling WebRTC (Socket.IO)', () => {
 
   afterAll(async () => {
     await app.close();
+  });
+
+  afterEach(() => {
+    // El registro de participacion es por instancia y sobrevive entre pruebas.
+    for (const id of [SESSION_A_ID, SESSION_B_ID, SESSION_C_ID])
+      participation.forget(id);
   });
 
   describe('autenticacion del namespace /technicians', () => {
@@ -1293,6 +1303,147 @@ describe('Signaling WebRTC (Socket.IO)', () => {
       // Ni SDP ni ICE se persisten, y la sesion no cambia de estado.
       expect(writes).toEqual([]);
       expect(remoteSessions[0].status).toBe(RemoteSessionStatus.CONNECTING);
+    });
+  });
+  describe('participacion efectiva en la sesion (cierre automatico)', () => {
+    const DEVICE = SignalingParticipant.DEVICE;
+    const TECHNICIAN = SignalingParticipant.TECHNICIAN;
+
+    const waitForAbsent = (
+      participant: SignalingParticipant,
+      remoteSessionId: string,
+    ): Promise<void> =>
+      waitFor(
+        () => !participation.isPresent(remoteSessionId, participant),
+        `${participant} ausente de ${remoteSessionId}`,
+      );
+
+    it('un socket autenticado que no hizo join no participa', async () => {
+      await connectTechnician(technicianA);
+      await connectDevice(DEVICE_A_ID);
+
+      await settle();
+
+      expect(participation.isPresent(SESSION_A_ID, TECHNICIAN)).toBe(false);
+      expect(participation.isPresent(SESSION_A_ID, DEVICE)).toBe(false);
+    });
+
+    it('un join validado registra al extremo en esa sesion y en ninguna otra', async () => {
+      const technician = await connectTechnician(technicianA);
+      const device = await connectDevice(DEVICE_A_ID);
+
+      await join(technician, SESSION_A_ID);
+      await join(device, SESSION_A_ID);
+
+      expect(participation.isPresent(SESSION_A_ID, TECHNICIAN)).toBe(true);
+      expect(participation.isPresent(SESSION_A_ID, DEVICE)).toBe(true);
+      expect(participation.isPresent(SESSION_C_ID, TECHNICIAN)).toBe(false);
+    });
+
+    it('un join rechazado no registra participacion', async () => {
+      const intruder = await connectTechnician(technicianB);
+      const closed = await connectDevice(DEVICE_A_ID);
+
+      await join(intruder, SESSION_A_ID);
+      await join(closed, CLOSED_SESSION_ID);
+
+      expect(participation.isPresent(SESSION_A_ID, TECHNICIAN)).toBe(false);
+      expect(participation.isPresent(CLOSED_SESSION_ID, DEVICE)).toBe(false);
+    });
+
+    it('la desconexion del ultimo socket deja al extremo ausente', async () => {
+      const technician = await connectTechnician(technicianA);
+
+      await join(technician, SESSION_A_ID);
+
+      technician.close();
+
+      await waitForAbsent(TECHNICIAN, SESSION_A_ID);
+
+      expect(participation.absentSince(SESSION_A_ID, TECHNICIAN)).toEqual(
+        expect.any(Number),
+      );
+    });
+
+    it('con dos pestanas unidas, cerrar una no deja ausente al tecnico', async () => {
+      const first = await connectTechnician(technicianA);
+      const second = await connectTechnician(technicianA);
+
+      await join(first, SESSION_A_ID);
+      await join(second, SESSION_A_ID);
+
+      first.close();
+
+      await waitFor(
+        () => participation.socketCount(SESSION_A_ID, TECHNICIAN) === 1,
+        'queda una sola pestana',
+      );
+
+      expect(participation.isPresent(SESSION_A_ID, TECHNICIAN)).toBe(true);
+      expect(participation.absentSince(SESSION_A_ID, TECHNICIAN)).toBeNull();
+    });
+
+    it('una pestana abierta pero sin join no cuenta como participacion', async () => {
+      const joined = await connectTechnician(technicianA);
+      await connectTechnician(technicianA);
+
+      await join(joined, SESSION_A_ID);
+
+      joined.close();
+
+      await waitForAbsent(TECHNICIAN, SESSION_A_ID);
+    });
+
+    it('reconexion de la tablet: el socket viejo que cae tarde no anula al nuevo', async () => {
+      const oldSocket = await connectDevice(DEVICE_A_ID);
+
+      await join(oldSocket, SESSION_A_ID);
+
+      const newSocket = await connectDevice(DEVICE_A_ID);
+
+      await join(newSocket, SESSION_A_ID);
+
+      oldSocket.close();
+
+      await waitFor(
+        () => participation.socketCount(SESSION_A_ID, DEVICE) === 1,
+        'solo queda el socket nuevo',
+      );
+
+      expect(participation.isPresent(SESSION_A_ID, DEVICE)).toBe(true);
+      expect(presence.isOnline(DEVICE_A_ID)).toBe(true);
+    });
+
+    it('cambiar de sesion en el mismo socket deja la anterior', async () => {
+      const technician = await connectTechnician(technicianA);
+
+      await join(technician, SESSION_A_ID);
+      await join(technician, SESSION_C_ID);
+
+      expect(participation.isPresent(SESSION_A_ID, TECHNICIAN)).toBe(false);
+      expect(participation.isPresent(SESSION_C_ID, TECHNICIAN)).toBe(true);
+    });
+
+    it('volver a unirse tras reconectar recupera la participacion', async () => {
+      const technician = await connectTechnician(technicianA);
+
+      await join(technician, SESSION_A_ID);
+
+      technician.close();
+
+      await waitForAbsent(TECHNICIAN, SESSION_A_ID);
+
+      // Reconectar NO basta: hace falta el join validado.
+      const reconnected = await connectTechnician(technicianA);
+
+      await settle();
+
+      expect(participation.isPresent(SESSION_A_ID, TECHNICIAN)).toBe(false);
+
+      await join(reconnected, SESSION_A_ID);
+
+      expect(participation.isPresent(SESSION_A_ID, TECHNICIAN)).toBe(true);
+      expect(participation.absentSince(SESSION_A_ID, TECHNICIAN)).toBeNull();
     });
   });
 });

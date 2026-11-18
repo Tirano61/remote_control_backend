@@ -126,6 +126,15 @@ export class RemoteSession {
   @Column('text', { default: RemoteSessionStatus.CONNECTING })
   status: RemoteSessionStatus;
 
+  /**
+   * Momento de creacion. Es el origen del TTL de CONNECTING.
+   *
+   * `RemoteSessionsService.create` lo escribe desde Node, igual que
+   * `connectedAt` y `endedAt`, para que los tres usen el mismo reloj. El
+   * `DEFAULT now()` de la columna queda solo como respaldo: genera la hora en
+   * la zona de la sesion de PostgreSQL, que no tiene por que coincidir con la
+   * del proceso.
+   */
   @CreateDateColumn({ type: 'timestamp' })
   createdAt: Date;
 
