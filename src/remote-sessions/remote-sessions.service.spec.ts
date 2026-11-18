@@ -600,6 +600,24 @@ describe('RemoteSessionsService', () => {
   });
 
   describe('creacion por el tecnico', () => {
+    it('escribe createdAt desde Node, con el mismo reloj que connectedAt y endedAt', async () => {
+      // Si se dejara al `DEFAULT now()` de PostgreSQL, el TTL de CONNECTING se
+      // calcularia sobre otro reloj (ver test/remote-sessions.db-spec.ts).
+      const save = jest.spyOn(remoteSessions, 'save');
+      const supportRequestId = await seedAcceptedRequest(deviceA);
+
+      const before = Date.now();
+      const created = await service.create({ supportRequestId }, technicianA);
+      const after = Date.now();
+
+      const inserted = save.mock.calls[0][0];
+
+      expect(inserted.createdAt).toBeInstanceOf(Date);
+      expect(inserted.createdAt.getTime()).toBeGreaterThanOrEqual(before);
+      expect(inserted.createdAt.getTime()).toBeLessThanOrEqual(after);
+      expect(created.createdAt).toEqual(inserted.createdAt);
+    });
+
     it('crea la sesion en CONNECTING, sin conectar y sin cerrar', async () => {
       const supportRequestId = await seedAcceptedRequest(deviceA);
 

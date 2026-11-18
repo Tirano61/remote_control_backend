@@ -17,6 +17,10 @@ import {
 } from '../src/remote-sessions/entities/remote-session.entity';
 import { RemoteSessionEndedBy } from '../src/remote-sessions/enums/remote-session-ended-by.enum';
 import {
+  nextExpiry,
+  SystemCloseReason,
+} from '../src/remote-sessions/lifecycle/remote-session-expiry.policy';
+import {
   ACTIVE_REMOTE_SESSION_STATUSES,
   RemoteSessionStatus,
 } from '../src/remote-sessions/enums/remote-session-status.enum';
@@ -1097,6 +1101,120 @@ describe('remote_sessions contra PostgreSQL', () => {
           createdAt: expect.any(Date) as Date,
         }),
       );
+    });
+  });
+
+  describe('TTL de CONNECTING y zona horaria del proceso', () => {
+    /**
+     * Las columnas de `remote_sessions` son `timestamp without time zone`.
+     * `pg` escribe un `Date` en la hora local del proceso y lo lee tambien como
+     * hora local; PostgreSQL descarta el offset del literal. Si `createdAt` lo
+     * generara la base (`DEFAULT now()`, en la zona de la SESION de PostgreSQL)
+     * y `connectedAt`/`endedAt` el proceso, convivirian dos relojes y el TTL,
+     * que se calcula en Node desde `createdAt`, venceria desplazado tantas horas
+     * como separen ambas zonas: tarde con offsets negativos, de inmediato con
+     * positivos. Esta prueba mide el vencimiento contra el instante real de
+     * creacion. La zona del proceso la fija `test/db-global-setup.ts` (no UTC
+     * por defecto; otra con `TEST_DB_TZ`), porque en UTC el defecto no se ve.
+     */
+    const zone = `${Intl.DateTimeFormat().resolvedOptions().timeZone} (UTC${-new Date().getTimezoneOffset() / 60 >= 0 ? '+' : ''}${-new Date().getTimezoneOffset() / 60})`;
+    const TTL_MS = 120_000;
+    const config = {
+      disconnectGraceMs: 60_000,
+      connectingTtlMs: TTL_MS,
+      startupRecoveryMs: 5_000,
+    };
+    // Nadie participa: en CONNECTING solo cuenta el TTL.
+    const nobody = { isPresent: () => false, absentSince: () => null };
+    // Arranque muy anterior: la ventana de recuperacion no interviene.
+    const longAgo = 0;
+
+    /** Envejece la fila en PostgreSQL sin cambiar la convencion de escritura. */
+    const ageSession = (id: string, seconds: number): Promise<unknown> =>
+      dataSource.query(
+        `UPDATE "${TEST_SCHEMA}"."remote_sessions"
+            SET "createdAt" = "createdAt" - make_interval(secs => $2)
+          WHERE id = $1`,
+        [id, seconds],
+      );
+
+    it(`zona del proceso ${zone}: createdAt es el instante real y el TTL vence a los 120 s`, async () => {
+      const before = Date.now();
+      const { remoteSessionId } = await seedLiveSession();
+      const after = Date.now();
+
+      // Lo que ve Node al releer de PostgreSQL, igual que la reconciliacion.
+      const [stored] = (await service.findLiveSessions()).filter(
+        (session) => session.id === remoteSessionId,
+      );
+      const createdAt = stored.createdAt.getTime();
+
+      // Margen de 1 s por la precision de la columna y el reloj de la base.
+      expect(createdAt).toBeGreaterThanOrEqual(before - 1_000);
+      expect(createdAt).toBeLessThanOrEqual(after + 1_000);
+
+      const expiry = nextExpiry(stored, nobody, config, longAgo);
+
+      expect(expiry?.reason).toBe(SystemCloseReason.CONNECTING_TTL);
+      expect(expiry?.at).toBe(createdAt + TTL_MS);
+
+      // Recien creada: no vence; tampoco con la fila bloqueada.
+      await expect(
+        service.closeBySystem(
+          remoteSessionId,
+          (session, now) =>
+            (nextExpiry(session, nobody, config, longAgo)?.at ?? Infinity) <=
+            now.getTime(),
+        ),
+      ).resolves.toBeNull();
+
+      // 119 s despues de crearse: todavia no.
+      await ageSession(remoteSessionId, 119);
+      const at119 = (await service.findLiveSession(remoteSessionId))!;
+      expect(nextExpiry(at119, nobody, config, longAgo)!.at).toBeGreaterThan(
+        Date.now(),
+      );
+
+      // 121 s: vencida, y el cierre real con la fila bloqueada la cierra.
+      await ageSession(remoteSessionId, 2);
+
+      const closed = await service.closeBySystem(
+        remoteSessionId,
+        (session, now) =>
+          (nextExpiry(session, nobody, config, longAgo)?.at ?? Infinity) <=
+          now.getTime(),
+      );
+
+      expect(closed).toMatchObject({
+        status: RemoteSessionStatus.CLOSED,
+        endedBy: RemoteSessionEndedBy.SYSTEM,
+      });
+
+      // Los tres instantes quedan en el mismo reloj: endedAt - createdAt es
+      // la vida real de la sesion (~121 s), no unas horas.
+      const [row] = await dataSource.query<Array<{ lived: number }>>(
+        `SELECT EXTRACT(EPOCH FROM ("endedAt" - "createdAt"))::float AS lived
+             FROM "${TEST_SCHEMA}"."remote_sessions" WHERE id = $1`,
+        [remoteSessionId],
+      );
+
+      expect(row.lived).toBeGreaterThanOrEqual(120);
+      expect(row.lived).toBeLessThan(125);
+    });
+
+    it(`zona del proceso ${zone}: connectedAt - createdAt es el tiempo real hasta la activacion`, async () => {
+      const { technician, remoteSessionId } = await seedLiveSession();
+
+      await service.activateByTechnician(remoteSessionId, technician);
+
+      const [row] = await dataSource.query<Array<{ gap: number }>>(
+        `SELECT EXTRACT(EPOCH FROM ("connectedAt" - "createdAt"))::float AS gap
+           FROM "${TEST_SCHEMA}"."remote_sessions" WHERE id = $1`,
+        [remoteSessionId],
+      );
+
+      expect(row.gap).toBeGreaterThanOrEqual(0);
+      expect(row.gap).toBeLessThan(5);
     });
   });
 

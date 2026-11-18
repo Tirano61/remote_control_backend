@@ -234,6 +234,16 @@ export class RemoteSessionsService {
         deviceId: supportRequest.deviceId,
         technicianId: user.id,
         status: RemoteSessionStatus.CONNECTING,
+        // Lo escribe Node y no el `DEFAULT now()` de PostgreSQL, A PROPOSITO.
+        // Las columnas son `timestamp without time zone`: `pg` guarda y lee un
+        // `Date` en la hora local del proceso, mientras que `now()` usa la zona
+        // de la sesion de PostgreSQL (GMT en Neon). Con `createdAt` generado
+        // por la base y `connectedAt`/`endedAt` por Node, la fila mezclaria dos
+        // relojes y el TTL de CONNECTING, que se calcula en Node desde
+        // `createdAt`, venceria desplazado por la diferencia de zonas: horas
+        // tarde en UTC-3, de inmediato en UTC+9. Asi los tres instantes de la
+        // sesion salen del mismo reloj.
+        createdAt: new Date(),
         connectedAt: null,
         endedAt: null,
         endedBy: null,
