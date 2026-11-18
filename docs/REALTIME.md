@@ -95,6 +95,10 @@ established at all: the client gets a `connect_error` whose message is the singl
 generic string `Unauthorized`. The reason is deliberately not disclosed —
 missing token, bad signature, wrong token type, expired token, unknown device,
 deactivated device and revoked credential are indistinguishable to the client.
+A refused handshake therefore never proves the permanent credential is gone: the
+client renews the token through `POST /device-auth/login`, and only a `401` from
+there with `code: DEVICE_CREDENTIAL_REJECTED` confirms it (see
+[ENDPOINTS.md](ENDPOINTS.md#post-device-authlogin)).
 
 The checks applied are the same ones `@DeviceAuth()` applies over HTTP: signature
 and expiry, `tokenType: "device"`, the device exists and is `isActive`, and the
