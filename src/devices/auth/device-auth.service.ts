@@ -5,6 +5,7 @@ import { createHash } from 'crypto';
 import { IsNull, Repository } from 'typeorm';
 import { DeviceCredential } from '../entities/device-credential.entity';
 import { Device } from '../entities/device.entity';
+import { DeviceCredentialRejectedException } from './device-credential-rejected.exception';
 import { DeviceCredentialsService } from './device-credentials.service';
 import { DeviceLoginDto } from './dto/device-login.dto';
 import {
@@ -69,6 +70,11 @@ export class DeviceAuthService {
    * Todos los motivos de rechazo (dispositivo inexistente o inactivo,
    * credencial revocada, secreto incorrecto) devuelven el mismo error: quien
    * prueba credenciales no debe poder deducir nada de la respuesta.
+   *
+   * Ese error lleva `code: DEVICE_CREDENTIAL_REJECTED` y solo se lanza despues
+   * de que la consulta haya respondido. Si PostgreSQL falla, la excepcion del
+   * driver no se captura aqui y sale como 500, sin ese codigo: un fallo de
+   * infraestructura no puede hacer creer a la tablet que perdio su credencial.
    */
   async login(deviceLoginDto: DeviceLoginDto): Promise<DeviceLoginResponse> {
     const { deviceId, deviceSecret } = deviceLoginDto;
@@ -77,14 +83,14 @@ export class DeviceAuthService {
 
     if (!device || !device.isActive) {
       this.burnVerificationTime(deviceSecret);
-      throw new UnauthorizedException('Invalid device credentials');
+      throw new DeviceCredentialRejectedException();
     }
 
     const credential = await this.findActiveCredential(device.id);
 
     if (!credential) {
       this.burnVerificationTime(deviceSecret);
-      throw new UnauthorizedException('Invalid device credentials');
+      throw new DeviceCredentialRejectedException();
     }
 
     const matches = this.deviceCredentialsService.matchesSecret(
@@ -92,7 +98,7 @@ export class DeviceAuthService {
       credential.secretHash,
     );
 
-    if (!matches) throw new UnauthorizedException('Invalid device credentials');
+    if (!matches) throw new DeviceCredentialRejectedException();
 
     await this.deviceCredentialRepository.update(
       { id: credential.id },
