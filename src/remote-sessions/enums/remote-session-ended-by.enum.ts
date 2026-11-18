@@ -12,10 +12,12 @@ export enum RemoteSessionEndedBy {
   DEVICE = 'DEVICE',
 
   /**
-   * Cierre automatico del backend.
+   * Cierre automatico del backend (`RemoteSessionLifecycleService`):
    *
-   * Todavia no se emite: queda reservado para los timeouts y los cierres por
-   * perdida de conexion, que aun no estan definidos.
+   * - una sesion `CONNECTING` supero su TTL sin llegar a `ACTIVE`;
+   * - un participante de una sesion `ACTIVE` falto mas que el periodo de gracia;
+   * - tras un reinicio, nadie recupero la sesion dentro de la ventana de
+   *   recuperacion.
    */
   SYSTEM = 'SYSTEM',
 }

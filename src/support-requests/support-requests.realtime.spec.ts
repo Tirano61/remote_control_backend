@@ -27,6 +27,7 @@ import { RemoteSession } from '../remote-sessions/entities/remote-session.entity
 import { SignalingRealtimeService } from '../signaling/realtime/signaling-realtime.service';
 import { TechnicianRealtimeService } from '../signaling/realtime/technician-realtime.service';
 import { SignalingService } from '../signaling/signaling.service';
+import { SessionParticipationService } from '../signaling/participation/session-participation.service';
 import { SupportRequest } from './entities/support-request.entity';
 import { SupportRequestStatus } from './enums/support-request-status.enum';
 import {
@@ -228,6 +229,7 @@ describe('support:assigned (Socket.IO)', () => {
         TechnicianRealtimeService,
         // Dependencias de signaling del gateway: no se ejercitan aqui.
         SignalingService,
+        SessionParticipationService,
         SignalingRealtimeService,
         {
           provide: getRepositoryToken(RemoteSession),
