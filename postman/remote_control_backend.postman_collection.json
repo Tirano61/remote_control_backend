@@ -617,6 +617,17 @@
                   "  if (typeof body.token === 'string' && body.token.length > 0) {",
                   "    pm.environment.set('deviceToken', body.token);",
                   "  }",
+                  "}",
+                  "",
+                  "// A refused credential answers 401 with a stable application code. A 401",
+                  "// without it (a proxy, a captive portal...) is not a confirmed rejection.",
+                  "if (pm.response.code === 401) {",
+                  "  let code;",
+                  "  try { code = pm.response.json().code; } catch (e) { code = undefined; }",
+                  "",
+                  "  pm.test('A 401 from the backend carries DEVICE_CREDENTIAL_REJECTED', function () {",
+                  "    pm.expect(code).to.eql('DEVICE_CREDENTIAL_REJECTED');",
+                  "  });",
                   "}"
                 ]
               }
@@ -641,7 +652,7 @@
                 "login"
               ]
             },
-            "description": "Step 05 of the end-to-end flow.\n\nExchanges the permanent deviceSecret for a Device JWT (24h by default).\npublicId is not accepted here: it does not authenticate. Answers 200.\n\nStores: deviceToken.",
+            "description": "Step 05 of the end-to-end flow.\n\nExchanges the permanent deviceSecret for a Device JWT (24h by default).\npublicId is not accepted here: it does not authenticate. Answers 200.\n\nA credential the backend refuses (unknown or inactive device, revoked or\nreplaced credential, wrong secret) answers 401 with\ncode: DEVICE_CREDENTIAL_REJECTED. A 401 without that code, or a 5xx, is not\na confirmed rejection. See docs/ENDPOINTS.md.\n\nStores: deviceToken.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"deviceId\": \"{{deviceId}}\",\n  \"deviceSecret\": \"{{deviceSecret}}\"\n}",
