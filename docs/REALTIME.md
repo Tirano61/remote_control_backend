@@ -90,22 +90,170 @@ Handshake auth.token = <Device JWT>
 The token is the one returned by `POST /device-auth/login`. Only
 `handshake.auth.token` is read; nothing else in the handshake is inspected.
 
-Authentication runs as a namespace middleware, so a rejected connection is never
-established at all: the client gets a `connect_error` whose message is the single
-generic string `Unauthorized`. The reason is deliberately not disclosed —
-missing token, bad signature, wrong token type, expired token, unknown device,
-deactivated device and revoked credential are indistinguishable to the client.
-A refused handshake therefore never proves the permanent credential is gone: the
-client renews the token through `POST /device-auth/login`, and only a `401` from
-there with `code: DEVICE_CREDENTIAL_REJECTED` confirms it (see
-[ENDPOINTS.md](ENDPOINTS.md#post-device-authlogin)).
-
 The checks applied are the same ones `@DeviceAuth()` applies over HTTP: signature
 and expiry, `tokenType: "device"`, the device exists and is `isActive`, and the
 credential referenced by the token is still the active one for that device.
 
 On success the socket is joined by the server to the device's private room and
 receives `device:connected`.
+
+Authentication runs as a namespace middleware, so a rejected connection is never
+established at all: the client gets a `connect_error` and no socket, room or
+presence exists for it on the server.
+
+## Handshake errors
+
+Every refused handshake carries a stable code in `data.code`:
+
+```text
+data.code                  message               meaning
+DEVICE_AUTH_UNAUTHORIZED   Unauthorized          the backend checked the token and refused it
+DEVICE_AUTH_UNAVAILABLE    Service unavailable   the backend could not finish checking the token
+```
+
+Clients branch on `data.code`. The `message` strings are fixed as shown (the
+first one is kept for older clients, see
+[Compatibility](#compatibility-with-earlier-clients)), but a client that knows
+the codes should not need them.
+
+Both codes **refuse** the handshake. Telling them apart never lets a socket open
+without a confirmed authentication.
+
+### Wire format
+
+The error travels in the standard Socket.IO `CONNECT_ERROR` packet. No custom
+event is used. These are the exact frames the server sends:
+
+```text
+44/devices,{"message":"Unauthorized","data":{"code":"DEVICE_AUTH_UNAUTHORIZED"}}
+44/devices,{"message":"Service unavailable","data":{"code":"DEVICE_AUTH_UNAVAILABLE"}}
+```
+
+(`4` Engine.IO message, `4` Socket.IO `CONNECT_ERROR`, then the namespace and the
+JSON body.) Only `message` and `data` cross the wire: no error name, no stack, no
+reason, no SQL, no host, nothing from the handshake.
+
+This shape is the one of Socket.IO protocol v5, the only protocol this server
+accepts (`allowEIO3` is not enabled). What the client libraries hand to the
+application:
+
+```text
+socket.io-client (JS) 4.x      connect_error(err)
+                               err.message === "Unauthorized" | "Service unavailable"
+                               err.data    === { code: "DEVICE_AUTH_..." }
+
+socket_io_client (Dart) 3.1.6  onConnectError(data)
+                               data is Map<String, dynamic>:
+                               {"message": "...", "data": {"code": "DEVICE_AUTH_..."}}
+```
+
+Both were verified against this server. In both, a namespace refusal destroys
+the client socket: the package does **not** retry it by itself
+(`socket.active == false`). The application decides when to connect again.
+
+### DEVICE_AUTH_UNAUTHORIZED
+
+The backend examined the token and does not accept it now. Any of these, and
+the client cannot tell which:
+
+```text
+no token, an empty token, or a token that is not a string
+a malformed token, a bad signature (a User JWT included), an expired token
+tokenType other than "device"
+the device does not exist
+the device is not isActive
+the credential in the token is revoked, or replaced by a re-enrollment
+```
+
+Signature and expiry are checked before the database is touched, so a forged,
+malformed or expired token is answered `DEVICE_AUTH_UNAUTHORIZED` even while the
+database is down.
+
+It is a statement about this **Device JWT**, not about the permanent credential.
+It never proves the credential is gone: the client renews the token through
+`POST /device-auth/login`, and only a `401` from there with
+`code: DEVICE_CREDENTIAL_REJECTED` confirms it (see
+[ENDPOINTS.md](ENDPOINTS.md#post-device-authlogin)).
+
+### DEVICE_AUTH_UNAVAILABLE
+
+The token passed the signature, expiry and `tokenType` checks, but the backend
+could not read the device or its credential:
+
+```text
+PostgreSQL refuses the connection or is unreachable
+the connection pool times out
+a query fails (QueryFailedError), a statement timeout included
+any other driver exception
+any unexpected error inside the authentication step
+```
+
+It says nothing about the token. The handshake is still refused, exactly like a
+rejection: no socket, no room, no presence, no `device:presence-updated`.
+
+The same token may be accepted as soon as the infrastructure is back. Renewing
+it does not help: `POST /device-auth/login` depends on the same database and
+would answer `500` (never `DEVICE_CREDENTIAL_REJECTED`) for as long as it is
+down. The intended client behaviour is to connect again **with the same token**
+after a backoff, and to renew only if a later attempt answers
+`DEVICE_AUTH_UNAUTHORIZED`.
+
+The server logs a warning per occurrence with the error type and driver code
+only (for example `Error ECONNREFUSED`, `QueryFailedError 42P01`), never the
+error message, the token or anything else from the handshake. Rejections are not
+logged.
+
+### Compatibility with earlier clients
+
+```text
+Before   every refusal          message "Unauthorized", no data
+Now      DEVICE_AUTH_UNAUTHORIZED  message "Unauthorized",        data.code
+         DEVICE_AUTH_UNAVAILABLE   message "Service unavailable", data.code
+```
+
+* A genuine rejection keeps the exact message `Unauthorized`. A client that
+  compares `message == "Unauthorized"` keeps treating it as before.
+* An infrastructure failure, which used to arrive as `Unauthorized`, now arrives
+  as `Service unavailable`. A client that only knows the old message sees a
+  namespace refusal with an unknown message.
+* A client that ignores `data` is unaffected by its presence.
+
+`remote_control_device` at the time of this change (main `302fdbf`, Socket.IO
+recovery of Prompt 35) classifies them as follows, verified with its real
+`SocketIoDeviceRealtimeClient` and its isolated harness against this backend:
+
+```text
+DEVICE_AUTH_UNAUTHORIZED  -> RealtimeHandshakeRejected
+DEVICE_AUTH_UNAVAILABLE   -> RealtimeConnectFailed(transportRetrying: false)
+```
+
+That client handles both signals with the same recovery: it releases the socket
+and renews the Device JWT through `POST /device-auth/login` (the first time at
+once, then on its 15 s / 30 s / 60 s backoff). So for that client the observable
+behaviour does **not** change: during a database outage it still renews, the
+login answers `500`, which it does not treat as a revocation, and it keeps its
+enrollment and reconnects when the database is back. Skipping that unnecessary
+renewal requires the client to read `data.code`; this backend change alone does
+not achieve it.
+
+### Limitations
+
+* **A database that hangs without failing produces no `connect_error`.** The
+  middleware waits for the driver. If the driver gives up first (connection
+  refused, a pool timeout), the answer is `DEVICE_AUTH_UNAVAILABLE`. If it does
+  not, Socket.IO closes the connection once its `connectTimeout` (45 s by
+  default) expires with no namespace joined, and the client sees a transport
+  close, which the client package retries with the same token. No pool or
+  statement timeout is configured in this backend today.
+* **The classification depends on the authentication step.** Only an
+  `UnauthorizedException` raised by `DeviceAuthService` counts as a rejection.
+  Anything else is `DEVICE_AUTH_UNAVAILABLE`, so an unexpected bug surfaces as
+  "unavailable" — still refused, never accepted.
+* **The code is an application signal, not a proof of origin**, like the REST
+  application codes: anything able to forge the Socket.IO frames can forge it.
+  Only a TLS connection with a validated certificate rules that out.
+* **`/technicians` is unchanged.** Its handshake still answers the single
+  message `Unauthorized`, with no `data.code`, for every failure.
 
 ## Presence
 
@@ -1320,7 +1468,12 @@ Details that apply to the current implementation:
 * **The handshake must carry a valid token again.** The Socket.IO client
   resends `auth` on each reconnection attempt, so a client holding an expired
   Device JWT must refresh it (`POST /device-auth/login`) before reconnecting, or
-  every attempt fails with `connect_error: Unauthorized`.
+  every attempt fails with `connect_error` `DEVICE_AUTH_UNAUTHORIZED`. A
+  `DEVICE_AUTH_UNAVAILABLE` refusal is different: the token may still be good,
+  and the same token can be presented again once the backend recovers — see
+  [Handshake errors](#handshake-errors). Neither refusal is retried by the
+  client package itself: after a namespace refusal the application has to call
+  `connect` again.
 * **Joined sessions do not survive.** A new socket has no session attached, so
   `webrtc:*` would answer `NOT_JOINED`. Send `remote-session:join` again after
   every reconnection.
