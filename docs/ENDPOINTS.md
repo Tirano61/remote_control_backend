@@ -123,6 +123,10 @@ DEVICE_CREDENTIAL_REJECTED   401     POST /device-auth/login
 This is the only application error code the REST API emits today. Every other
 error response has no `code` field.
 
+The `/devices` Socket.IO handshake has its own codes (`DEVICE_AUTH_UNAUTHORIZED`,
+`DEVICE_AUTH_UNAVAILABLE`), carried in `connect_error`, not in an HTTP body. They
+are documented in [REALTIME.md](REALTIME.md#handshake-errors).
+
 `DEVICE_CREDENTIAL_REJECTED` means the backend looked up the presented device
 credential and refused it. See [POST /device-auth/login](#post-device-authlogin)
 for exactly when it is sent and when it is not.
@@ -1856,6 +1860,10 @@ user
           -> validates the token; does NOT renew it
 
 6. Socket.IO connect to /devices with auth.token = Device JWT
+          -> connect_error data.code DEVICE_AUTH_UNAUTHORIZED: token refused,
+             renew it with step 4
+          -> connect_error data.code DEVICE_AUTH_UNAVAILABLE: token not
+             checked, retry with the same token (see REALTIME.md)
 ```
 
 Re-enrollment repeats steps 2–4: it revokes the previous credential, invalidates
