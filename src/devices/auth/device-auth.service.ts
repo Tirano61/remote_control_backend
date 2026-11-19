@@ -130,6 +130,11 @@ export class DeviceAuthService {
    * Es el mismo camino que usa la estrategia HTTP, con la verificacion de firma
    * y vencimiento por delante: asi las reglas de autorizacion del dispositivo
    * no se duplican entre transportes.
+   *
+   * Contrato del que depende el handshake de `/devices`: todo rechazo del
+   * token sale como `UnauthorizedException`, y solo despues de haberlo
+   * comprobado. Un fallo de la base de datos no se captura aqui y sale tal
+   * cual, para que nunca se confunda con un rechazo.
    */
   async authenticateToken(token: string): Promise<AuthenticatedDevice> {
     let payload: DeviceJwtPayload;
