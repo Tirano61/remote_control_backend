@@ -107,13 +107,21 @@ export const classifyHandshakeFailure = (
  * Solo el tipo y, si lo trae, el codigo del driver (`ECONNREFUSED`, `57014`,
  * ...). Nunca el `message`: el de `QueryFailedError` incluye la consulta y el
  * de algunos errores de conexion, el usuario o el host de la base.
+ *
+ * Se mira la forma del objeto y no `instanceof Error`: los errores de red los
+ * crea el nucleo de Node, que puede ser otro realm que el de quien los recibe.
  */
 export const describeHandshakeFailure = (error: unknown): string => {
-  if (!(error instanceof Error)) return typeof error;
+  if (typeof error !== 'object' || error === null) return typeof error;
 
-  const code = (error as { code?: unknown }).code;
-  const driverCode = (error as { driverError?: { code?: unknown } }).driverError
-    ?.code;
+  const { name, code, driverError } = error as {
+    name?: unknown;
+    code?: unknown;
+    driverError?: { code?: unknown } | null;
+  };
+
+  const label = typeof name === 'string' ? name : 'object';
+  const driverCode = driverError?.code;
   const shownCode =
     typeof code === 'string'
       ? code
@@ -121,5 +129,5 @@ export const describeHandshakeFailure = (error: unknown): string => {
         ? driverCode
         : null;
 
-  return shownCode ? `${error.name} ${shownCode}` : error.name;
+  return shownCode ? `${label} ${shownCode}` : label;
 };

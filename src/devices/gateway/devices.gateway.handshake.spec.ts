@@ -228,6 +228,13 @@ describe('DevicesGateway — clasificacion de errores del handshake', () => {
     expect(timeoutError.message).toMatch(/timeout/i);
   });
 
+  it('describe los errores genuinos del driver aunque vengan de otro realm', () => {
+    // El ECONNREFUSED lo crea el nucleo de Node: bajo Jest no es instancia del
+    // `Error` del test. El log tiene que seguir mostrando tipo y codigo.
+    expect(describeHandshakeFailure(refusedError)).toBe('Error ECONNREFUSED');
+    expect(describeHandshakeFailure(timeoutError)).toBe('Error');
+  });
+
   describe('JWT valido', () => {
     it('acepta y deja la identidad del token en el socket', async () => {
       const outcome = await handshake({ token: signDeviceToken() });
