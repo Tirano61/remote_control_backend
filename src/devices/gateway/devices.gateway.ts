@@ -1,4 +1,4 @@
-import { Logger } from '@nestjs/common';
+import { Logger, UnauthorizedException } from '@nestjs/common';
 import {
   ConnectedSocket,
   MessageBody,
@@ -35,15 +35,17 @@ import {
   DeviceRealtimeService,
   deviceRoom,
 } from '../realtime/device-realtime.service';
+import {
+  classifyHandshakeFailure,
+  describeHandshakeFailure,
+  DeviceHandshakeErrorCode,
+} from './device-handshake-error';
 
 /** Namespace exclusivo de tablets. Los tecnicos tendran el suyo aparte. */
 export const DEVICES_NAMESPACE = '/devices';
 
 /** Confirmacion que recibe la tablet tras autenticarse. */
 export const DEVICE_CONNECTED_EVENT = 'device:connected';
-
-/** Motivo unico de rechazo: no revela por que fallo la autenticacion. */
-const UNAUTHORIZED_REASON = 'Unauthorized';
 
 /**
  * Identidad del socket autenticado.
@@ -109,6 +111,11 @@ export class DevicesGateway
    * `handleConnection`: asi la conexion se rechaza antes de establecerse, el
    * cliente recibe un `connect_error` y un socket sin identidad nunca llega a
    * existir para el gateway.
+   *
+   * El `connect_error` distingue dos casos (ver `device-handshake-error.ts`):
+   * el token fue comprobado y rechazado (`DEVICE_AUTH_UNAUTHORIZED`), o no se
+   * pudo comprobar (`DEVICE_AUTH_UNAVAILABLE`). Los dos rechazan el handshake;
+   * la identidad solo se asigna al socket cuando la autenticacion termino bien.
    */
   afterInit(namespace: DeviceNamespace): void {
     // A partir de aqui otros modulos pueden emitir eventos a un dispositivo sin
@@ -121,8 +128,24 @@ export class DevicesGateway
 
     namespace.use((socket, next) => {
       void this.authenticate(socket).then(
-        () => next(),
-        () => next(new Error(UNAUTHORIZED_REASON)),
+        (context) => {
+          socket.data.device = context;
+          next();
+        },
+        (error: unknown) => {
+          const refusal = classifyHandshakeFailure(error);
+
+          // Un rechazo del token es rutina (tokens vencidos, re-enrolamientos) y
+          // no se registra. No poder comprobarlo es un problema del servidor:
+          // se registra solo el tipo y el codigo del fallo, nunca su mensaje
+          // (puede llevar la consulta) ni nada del handshake (lleva el token).
+          if (refusal.code === DeviceHandshakeErrorCode.UNAVAILABLE)
+            this.logger.warn(
+              `Device handshake refused, authentication unavailable: ${describeHandshakeFailure(error)}`,
+            );
+
+          next(refusal);
+        },
       );
     });
   }
@@ -253,21 +276,27 @@ export class DevicesGateway
   }
 
   /**
-   * Valida el Device JWT del handshake y deja la identidad en el socket.
+   * Valida el Device JWT del handshake y devuelve la identidad del socket.
    *
    * Reutiliza `DeviceAuthService`, la misma logica que usa la estrategia HTTP:
    * firma, `tokenType`, dispositivo existente y activo, y credencial vigente
    * que pertenezca al dispositivo.
+   *
+   * Un rechazo sale como `UnauthorizedException`; cualquier otro error (de la
+   * base de datos, por ejemplo) sale tal cual, y el middleware lo clasifica
+   * como "no disponible".
    */
-  private async authenticate(socket: DeviceSocket): Promise<void> {
+  private async authenticate(
+    socket: DeviceSocket,
+  ): Promise<DeviceSocketContext> {
     const token = this.extractToken(socket);
 
-    if (!token) throw new Error(UNAUTHORIZED_REASON);
+    if (!token) throw new UnauthorizedException();
 
     const { device, credentialId } =
       await this.deviceAuthService.authenticateToken(token);
 
-    socket.data.device = {
+    return {
       deviceId: device.id,
       credentialId,
       publicId: device.publicId,
@@ -281,7 +310,8 @@ export class DevicesGateway
    * autentican nada: la identidad sale exclusivamente del token validado.
    */
   private extractToken(socket: DeviceSocket): string | null {
-    const { token } = socket.handshake.auth as { token?: unknown };
+    const auth = socket.handshake.auth as { token?: unknown } | undefined;
+    const token = auth?.token;
 
     return typeof token === 'string' && token.length > 0 ? token : null;
   }
