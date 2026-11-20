@@ -305,6 +305,46 @@ describe('RemoteSessions controllers (HTTP)', () => {
       );
     });
 
+    it('un cierre repetido tambien responde 200 con la sesion CLOSED', async () => {
+      const id = randomUUID();
+      const closed = {
+        id,
+        status: 'CLOSED',
+        endedBy: 'DEVICE',
+        endedAt: '2026-11-20T10:00:00.000Z',
+      };
+
+      remoteSessionsService.closeByTechnician.mockResolvedValue(closed);
+
+      await request(server)
+        .post(`/remote-sessions/${id}/close`)
+        .set(asTechnician)
+        .expect(200)
+        .expect(closed);
+    });
+
+    it('responde 401 al cerrar con un token invalido, sin llegar al servicio', async () => {
+      await request(server)
+        .post(`/remote-sessions/${randomUUID()}/close`)
+        .set({ Authorization: 'Bearer token-invalido' })
+        .expect(401);
+
+      await request(server)
+        .post(`/remote-sessions/${randomUUID()}/close`)
+        .expect(401);
+
+      expect(remoteSessionsService.closeByTechnician).not.toHaveBeenCalled();
+    });
+
+    it('responde 403 al cerrar con un rol que no es admin ni tecnico', async () => {
+      await request(server)
+        .post(`/remote-sessions/${randomUUID()}/close`)
+        .set({ Authorization: `Bearer ${USER_TOKEN}` })
+        .expect(403);
+
+      expect(remoteSessionsService.closeByTechnician).not.toHaveBeenCalled();
+    });
+
     it('devuelve la sesion actual del tecnico del token', async () => {
       remoteSessionsService.findCurrentForTechnician.mockResolvedValue({
         remoteSession: null,

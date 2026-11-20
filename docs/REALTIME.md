@@ -473,6 +473,12 @@ should tear down its peer connection when it receives this. Any further
 `webrtc:*` it sends would be rejected with `UNAUTHORIZED`, since the session is
 no longer live.
 
+Emitted once per session, on the real transition only. The technician's close is
+idempotent: a retried `POST /remote-sessions/:id/close` on a session that is
+already `CLOSED` answers `200` and emits nothing, and when several closes race
+only the one that performed the transition emits. See
+[Idempotent close](ENDPOINTS.md#idempotent-close).
+
 Delivery is best-effort: a tablet that is disconnected when the close happens
 never sees this event. That is precisely the situation in which a `SYSTEM`
 close for `DEVICE_ABSENT` occurs, so the tablet must not rely on it — after
@@ -938,6 +944,13 @@ another connected technician receives nothing.
 It is **not** emitted when the technician closes the session with
 `POST /remote-sessions/:id/close` — that HTTP response already carries the closed
 session.
+
+Emitted once per session, on the real transition only. The device's close is
+idempotent: a retried `POST /device/remote-sessions/:id/close` on a session that
+is already `CLOSED` answers `200` and emits nothing, and when several closes race
+only the one that performed the transition emits. A client must therefore not
+wait for this event to confirm its own close: the HTTP response is the
+confirmation. See [Idempotent close](ENDPOINTS.md#idempotent-close).
 
 Emitted only after the transaction commits, so the session named here is always
 already `CLOSED` and its support request `COMPLETED`. If the delivery fails, the
@@ -1606,9 +1619,13 @@ row and re-evaluates the condition, so:
 
 * it never closes a session that recovered, was activated, or was already closed
   in the meantime;
-* if a technician or device close races with it, exactly one wins; the loser
-  gets `409` (REST) or does nothing (SYSTEM), and the recorded `endedBy` /
-  `endedAt` are the winner's;
+* if a technician or device close races with it, exactly one wins — all three
+  take the same row lock; a losing technician or device close answers `200`
+  with the winning close (REST, idempotent), a losing SYSTEM close does
+  nothing, and the recorded `endedBy` / `endedAt` are the winner's;
+* a technician or device close that arrives after the SYSTEM close (for example
+  a retry queued while offline) answers `200` with `endedBy: "SYSTEM"` and the
+  original `endedAt`: it neither rewrites the close nor emits again;
 * a stale timer can only cause an extra read: it never touches another session.
 
 After the commit, and only then, `remote-session:closed` is emitted to **both**

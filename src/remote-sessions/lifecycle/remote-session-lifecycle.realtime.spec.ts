@@ -216,9 +216,21 @@ describe('Cierre automatico de sesiones (Socket.IO + REST)', () => {
   };
 
   const manager = {
-    findOne: (entity: unknown, { where }: { where: Where }) => {
+    findOne: (
+      entity: unknown,
+      { where, relations }: { where: Where; relations?: object },
+    ) => {
       const row = rowsOf(entity).find((candidate) => matches(candidate, where));
-      return Promise.resolve(row ? { ...row } : null);
+
+      if (!row) return Promise.resolve(null);
+
+      // Como TypeORM: las relaciones solo llegan si se piden (la relectura del
+      // cierre las pide; el `SELECT ... FOR UPDATE` no puede).
+      return Promise.resolve(
+        relations && entity === RemoteSession
+          ? hydrate(row as RemoteSession)
+          : { ...row },
+      );
     },
     exists: (_entity: unknown, { where }: { where: Where }) =>
       Promise.resolve(

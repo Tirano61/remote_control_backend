@@ -873,15 +873,16 @@ describe('remote_sessions contra PostgreSQL', () => {
     const RACE_ROUNDS = 8;
 
     /**
-     * Retraso (ms) con el que arranca el cierre SYSTEM en cada ronda.
+     * Retraso (ms) con el que arranca el SEGUNDO cierre de cada ronda.
      *
-     * Los cierres manuales leen la sesion (pertenencia) antes de abrir su
-     * transaccion, asi que con arranque simultaneo casi siempre gana SYSTEM.
-     * Escalonar el arranque hace que el cierre manual llegue antes en algunas
-     * rondas y deja ejercitadas las dos ramas. No se exige un reparto concreto
-     * de ganadores: depende del motor y haria la prueba inestable.
+     * Los tres cierres empiezan bloqueando la fila, asi que con arranque
+     * simultaneo casi siempre gana el que sale primero. Por eso las rondas
+     * pares sale primero el cierre manual y las impares SYSTEM, con retrasos
+     * escalonados: quedan ejercitadas las dos ramas (gana SYSTEM / gana el
+     * manual). No se exige un reparto concreto de ganadores: depende del motor
+     * y haria la prueba inestable.
      */
-    const SYSTEM_START_OFFSETS_MS = [0, 0, 2, 4, 8, 12, 20, 30];
+    const SECOND_START_OFFSETS_MS = [0, 0, 1, 1, 3, 3, 8, 8];
 
     it.each([
       ['el tecnico', RemoteSessionEndedBy.TECHNICIAN],
@@ -906,29 +907,39 @@ describe('remote_sessions contra PostgreSQL', () => {
                   id: deviceId,
                 } as Device);
 
-          // El cierre manual sale primero; SYSTEM, con el retraso de la ronda.
-          const manualCloseResult: Promise<unknown> = manualClose();
-          const systemClose = delay(SYSTEM_START_OFFSETS_MS[round]).then(() =>
-            service.closeBySystem(remoteSessionId, always),
-          );
+          const systemClose = () =>
+            service.closeBySystem(remoteSessionId, always);
+          const offset = () => delay(SECOND_START_OFFSETS_MS[round]);
+
+          // Rondas pares: primero el manual. Impares: primero SYSTEM.
+          const manualFirst = round % 2 === 0;
+          const manualCloseResult: Promise<{ endedBy: unknown }> = manualFirst
+            ? manualClose()
+            : offset().then(manualClose);
+          const systemCloseResult = manualFirst
+            ? offset().then(systemClose)
+            : systemClose();
 
           const [system, manual] = await Promise.allSettled([
-            systemClose,
+            systemCloseResult,
             manualCloseResult,
           ]);
 
           const systemWon =
             system.status === 'fulfilled' && system.value !== null;
-          const manualWon = manual.status === 'fulfilled';
 
-          expect(Number(systemWon) + Number(manualWon)).toBe(1);
-
-          if (manual.status === 'rejected')
-            expect(manual.reason).toBeInstanceOf(ConflictException);
+          // El cierre manual nunca falla: si gano, devuelve su propio cierre;
+          // si perdio, confirma el de SYSTEM (cierre idempotente).
+          expect(manual.status).toBe('fulfilled');
 
           const winner = systemWon
             ? RemoteSessionEndedBy.SYSTEM
             : manualEndedBy;
+
+          expect(
+            (manual as PromiseFulfilledResult<{ endedBy: unknown }>).value
+              .endedBy,
+          ).toBe(winner);
 
           winners.push(winner);
 
@@ -1215,6 +1226,455 @@ describe('remote_sessions contra PostgreSQL', () => {
 
       expect(row.gap).toBeGreaterThanOrEqual(0);
       expect(row.gap).toBeLessThan(5);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Cierre idempotente (tecnico y dispositivo)
+  // ---------------------------------------------------------------------------
+
+  describe('cierre idempotente', () => {
+    const always = () => true;
+
+    /** Rondas de cada carrera: un orden fijo podria ocultar un fallo. */
+    const ROUNDS = 8;
+
+    /** Sesion viva por el flujo real, con el dispositivo a mano. */
+    const seedSessionWithDevice = async () => {
+      const seeded = await seedLiveSession();
+      const { deviceId } = await storedSession(seeded.remoteSessionId);
+
+      emitToDevice.mockClear();
+      emitToTechnician.mockClear();
+
+      return { ...seeded, device: { id: deviceId } as Device };
+    };
+
+    /**
+     * `xmin` de la fila: el id de la transaccion que escribio su version
+     * vigente. Si un reintento no cambia el `xmin`, PostgreSQL no escribio la
+     * fila: no hubo UPDATE, ni siquiera uno que dejara los mismos valores.
+     */
+    const xminOf = async (
+      table: 'remote_sessions' | 'support_requests',
+      id: string,
+    ): Promise<string> => {
+      const [row] = await dataSource.query<{ xmin: string }[]>(
+        `SELECT xmin::text AS xmin FROM "${TEST_SCHEMA}"."${table}" WHERE id = $1`,
+        [id],
+      );
+
+      return row.xmin;
+    };
+
+    /** `(destinatario, evento, payload)` de cada aviso emitido. */
+    type Emitted = [string, string, unknown];
+
+    /** Avisos `remote-session:closed` emitidos, a los dos extremos. */
+    const closedNotices = (): Emitted[] =>
+      [
+        ...(emitToDevice.mock.calls as Emitted[]),
+        ...(emitToTechnician.mock.calls as Emitted[]),
+      ].filter(([, event]) => event === REMOTE_SESSION_CLOSED_EVENT);
+
+    it('el primer cierre escribe una vez; el reintento devuelve lo mismo sin escribir nada', async () => {
+      const { technician, remoteSessionId, supportRequestId } =
+        await seedSessionWithDevice();
+
+      const first = await service.closeByTechnician(
+        remoteSessionId,
+        technician,
+      );
+
+      const sessionXmin = await xminOf('remote_sessions', remoteSessionId);
+      const requestXmin = await xminOf('support_requests', supportRequestId);
+      const storedRequestBefore = await storedRequest(supportRequestId);
+
+      // Respuesta perdida: el cliente reintenta tres veces.
+      const retries: (typeof first)[] = [];
+      for (let attempt = 0; attempt < 3; attempt += 1)
+        retries.push(
+          await service.closeByTechnician(remoteSessionId, technician),
+        );
+
+      for (const retry of retries) expect(retry).toEqual(first);
+
+      expect(first).toMatchObject({
+        status: RemoteSessionStatus.CLOSED,
+        endedBy: RemoteSessionEndedBy.TECHNICIAN,
+      });
+      // El `endedAt` de la respuesta es el persistido, tambien fuera de UTC.
+      expect(first.endedAt?.getTime()).toBe(
+        (await storedSession(remoteSessionId)).endedAt?.getTime(),
+      );
+      expect(await xminOf('remote_sessions', remoteSessionId)).toBe(
+        sessionXmin,
+      );
+      expect(await xminOf('support_requests', supportRequestId)).toBe(
+        requestXmin,
+      );
+      expect(await storedRequest(supportRequestId)).toEqual(
+        storedRequestBefore,
+      );
+      expect(storedRequestBefore.closedAt?.getTime()).toBe(
+        first.endedAt?.getTime(),
+      );
+      // Un unico aviso, el del primer cierre.
+      expect(closedNotices()).toHaveLength(1);
+    });
+
+    it.each([
+      [
+        'tecnico, luego dispositivo',
+        RemoteSessionEndedBy.TECHNICIAN,
+        RemoteSessionEndedBy.DEVICE,
+      ],
+      [
+        'dispositivo, luego tecnico',
+        RemoteSessionEndedBy.DEVICE,
+        RemoteSessionEndedBy.TECHNICIAN,
+      ],
+      [
+        'SYSTEM, luego tecnico',
+        RemoteSessionEndedBy.SYSTEM,
+        RemoteSessionEndedBy.TECHNICIAN,
+      ],
+      [
+        'SYSTEM, luego dispositivo',
+        RemoteSessionEndedBy.SYSTEM,
+        RemoteSessionEndedBy.DEVICE,
+      ],
+    ])(
+      'cierre desde el otro extremo (%s): conserva el primer cierre',
+      async (_label, firstBy, lateBy) => {
+        const { technician, device, remoteSessionId, supportRequestId } =
+          await seedSessionWithDevice();
+
+        const closeAs = (endedBy: RemoteSessionEndedBy) =>
+          endedBy === RemoteSessionEndedBy.TECHNICIAN
+            ? service.closeByTechnician(remoteSessionId, technician)
+            : endedBy === RemoteSessionEndedBy.DEVICE
+              ? service.closeByDevice(remoteSessionId, device)
+              : service.closeBySystem(remoteSessionId, always);
+
+        const first = await closeAs(firstBy);
+        const noticesAfterFirst = closedNotices().length;
+        const sessionXmin = await xminOf('remote_sessions', remoteSessionId);
+        const requestXmin = await xminOf('support_requests', supportRequestId);
+
+        const late = await closeAs(lateBy);
+
+        expect(late).toMatchObject({
+          id: remoteSessionId,
+          status: RemoteSessionStatus.CLOSED,
+          endedBy: firstBy,
+        });
+        expect(late?.endedAt?.getTime()).toBe(first?.endedAt?.getTime());
+        expect(await xminOf('remote_sessions', remoteSessionId)).toBe(
+          sessionXmin,
+        );
+        expect(await xminOf('support_requests', supportRequestId)).toBe(
+          requestXmin,
+        );
+        expect(closedNotices()).toHaveLength(noticesAfterFirst);
+      },
+    );
+
+    it('un cierre que llega con la fila bloqueada espera y confirma el cierre ajeno', async () => {
+      const { device, remoteSessionId, supportRequestId } =
+        await seedSessionWithDevice();
+
+      const runner = dataSource.createQueryRunner();
+
+      await runner.connect();
+
+      try {
+        await runner.startTransaction();
+
+        // Otro cierre, todavia sin confirmar, con el mismo lock que el
+        // servicio: la fila queda bloqueada.
+        await runner.manager.findOne(RemoteSession, {
+          where: { id: remoteSessionId },
+          lock: { mode: 'pessimistic_write' },
+        });
+        await closeSessionRaw(runner, remoteSessionId);
+        await runner.manager
+          .createQueryBuilder()
+          .update(SupportRequest)
+          .set({
+            status: SupportRequestStatus.COMPLETED,
+            closedAt: new Date(),
+          })
+          .where('id = :id', { id: supportRequestId })
+          .execute();
+
+        let settled = false;
+        const blocked = service
+          .closeByDevice(remoteSessionId, device)
+          .finally(() => {
+            settled = true;
+          });
+
+        blocked.catch(() => undefined);
+
+        await delay(1_000);
+
+        // El SELECT ... FOR UPDATE espera: no decide con una lectura vieja.
+        expect(settled).toBe(false);
+
+        await runner.commitTransaction();
+
+        // Al obtener la fila ya lee CLOSED/TECHNICIAN y lo confirma tal cual.
+        await expect(blocked).resolves.toMatchObject({
+          status: RemoteSessionStatus.CLOSED,
+          endedBy: RemoteSessionEndedBy.TECHNICIAN,
+        });
+      } finally {
+        await runner.release();
+      }
+
+      expect((await storedSession(remoteSessionId)).endedBy).toBe(
+        RemoteSessionEndedBy.TECHNICIAN,
+      );
+      // El cierre que espero no emitio nada.
+      expect(closedNotices()).toHaveLength(0);
+    });
+
+    type Actor = 'TECHNICIAN' | 'DEVICE' | 'SYSTEM';
+
+    it.each<[string, Actor[]]>([
+      ['WEB + DEVICE', ['TECHNICIAN', 'DEVICE']],
+      ['WEB + WEB', ['TECHNICIAN', 'TECHNICIAN']],
+      ['DEVICE + DEVICE', ['DEVICE', 'DEVICE']],
+      ['WEB + SYSTEM', ['TECHNICIAN', 'SYSTEM']],
+      ['DEVICE + SYSTEM', ['DEVICE', 'SYSTEM']],
+      ['tres actores', ['TECHNICIAN', 'DEVICE', 'SYSTEM']],
+      [
+        'tres actores con reintentos',
+        ['DEVICE', 'TECHNICIAN', 'SYSTEM', 'TECHNICIAN', 'DEVICE', 'SYSTEM'],
+      ],
+    ])(
+      'cierres simultaneos %s: una sola transicion, todos confirman al ganador',
+      async (_label, actors) => {
+        const winners: string[] = [];
+
+        for (let round = 0; round < ROUNDS; round += 1) {
+          const { technician, device, remoteSessionId, supportRequestId } =
+            await seedSessionWithDevice();
+
+          // Se rota quien sale primero para no fijar siempre al mismo ganador.
+          const order = actors.map(
+            (_, index) => actors[(index + round) % actors.length],
+          );
+
+          const results = await Promise.allSettled(
+            order.map((actor) =>
+              actor === 'TECHNICIAN'
+                ? service.closeByTechnician(remoteSessionId, technician)
+                : actor === 'DEVICE'
+                  ? service.closeByDevice(remoteSessionId, device)
+                  : service.closeBySystem(remoteSessionId, always),
+            ),
+          );
+
+          // Nadie ve un 409, un 500, un deadlock ni un error del driver.
+          for (const result of results) expect(result.status).toBe('fulfilled');
+
+          const stored = await storedSession(remoteSessionId);
+          const request = await storedRequest(supportRequestId);
+          const winner = stored.endedBy as RemoteSessionEndedBy;
+
+          winners.push(winner);
+
+          expect(stored.status).toBe(RemoteSessionStatus.CLOSED);
+          expect(request.status).toBe(SupportRequestStatus.COMPLETED);
+          expect(request.closedAt?.getTime()).toBe(stored.endedAt?.getTime());
+
+          // Los participantes responden todos lo mismo: el cierre ganador.
+          // SYSTEM devuelve la sesion solo si fue el, y si no `null`.
+          order.forEach((actor, index) => {
+            const value = (
+              results[index] as PromiseFulfilledResult<{
+                endedBy: RemoteSessionEndedBy;
+                endedAt: Date | null;
+              } | null>
+            ).value;
+
+            if (actor === 'SYSTEM' && winner !== RemoteSessionEndedBy.SYSTEM) {
+              expect(value).toBeNull();
+              return;
+            }
+
+            if (actor === 'SYSTEM' && value === null) return;
+
+            expect(value?.endedBy).toBe(winner);
+            expect(value?.endedAt?.getTime()).toBe(stored.endedAt?.getTime());
+          });
+
+          // Exactamente los avisos de UNA transicion.
+          const notices = closedNotices();
+
+          expect(notices).toHaveLength(
+            winner === RemoteSessionEndedBy.SYSTEM ? 2 : 1,
+          );
+          for (const [, , payload] of notices)
+            expect(payload).toEqual({ remoteSessionId, endedBy: winner });
+        }
+
+        process.stdout.write(
+          `  [idempotent race ${actors.join('+')}] winners: ${winners.join(', ')}\n`,
+        );
+      },
+    );
+
+    it('una sesion CLOSED ajena sigue siendo 404, sin esperar a su lock', async () => {
+      const owner = await seedSessionWithDevice();
+      const stranger = await seedSessionWithDevice();
+
+      await service.closeByTechnician(owner.remoteSessionId, owner.technician);
+
+      const runner = dataSource.createQueryRunner();
+
+      await runner.connect();
+
+      try {
+        await runner.startTransaction();
+
+        // La fila queda bloqueada por otra transaccion.
+        await runner.manager.findOne(RemoteSession, {
+          where: { id: owner.remoteSessionId },
+          lock: { mode: 'pessimistic_write' },
+        });
+
+        // La pertenencia viaja en el WHERE del FOR UPDATE: la fila no
+        // coincide, PostgreSQL ni la bloquea ni espera por ella.
+        const started = Date.now();
+
+        await expect(
+          service.closeByTechnician(owner.remoteSessionId, stranger.technician),
+        ).rejects.toBeInstanceOf(NotFoundException);
+        await expect(
+          service.closeByDevice(owner.remoteSessionId, stranger.device),
+        ).rejects.toBeInstanceOf(NotFoundException);
+
+        expect(Date.now() - started).toBeLessThan(1_000);
+      } finally {
+        await runner.rollbackTransaction();
+        await runner.release();
+      }
+
+      expect((await storedSession(owner.remoteSessionId)).endedBy).toBe(
+        RemoteSessionEndedBy.TECHNICIAN,
+      );
+      // La sesion viva del extraño tampoco se toco.
+      expect((await storedSession(stranger.remoteSessionId)).status).toBe(
+        RemoteSessionStatus.CONNECTING,
+      );
+    });
+
+    it('un POST antiguo sobre la sesion historica no afecta a la asistencia nueva', async () => {
+      const old = await seedSessionWithDevice();
+
+      await service.closeByTechnician(old.remoteSessionId, old.technician);
+
+      // Nueva asistencia del mismo tecnico sobre el mismo dispositivo.
+      const request = await seedRequest(
+        old.technician,
+        SupportRequestStatus.ACCEPTED,
+        old.device,
+      );
+      const current = await service.create(
+        { supportRequestId: request.id },
+        old.technician,
+      );
+
+      await service.activateByTechnician(current.id, old.technician);
+
+      const currentXmin = await xminOf('remote_sessions', current.id);
+      const requestXmin = await xminOf('support_requests', request.id);
+
+      emitToDevice.mockClear();
+      emitToTechnician.mockClear();
+
+      await service.closeByTechnician(old.remoteSessionId, old.technician);
+      await service.closeByDevice(old.remoteSessionId, old.device);
+
+      expect(await xminOf('remote_sessions', current.id)).toBe(currentXmin);
+      expect(await xminOf('support_requests', request.id)).toBe(requestXmin);
+      expect((await storedSession(current.id)).status).toBe(
+        RemoteSessionStatus.ACTIVE,
+      );
+      expect(closedNotices()).toHaveLength(0);
+    });
+
+    it('un error real de PostgreSQL deja todo intacto y el reintento cierra una sola vez', async () => {
+      const { technician, remoteSessionId, supportRequestId } =
+        await seedSessionWithDevice();
+
+      // Segunda conexion con `lock_timeout` corto: si la fila esta bloqueada,
+      // PostgreSQL aborta con 55P03 (lock_not_available) en vez de esperar.
+      const impatient = new DataSource({
+        type: 'postgres',
+        url: DATABASE_URL,
+        ssl: resolveDatabaseSsl(DATABASE_URL as string),
+        schema: TEST_SCHEMA,
+        entities: [User, Device, SupportRequest, RemoteSession],
+        extra: { options: '-c lock_timeout=300' },
+      });
+
+      await impatient.initialize();
+
+      const impatientService = new RemoteSessionsService(
+        impatient.getRepository(RemoteSession),
+        impatient,
+        { isOnline: () => true } as unknown as DevicePresenceService,
+        { emitToDevice } as unknown as DeviceRealtimeService,
+        { emitToTechnician } as unknown as TechnicianRealtimeService,
+      );
+
+      const runner = dataSource.createQueryRunner();
+
+      await runner.connect();
+
+      try {
+        await runner.startTransaction();
+        await runner.manager.findOne(RemoteSession, {
+          where: { id: remoteSessionId },
+          lock: { mode: 'pessimistic_write' },
+        });
+
+        const failure = await impatientService
+          .closeByTechnician(remoteSessionId, technician)
+          .catch((error: unknown) => error);
+
+        // El error del driver sube tal cual (Nest lo responde como 500).
+        expect(postgresError(failure).code).toBe('55P03');
+
+        // Quien tenia la fila no cierra nada.
+        await runner.rollbackTransaction();
+      } finally {
+        await runner.release();
+        await impatient.destroy();
+      }
+
+      expect(await storedSession(remoteSessionId)).toMatchObject({
+        status: RemoteSessionStatus.CONNECTING,
+        endedAt: null,
+        endedBy: null,
+      });
+      expect((await storedRequest(supportRequestId)).status).toBe(
+        SupportRequestStatus.ACCEPTED,
+      );
+      expect(closedNotices()).toHaveLength(0);
+
+      // El cliente reintenta y ahora si cierra, una vez.
+      await expect(
+        service.closeByTechnician(remoteSessionId, technician),
+      ).resolves.toMatchObject({ endedBy: RemoteSessionEndedBy.TECHNICIAN });
+      await expect(
+        service.closeByTechnician(remoteSessionId, technician),
+      ).resolves.toMatchObject({ endedBy: RemoteSessionEndedBy.TECHNICIAN });
+      expect(closedNotices()).toHaveLength(1);
     });
   });
 

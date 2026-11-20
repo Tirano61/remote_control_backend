@@ -180,6 +180,11 @@ body, it is safe to repeat (a retry answers `200` with the same `connectedAt`),
 and it is not a precondition for step 14 — a session can be closed while still
 `CONNECTING`.
 
+Step 14 is safe to repeat too, from either close request: once the session is
+`CLOSED`, closing it again answers `200` with the original `endedBy` and
+`endedAt` and emits nothing. The collection stores the first close it sees in
+`remoteSessionClose` and checks that a repeat returns the same values.
+
 Step 12b is what `remote_control_web` uses to recover its own session: it takes
 no id, only `{{userToken}}`, so a lost `remoteSessionId` is not a problem. It is
 also the request to repeat after the device closes the session, which is
@@ -198,8 +203,10 @@ ACTIVE      closed 60 s after step 13 while no Socket.IO client of a side is
 
 Postman cannot join a session over Socket.IO. Driven only from this collection,
 send steps 13 and 14 within those windows, or keep the Flutter apps joined to
-the session; otherwise steps 13 and 14 answer `409` because the session is
-already `CLOSED` with `endedBy: "SYSTEM"`. The windows are configurable with
+the session; otherwise the session is already `CLOSED` with
+`endedBy: "SYSTEM"`: step 13 answers `409`, and step 14 answers `200` with
+`endedBy: "SYSTEM"` (its "closed by the technician/device" check then fails,
+which is how the collection shows it). The windows are configurable with
 `REMOTE_SESSION_CONNECTING_TTL_MS` and `REMOTE_SESSION_DISCONNECT_GRACE_MS`.
 
 ### Step 09 needs the device to be ONLINE

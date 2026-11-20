@@ -1129,7 +1129,7 @@
     },
     {
       "name": "06 - Remote sessions",
-      "description": "The technician routes are mounted under /remote-sessions (User JWT) and the\ndevice ones under /device/remote-sessions (Device JWT).\n\nEvery technician route is ownership-scoped: the session must belong to the\nauthenticated technician. Being admin is not an exemption — it answers 404 like\nanybody else, and /remote-sessions/current answers remoteSession null.\n\nActivate reports that WebRTC came up: CONNECTING -> ACTIVE with connectedAt. It is\nidempotent, so a retry answers 200 with the same session, and it never reopens a\nCLOSED one.\n\nThe two close requests are alternatives: whoever closes first wins and the\nother side gets 409. Each close notifies the other end over Socket.IO.\n\nTime limits (automatic close, endedBy SYSTEM, see docs/REALTIME.md):\n\n```text\nCONNECTING  closed REMOTE_SESSION_CONNECTING_TTL_MS (120 s) after createdAt\n            if Activate was not called\nACTIVE      closed REMOTE_SESSION_DISCONNECT_GRACE_MS (60 s) after a side has\n            no Socket.IO client joined to the session\n```\n\nPostman cannot join a session over Socket.IO, so a session driven only from\nthis collection is closed by the backend about one grace period after Activate\n(or at the TTL if it is never activated). Run Activate and Close within those\nwindows, or keep the Flutter apps joined; otherwise Activate/Close answer 409\nbecause the session is already CLOSED with endedBy SYSTEM.",
+      "description": "The technician routes are mounted under /remote-sessions (User JWT) and the\ndevice ones under /device/remote-sessions (Device JWT).\n\nEvery technician route is ownership-scoped: the session must belong to the\nauthenticated technician. Being admin is not an exemption — it answers 404 like\nanybody else, and /remote-sessions/current answers remoteSession null.\n\nActivate reports that WebRTC came up: CONNECTING -> ACTIVE with connectedAt. It is\nidempotent, so a retry answers 200 with the same session, and it never reopens a\nCLOSED one.\n\nThe two close requests are alternatives, and both are idempotent: whoever\ncloses first wins, and a later close from either side (or a retry of the same\none) answers 200 with that same close, keeping its endedBy and endedAt. Only\nthe close that performs the transition notifies the other end over Socket.IO;\na repeated close emits nothing.\n\nTime limits (automatic close, endedBy SYSTEM, see docs/REALTIME.md):\n\n```text\nCONNECTING  closed REMOTE_SESSION_CONNECTING_TTL_MS (120 s) after createdAt\n            if Activate was not called\nACTIVE      closed REMOTE_SESSION_DISCONNECT_GRACE_MS (60 s) after a side has\n            no Socket.IO client joined to the session\n```\n\nPostman cannot join a session over Socket.IO, so a session driven only from\nthis collection is closed by the backend about one grace period after Activate\n(or at the TTL if it is never activated). Run Activate and Close within those\nwindows, or keep the Flutter apps joined; otherwise the session is already\nCLOSED with endedBy SYSTEM: Activate answers 409, and Close answers 200 with\nendedBy SYSTEM.",
       "item": [
         {
           "name": "Create remote session - Technician",
@@ -1476,10 +1476,32 @@
                   "if (pm.response.code === 200) {",
                   "  const body = pm.response.json();",
                   "",
-                  "  pm.test('The session is closed by the technician', function () {",
+                  "  pm.test('It is the requested session and it is closed', function () {",
+                  "    pm.expect(body.id).to.eql(pm.environment.get('remoteSessionId'));",
                   "    pm.expect(body.status).to.eql('CLOSED');",
-                  "    pm.expect(body.endedBy).to.eql('TECHNICIAN');",
+                  "    pm.expect(body.endedAt).to.be.a('string');",
+                  "    pm.expect(['TECHNICIAN', 'DEVICE', 'SYSTEM']).to.include(body.endedBy);",
                   "  });",
+                  "",
+                  "  // Idempotency seen from the client: closing the same session again, from",
+                  "  // either side, must answer 200 with this very same close.",
+                  "  const previous = JSON.parse(pm.environment.get('remoteSessionClose') || 'null');",
+                  "",
+                  "  if (previous && previous.id === body.id) {",
+                  "    pm.test('A repeated close keeps the original endedBy and endedAt', function () {",
+                  "      pm.expect(body.endedBy).to.eql(previous.endedBy);",
+                  "      pm.expect(body.endedAt).to.eql(previous.endedAt);",
+                  "    });",
+                  "  } else {",
+                  "    pm.test('The session is closed by the technician', function () {",
+                  "      pm.expect(body.endedBy).to.eql('TECHNICIAN');",
+                  "    });",
+                  "",
+                  "    pm.environment.set(",
+                  "      'remoteSessionClose',",
+                  "      JSON.stringify({ id: body.id, endedBy: body.endedBy, endedAt: body.endedAt }),",
+                  "    );",
+                  "  }",
                   "}"
                 ]
               }
@@ -1505,7 +1527,7 @@
                 "close"
               ]
             },
-            "description": "Step 14 of the end-to-end flow.\n\nThe technician ends the assistance: the session becomes CLOSED with\nendedBy TECHNICIAN and its support request becomes COMPLETED in the same\ntransaction. Emits remote-session:closed to the device."
+            "description": "Step 14 of the end-to-end flow.\n\nThe technician ends the assistance: the session becomes CLOSED with\nendedBy TECHNICIAN and its support request becomes COMPLETED in the same\ntransaction. Emits remote-session:closed to the device.\n\nIdempotent: running it again (a lost response, a retry) answers 200 with the\nsame close, the same endedBy and the same endedAt, writes nothing and emits\nnothing. If the device or the backend (SYSTEM) closed the session first, it also\nanswers 200, with their endedBy: a late close never claims the close.\n\n404 if the session belongs to another technician, also once it is CLOSED (admin\nincluded). 409 only if the session is live but its request cannot complete.\n\nStores: remoteSessionClose (id, endedBy, endedAt of the first close seen), to\ncheck a repeated close."
           },
           "response": []
         },
@@ -1524,10 +1546,32 @@
                   "if (pm.response.code === 200) {",
                   "  const body = pm.response.json();",
                   "",
-                  "  pm.test('The session is closed by the device', function () {",
+                  "  pm.test('It is the requested session and it is closed', function () {",
+                  "    pm.expect(body.id).to.eql(pm.environment.get('remoteSessionId'));",
                   "    pm.expect(body.status).to.eql('CLOSED');",
-                  "    pm.expect(body.endedBy).to.eql('DEVICE');",
+                  "    pm.expect(body.endedAt).to.be.a('string');",
+                  "    pm.expect(['TECHNICIAN', 'DEVICE', 'SYSTEM']).to.include(body.endedBy);",
                   "  });",
+                  "",
+                  "  // Idempotency seen from the client: closing the same session again, from",
+                  "  // either side, must answer 200 with this very same close.",
+                  "  const previous = JSON.parse(pm.environment.get('remoteSessionClose') || 'null');",
+                  "",
+                  "  if (previous && previous.id === body.id) {",
+                  "    pm.test('A repeated close keeps the original endedBy and endedAt', function () {",
+                  "      pm.expect(body.endedBy).to.eql(previous.endedBy);",
+                  "      pm.expect(body.endedAt).to.eql(previous.endedAt);",
+                  "    });",
+                  "  } else {",
+                  "    pm.test('The session is closed by the device', function () {",
+                  "      pm.expect(body.endedBy).to.eql('DEVICE');",
+                  "    });",
+                  "",
+                  "    pm.environment.set(",
+                  "      'remoteSessionClose',",
+                  "      JSON.stringify({ id: body.id, endedBy: body.endedBy, endedAt: body.endedAt }),",
+                  "    );",
+                  "  }",
                   "}"
                 ]
               }
@@ -1554,7 +1598,7 @@
                 "close"
               ]
             },
-            "description": "Alternative to closing as the technician: the user of the tablet ends the\nassistance. CLOSED with endedBy DEVICE, and the support request becomes\nCOMPLETED in the same transaction.\n\nEmits remote-session:closed to the owning technician on /technicians, after the\ntransaction commits. The web app answers that event with\nGET /remote-sessions/current."
+            "description": "Alternative to closing as the technician: the user of the tablet ends the\nassistance. CLOSED with endedBy DEVICE, and the support request becomes\nCOMPLETED in the same transaction.\n\nEmits remote-session:closed to the owning technician on /technicians, after the\ntransaction commits. The web app answers that event with\nGET /remote-sessions/current.\n\nIdempotent: running it again answers 200 with the same close and emits nothing.\nIf the technician or the backend (SYSTEM) closed the session first, it also\nanswers 200, with their endedBy. 404 if the session belongs to another device,\nalso once it is CLOSED.\n\nStores: remoteSessionClose, shared with the technician close."
           },
           "response": []
         }
