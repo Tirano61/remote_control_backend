@@ -130,6 +130,14 @@ interface PostgresError {
 /** unique_violation */
 const UNIQUE_VIOLATION = '23505';
 
+/**
+ * Quien pide algo sobre una sesion, tal como viaja en el WHERE: el tecnico del
+ * User JWT o el dispositivo del Device JWT, nunca un id que mande el cliente.
+ */
+type RemoteSessionParticipant =
+  | Pick<RemoteSession, 'technicianId'>
+  | Pick<RemoteSession, 'deviceId'>;
+
 /** Columnas de `RemoteSessionLifecycleSnapshot`: nada de relaciones. */
 const LIFECYCLE_SNAPSHOT_SELECT = {
   id: true,
@@ -400,21 +408,29 @@ export class RemoteSessionsService {
     return this.toResponse(remoteSession);
   }
 
-  /** El tecnico finaliza la asistencia. */
+  /**
+   * El tecnico finaliza la asistencia.
+   *
+   * Idempotente: si la sesion del tecnico ya estaba `CLOSED` (la cerro el
+   * mismo en un intento cuya respuesta se perdio, la tablet o el sistema)
+   * responde `200` con la sesion tal como quedo, sin reescribir `endedAt` ni
+   * `endedBy` y sin volver a avisar a la tablet. Ver `closeOwned`.
+   */
   async closeByTechnician(
     id: string,
     user: User,
   ): Promise<RemoteSessionResponseDto> {
-    const remoteSession = await this.findOwnedByTechnicianOrFail(id, user.id);
-
-    const closed = await this.close(
-      remoteSession,
+    const { remoteSession, closedNow } = await this.closeOwned(
+      id,
+      { technicianId: user.id },
       RemoteSessionEndedBy.TECHNICIAN,
     );
 
-    this.notifyDeviceClosed(closed);
+    // Solo quien hizo la transicion avisa, y despues del commit: un reintento
+    // sobre una sesion ya cerrada no emite un segundo `remote-session:closed`.
+    if (closedNow) this.notifyDeviceClosed(remoteSession);
 
-    return this.toResponse(closed);
+    return this.toResponse(remoteSession);
   }
 
   // ---------------------------------------------------------------------------
@@ -453,21 +469,26 @@ export class RemoteSessionsService {
    * Al tecnico si se le avisa, y despues del commit: es el unico extremo que se
    * quedaria mostrando una sesion que ya no existe. El aviso es simetrico del
    * que recibe la tablet cuando cierra el tecnico.
+   *
+   * Idempotente igual que el cierre del tecnico: sobre una sesion propia ya
+   * `CLOSED` responde `200` con el cierre original y no avisa a nadie.
    */
   async closeByDevice(
     id: string,
     device: Device,
   ): Promise<RemoteSessionResponseDto> {
-    const remoteSession = await this.findOwnedByDeviceOrFail(id, device.id);
-
-    const closed = await this.close(remoteSession, RemoteSessionEndedBy.DEVICE);
+    const { remoteSession, closedNow } = await this.closeOwned(
+      id,
+      { deviceId: device.id },
+      RemoteSessionEndedBy.DEVICE,
+    );
 
     // Nunca antes de que la transaccion confirme: no se anuncia un cierre que
-    // todavia pudiera deshacerse. Si la sesion ya estaba cerrada, `close` ha
-    // lanzado `409` y aqui no se llega, asi que no se emiten avisos falsos.
-    this.notifyTechnicianClosed(closed);
+    // todavia pudiera deshacerse. Y solo si esta peticion hizo la transicion:
+    // un reintento, o un cierre que ya hizo otro, no produce avisos.
+    if (closedNow) this.notifyTechnicianClosed(remoteSession);
 
-    return this.toResponse(closed);
+    return this.toResponse(remoteSession);
   }
 
   // ---------------------------------------------------------------------------
@@ -518,8 +539,9 @@ export class RemoteSessionsService {
    *    CONNECTING nunca toca una sesion que ya es ACTIVE.
    *
    * Frente a un cierre del tecnico o del dispositivo simultaneo, gana el primero
-   * que llega a la fila: el otro ve `CLOSED` (aqui, `null`; alli, `409`) y no
-   * reescribe `endedAt` ni `endedBy`.
+   * que llega a la fila (los tres la bloquean igual): el otro ve `CLOSED`
+   * (aqui, `null`; alli, un `200` con el cierre ya hecho) y no reescribe
+   * `endedAt` ni `endedBy`.
    *
    * Solo despues del commit avisa a LOS DOS extremos con
    * `remote-session:closed`. Devuelve la sesion cerrada, o `null` si no cerro.
@@ -571,43 +593,69 @@ export class RemoteSessionsService {
   // ---------------------------------------------------------------------------
 
   /**
-   * Cierra la sesion y completa su solicitud en una unica transaccion.
+   * Cierre pedido por un participante (tecnico o dispositivo). Idempotente.
    *
-   * El cierre va condicionado al estado actual, asi que si el tecnico y el
-   * dispositivo (o el sistema) cierran a la vez solo uno hace la transicion; el
-   * segundo encuentra la fila ya cerrada, recibe `409` y no toca el `endedAt`
-   * ni el `endedBy` del primero.
+   * Todo ocurre en una transaccion que empieza bloqueando la fila
+   * (`SELECT ... FOR UPDATE`) CON LA PERTENENCIA EN EL WHERE, igual que
+   * `activate` y `closeBySystem`:
+   *
+   * 1. Una sesion ajena o inexistente responde `404` y ni siquiera se bloquea.
+   *    La idempotencia no relaja esto: estar `CLOSED` no hace visible una
+   *    sesion que nunca fue del solicitante.
+   * 2. Si la sesion sigue viva, se cierra con LA transicion de siempre
+   *    (`closeWithin`: sesion `CLOSED` + solicitud `COMPLETED`, o nada).
+   * 3. Si ya estaba `CLOSED` no se escribe nada: ni `endedAt`, ni `endedBy`, ni
+   *    la solicitud. Un reintento tardio no se atribuye el cierre.
+   *
+   * El lock es lo que decide las carreras: tecnico, dispositivo y sistema
+   * compiten por la misma fila, el primero que la obtiene cierra y los demas,
+   * al obtenerla despues, leen `CLOSED`. Ninguna decision depende de una
+   * lectura hecha fuera de la transaccion.
+   *
+   * La sesion devuelta se relee DESPUES del cierre, dentro de la misma
+   * transaccion: es la fila confirmada, asi que el primer cierre y cualquier
+   * reintento responden exactamente lo mismo (mismo `endedAt`, mismo
+   * `endedBy`).
+   *
+   * `closedNow` dice si ESTA peticion hizo la transicion. Solo en ese caso se
+   * avisa (por Socket.IO y en proceso): una carrera o un reintento no producen
+   * avisos duplicados.
    */
-  private async close(
-    remoteSession: RemoteSession,
+  private async closeOwned(
+    id: string,
+    owner: RemoteSessionParticipant,
     endedBy: RemoteSessionEndedBy,
-  ): Promise<RemoteSession> {
-    const endedAt = new Date();
+  ): Promise<{ remoteSession: RemoteSession; closedNow: boolean }> {
+    const outcome = await this.dataSource.transaction(async (manager) => {
+      const locked = await this.lockOwnedSessionOrFail(manager, id, owner);
 
-    await this.dataSource.transaction(async (manager) => {
-      const closed = await this.closeWithin(
-        manager,
-        remoteSession,
-        endedAt,
-        endedBy,
-        ACTIVE_REMOTE_SESSION_STATUSES,
-      );
+      // Con la fila bloqueada nadie puede cambiar su estado: el UPDATE va
+      // condicionado al estado leido y no puede fallar salvo que la fila
+      // estuviera ya `CLOSED`, en cuyo caso ni se ejecuta.
+      const closedNow =
+        locked.status !== RemoteSessionStatus.CLOSED &&
+        (await this.closeWithin(manager, locked, new Date(), endedBy, [
+          locked.status,
+        ]));
 
-      if (!closed)
+      const remoteSession = await manager.findOne(RemoteSession, {
+        where: { id },
+        relations: { device: true, technician: true },
+      });
+
+      // Inalcanzable con la fila bloqueada. Si aun asi ocurriera, no se
+      // confirma un cierre que PostgreSQL no tiene.
+      if (remoteSession?.status !== RemoteSessionStatus.CLOSED)
         throw new ConflictException(
-          `Remote session with id ${remoteSession.id} is already closed`,
+          `Remote session with id ${id} could not be closed`,
         );
+
+      return { remoteSession, closedNow };
     });
 
-    const result = Object.assign(remoteSession, {
-      status: RemoteSessionStatus.CLOSED,
-      endedAt,
-      endedBy,
-    });
+    if (outcome.closedNow) this.notifyChanged(outcome.remoteSession);
 
-    this.notifyChanged(result);
-
-    return result;
+    return outcome;
   }
 
   /**
@@ -741,14 +789,6 @@ export class RemoteSessionsService {
     return this.findOwnedOrFail(id, { technicianId });
   }
 
-  /** Sesion del dispositivo autenticado, o `404` como si no existiera. */
-  private findOwnedByDeviceOrFail(
-    id: string,
-    deviceId: string,
-  ): Promise<RemoteSession> {
-    return this.findOwnedOrFail(id, { deviceId });
-  }
-
   /**
    * La pertenencia viaja en el WHERE.
    *
@@ -771,27 +811,41 @@ export class RemoteSessionsService {
   }
 
   /**
-   * Bloquea la fila de la sesion del tecnico autenticado.
-   *
-   * Es el `SELECT ... FOR UPDATE` que serializa la activacion con el cierre:
-   * un `close` concurrente espera a este lock, y despues reevalua la fila.
-   * Quien llegue segundo ve lo que dejo el primero, nunca el estado anterior.
-   *
-   * La pertenencia viaja en el WHERE, igual que en `findOwnedOrFail`: la sesion
-   * de otro tecnico se comporta como inexistente (`404`) y ni siquiera se
-   * bloquea.
-   *
-   * Sin relaciones, por el mismo motivo que en la solicitud: TypeORM las
-   * resolveria con LEFT JOIN y PostgreSQL no admite `FOR UPDATE` sobre el lado
-   * nullable de un outer join. Las carga despues `withRelations`.
+   * Bloquea la fila de la sesion del tecnico autenticado. Ver
+   * `lockOwnedSessionOrFail`.
    */
-  private async lockSessionOwnedByTechnicianOrFail(
+  private lockSessionOwnedByTechnicianOrFail(
     manager: EntityManager,
     id: string,
     technicianId: string,
   ): Promise<RemoteSession> {
+    return this.lockOwnedSessionOrFail(manager, id, { technicianId });
+  }
+
+  /**
+   * Bloquea la fila de una sesion del participante autenticado (tecnico o
+   * dispositivo).
+   *
+   * Es el `SELECT ... FOR UPDATE` que serializa la activacion con el cierre y
+   * los cierres entre si: quien llega segundo espera al lock y despues
+   * reevalua la fila, asi que ve lo que dejo el primero, nunca el estado
+   * anterior.
+   *
+   * La pertenencia viaja en el WHERE, igual que en `findOwnedOrFail`: la sesion
+   * de otro tecnico o de otro dispositivo se comporta como inexistente (`404`),
+   * este como este, y ni siquiera se bloquea.
+   *
+   * Sin relaciones, por el mismo motivo que en la solicitud: TypeORM las
+   * resolveria con LEFT JOIN y PostgreSQL no admite `FOR UPDATE` sobre el lado
+   * nullable de un outer join. Se cargan despues, con una lectura aparte.
+   */
+  private async lockOwnedSessionOrFail(
+    manager: EntityManager,
+    id: string,
+    owner: RemoteSessionParticipant,
+  ): Promise<RemoteSession> {
     const remoteSession = await manager.findOne(RemoteSession, {
-      where: { id, technicianId },
+      where: { id, ...owner },
       lock: { mode: 'pessimistic_write' },
     });
 
@@ -1016,12 +1070,20 @@ export class RemoteSessionsService {
     }
   }
 
-  /** Avisa a la tablet de que el tecnico termino la sesion. */
+  /**
+   * Avisa a la tablet de que el tecnico termino la sesion.
+   *
+   * Igual que el aviso al tecnico: la sesion ya esta `CLOSED` en PostgreSQL, y
+   * un transporte que falla se registra pero no convierte el cierre en un
+   * `500` (que haria creer al tecnico que no cerro).
+   */
   private notifyDeviceClosed(remoteSession: RemoteSession): void {
-    this.deviceRealtimeService.emitToDevice(
-      remoteSession.deviceId,
-      REMOTE_SESSION_CLOSED_EVENT,
-      this.closedPayload(remoteSession),
+    this.deliverClosed(remoteSession, `device ${remoteSession.deviceId}`, () =>
+      this.deviceRealtimeService.emitToDevice(
+        remoteSession.deviceId,
+        REMOTE_SESSION_CLOSED_EVENT,
+        this.closedPayload(remoteSession),
+      ),
     );
   }
 

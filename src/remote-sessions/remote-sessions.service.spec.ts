@@ -1749,7 +1749,7 @@ describe('RemoteSessionsService', () => {
       expect(emitToTechnician).not.toHaveBeenCalled();
     });
 
-    it('responde 409 al cerrar dos veces, sin alterar el primer cierre', async () => {
+    it('cerrar dos veces confirma el primer cierre sin alterarlo', async () => {
       const { remoteSessionId } = await seedSession();
 
       const closed = await service.closeByTechnician(
@@ -1759,9 +1759,17 @@ describe('RemoteSessionsService', () => {
 
       await expect(
         service.closeByTechnician(remoteSessionId, technicianA),
-      ).rejects.toBeInstanceOf(ConflictException);
+      ).resolves.toEqual(closed);
 
       expect(sessionRow(remoteSessionId).endedAt).toEqual(closed.endedAt);
+    });
+
+    it('bloquea la fila de la sesion antes de cerrar', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      await service.closeByTechnician(remoteSessionId, technicianA);
+
+      expect(lockedRows).toContain(`RemoteSession:${remoteSessionId}`);
     });
   });
 
@@ -1848,9 +1856,20 @@ describe('RemoteSessionsService', () => {
 
       await expect(
         service.closeByDevice(remoteSessionId, deviceA),
-      ).rejects.toBeInstanceOf(ConflictException);
+      ).resolves.toMatchObject({
+        status: RemoteSessionStatus.CLOSED,
+        endedBy: RemoteSessionEndedBy.DEVICE,
+      });
 
       expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it('bloquea la fila de la sesion antes de cerrar', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      await service.closeByDevice(remoteSessionId, deviceA);
+
+      expect(lockedRows).toContain(`RemoteSession:${remoteSessionId}`);
     });
   });
 
@@ -1858,34 +1877,334 @@ describe('RemoteSessionsService', () => {
     it('deja un unico cierre cuando tecnico y dispositivo coinciden', async () => {
       const { remoteSessionId, supportRequestId } = await seedSession();
 
-      const results = await Promise.allSettled([
+      // Los dos piden la fila a la vez: el lock los ordena, el primero cierra y
+      // el segundo, al obtenerla, lee CLOSED y confirma ese mismo cierre.
+      const [byTechnician, byDevice] = await Promise.all([
         service.closeByTechnician(remoteSessionId, technicianA),
         service.closeByDevice(remoteSessionId, deviceA),
       ]);
 
-      const fulfilled = results.filter(
-        (result) => result.status === 'fulfilled',
-      );
-      const rejected = results.filter((result) => result.status === 'rejected');
-
-      expect(fulfilled).toHaveLength(1);
-      expect(rejected).toHaveLength(1);
-      expect(rejected[0].reason).toBeInstanceOf(ConflictException);
-
-      const winner = (
-        fulfilled[0] as PromiseFulfilledResult<{
-          endedBy: RemoteSessionEndedBy | null;
-          endedAt: Date | null;
-        }>
-      ).value;
-
       const row = sessionRow(remoteSessionId);
 
       expect(row.status).toBe(RemoteSessionStatus.CLOSED);
-      expect(row.endedBy).toBe(winner.endedBy);
-      expect(row.endedAt).toEqual(winner.endedAt);
+      // Ganó el primero que pidió la fila, y los dos responden lo mismo.
+      expect(row.endedBy).toBe(RemoteSessionEndedBy.TECHNICIAN);
+      expect(byTechnician).toEqual(byDevice);
+      expect(byDevice).toMatchObject({
+        endedBy: row.endedBy,
+        endedAt: row.endedAt,
+      });
       expect(requestRow(supportRequestId).status).toBe(
         SupportRequestStatus.COMPLETED,
+      );
+
+      // Un solo cierre real, un solo aviso: a la tablet, porque gano el tecnico.
+      expect(emitToDevice).toHaveBeenCalledTimes(1);
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('cierre idempotente', () => {
+    const always = () => true;
+
+    /** Todo lo que un cierre puede haber escrito, para comparar antes/despues. */
+    const snapshotOf = (remoteSessionId: string, supportRequestId: string) => ({
+      session: { ...sessionRow(remoteSessionId) },
+      request: { ...requestRow(supportRequestId) },
+    });
+
+    it('el tecnico repite: 200 con el cierre original, sin escribir ni avisar', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+      const first = await service.closeByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+      const before = snapshotOf(remoteSessionId, supportRequestId);
+      emitToDevice.mockClear();
+      const listener = jest.fn();
+      service.onSessionChanged(listener);
+
+      const again = await service.closeByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+
+      expect(again).toEqual(first);
+      expect(again).toMatchObject({
+        status: RemoteSessionStatus.CLOSED,
+        endedBy: RemoteSessionEndedBy.TECHNICIAN,
+        endedAt: first.endedAt,
+      });
+      expect(snapshotOf(remoteSessionId, supportRequestId)).toEqual(before);
+      expect(emitToDevice).not.toHaveBeenCalled();
+      expect(emitToTechnician).not.toHaveBeenCalled();
+      expect(listener).not.toHaveBeenCalled();
+    });
+
+    it('el dispositivo repite: 200 con el cierre original, sin escribir ni avisar', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+      const first = await service.closeByDevice(remoteSessionId, deviceA);
+      const before = snapshotOf(remoteSessionId, supportRequestId);
+      emitToTechnician.mockClear();
+
+      const again = await service.closeByDevice(remoteSessionId, deviceA);
+
+      expect(again).toEqual(first);
+      expect(again.endedBy).toBe(RemoteSessionEndedBy.DEVICE);
+      expect(snapshotOf(remoteSessionId, supportRequestId)).toEqual(before);
+      expect(emitToDevice).not.toHaveBeenCalled();
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it('cierra el tecnico y despues el dispositivo: confirma TECHNICIAN, no DEVICE', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+      const first = await service.closeByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+      const before = snapshotOf(remoteSessionId, supportRequestId);
+      emitToDevice.mockClear();
+
+      const late = await service.closeByDevice(remoteSessionId, deviceA);
+
+      // El solicitante tardio no se atribuye el cierre.
+      expect(late).toMatchObject({
+        status: RemoteSessionStatus.CLOSED,
+        endedBy: RemoteSessionEndedBy.TECHNICIAN,
+        endedAt: first.endedAt,
+      });
+      expect(snapshotOf(remoteSessionId, supportRequestId)).toEqual(before);
+      expect(emitToDevice).not.toHaveBeenCalled();
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it('cierra el dispositivo y despues el tecnico: confirma DEVICE, no TECHNICIAN', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+      const first = await service.closeByDevice(remoteSessionId, deviceA);
+      const before = snapshotOf(remoteSessionId, supportRequestId);
+      emitToTechnician.mockClear();
+
+      const late = await service.closeByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+
+      expect(late).toMatchObject({
+        status: RemoteSessionStatus.CLOSED,
+        endedBy: RemoteSessionEndedBy.DEVICE,
+        endedAt: first.endedAt,
+      });
+      expect(snapshotOf(remoteSessionId, supportRequestId)).toEqual(before);
+      expect(emitToDevice).not.toHaveBeenCalled();
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it('despues de SYSTEM, un POST antiguo de cualquiera conserva SYSTEM', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+      const bySystem = await service.closeBySystem(remoteSessionId, always);
+      const before = snapshotOf(remoteSessionId, supportRequestId);
+      emitToDevice.mockClear();
+      emitToTechnician.mockClear();
+
+      const fromTechnician = await service.closeByTechnician(
+        remoteSessionId,
+        technicianA,
+      );
+      const fromDevice = await service.closeByDevice(remoteSessionId, deviceA);
+
+      for (const late of [fromTechnician, fromDevice])
+        expect(late).toMatchObject({
+          status: RemoteSessionStatus.CLOSED,
+          endedBy: RemoteSessionEndedBy.SYSTEM,
+          endedAt: bySystem?.endedAt,
+        });
+      expect(snapshotOf(remoteSessionId, supportRequestId)).toEqual(before);
+      // SYSTEM ya aviso a los dos al cerrar; los reintentos no repiten nada.
+      expect(emitToDevice).not.toHaveBeenCalled();
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it('la solicitud pasa a COMPLETED una sola vez y su closedAt no cambia', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+      await service.closeByTechnician(remoteSessionId, technicianA);
+      const completed = { ...requestRow(supportRequestId) };
+
+      await service.closeByTechnician(remoteSessionId, technicianA);
+      await service.closeByDevice(remoteSessionId, deviceA);
+
+      expect(requestRow(supportRequestId)).toEqual(completed);
+      expect(completed).toMatchObject({
+        status: SupportRequestStatus.COMPLETED,
+        closedAt: sessionRow(remoteSessionId).endedAt,
+      });
+    });
+
+    it('un reintento que llega en plena carrera espera al lock y confirma al ganador', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      // Tres actores a la vez, cada uno con su propio reintento.
+      const results = await Promise.all([
+        service.closeByDevice(remoteSessionId, deviceA),
+        service.closeByTechnician(remoteSessionId, technicianA),
+        service.closeBySystem(remoteSessionId, always),
+        service.closeByTechnician(remoteSessionId, technicianA),
+        service.closeByDevice(remoteSessionId, deviceA),
+      ]);
+
+      const row = sessionRow(remoteSessionId);
+
+      expect(row.endedBy).toBe(RemoteSessionEndedBy.DEVICE);
+      // SYSTEM no cerro: devuelve null y no avisa.
+      expect(results[2]).toBeNull();
+      for (const index of [0, 1, 3, 4])
+        expect(results[index]).toMatchObject({
+          endedBy: RemoteSessionEndedBy.DEVICE,
+          endedAt: row.endedAt,
+        });
+      // Un unico aviso, el del cierre real del dispositivo hacia el tecnico.
+      expect(emitToTechnician).toHaveBeenCalledTimes(1);
+      expect(emitToDevice).not.toHaveBeenCalled();
+    });
+
+    it('responde 404 a una sesion inexistente', async () => {
+      await expect(
+        service.closeByTechnician(randomUUID(), technicianA),
+      ).rejects.toBeInstanceOf(NotFoundException);
+      await expect(
+        service.closeByDevice(randomUUID(), deviceA),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      expect(emitToDevice).not.toHaveBeenCalled();
+      expect(emitToTechnician).not.toHaveBeenCalled();
+    });
+
+    it('una sesion CLOSED de otro tecnico sigue siendo 404 y no se bloquea', async () => {
+      const { remoteSessionId } = await seedSession();
+      await service.closeByTechnician(remoteSessionId, technicianA);
+      lockedRows = [];
+
+      // Ni el tecnico ajeno ni un admin: estar CLOSED no hace visible nada.
+      for (const stranger of [technicianB, adminUser])
+        await expect(
+          service.closeByTechnician(remoteSessionId, stranger),
+        ).rejects.toBeInstanceOf(NotFoundException);
+
+      expect(lockedRows).toEqual([]);
+    });
+
+    it('una sesion CLOSED de otro dispositivo sigue siendo 404', async () => {
+      const { remoteSessionId } = await seedSession();
+      await service.closeByDevice(remoteSessionId, deviceA);
+      lockedRows = [];
+
+      await expect(
+        service.closeByDevice(remoteSessionId, deviceB),
+      ).rejects.toBeInstanceOf(NotFoundException);
+
+      expect(lockedRows).toEqual([]);
+    });
+
+    it('el 404 no distingue una sesion ajena de una inexistente', async () => {
+      const { remoteSessionId } = await seedSession();
+      await service.closeByTechnician(remoteSessionId, technicianA);
+
+      const foreign = await service
+        .closeByTechnician(remoteSessionId, technicianB)
+        .catch((error: NotFoundException) => error.getResponse());
+      const missing = await service
+        .closeByTechnician(randomUUID(), technicianB)
+        .catch((error: NotFoundException) => error.getResponse());
+
+      expect(foreign).toMatchObject({ statusCode: 404, error: 'Not Found' });
+      expect(Object.keys(foreign as object)).toEqual(
+        Object.keys(missing as object),
+      );
+      // Nada de la sesion (estado, endedBy, participantes) en el error.
+      expect(JSON.stringify(foreign)).not.toMatch(
+        /CLOSED|TECHNICIAN|DEVICE|Ana|384-729-142/,
+      );
+    });
+
+    it('un POST antiguo sobre una sesion historica no toca la sesion nueva', async () => {
+      const old = await seedSession();
+      await service.closeByTechnician(old.remoteSessionId, technicianA);
+
+      // Nueva asistencia: mismo dispositivo y mismo tecnico.
+      const current = await seedSessionFor(deviceA, technicianA);
+      await service.activateByTechnician(current, technicianA);
+      const liveBefore = { ...sessionRow(current) };
+      emitToDevice.mockClear();
+      emitToTechnician.mockClear();
+
+      // Reintentos retrasados de los dos lados sobre la sesion vieja.
+      await expect(
+        service.closeByTechnician(old.remoteSessionId, technicianA),
+      ).resolves.toMatchObject({ id: old.remoteSessionId, status: 'CLOSED' });
+      await expect(
+        service.closeByDevice(old.remoteSessionId, deviceA),
+      ).resolves.toMatchObject({ id: old.remoteSessionId, status: 'CLOSED' });
+
+      expect(sessionRow(current)).toEqual(liveBefore);
+      expect(sessionRow(current).status).toBe(RemoteSessionStatus.ACTIVE);
+      expect(emitToDevice).not.toHaveBeenCalled();
+      expect(emitToTechnician).not.toHaveBeenCalled();
+      await expect(
+        service.findCurrentForTechnician(technicianA.id),
+      ).resolves.toMatchObject({ remoteSession: { id: current } });
+    });
+
+    it('si la base falla en mitad del cierre, no queda nada escrito ni avisado', async () => {
+      const { remoteSessionId, supportRequestId } = await seedSession();
+      type FindOne = FakeRemoteSessionRepository['findOne'];
+      const original = remoteSessions.findOne.bind(remoteSessions) as FindOne;
+      let calls = 0;
+
+      // 1a lectura: el SELECT ... FOR UPDATE. 2a: la relectura posterior al
+      // UPDATE. Falla la segunda, con los UPDATE ya ejecutados.
+      const failing = jest
+        .spyOn(remoteSessions, 'findOne')
+        .mockImplementation((options: Parameters<FindOne>[0]) =>
+          ++calls === 2
+            ? Promise.reject(new QueryFailedError('SELECT', [], new Error()))
+            : original(options),
+        );
+
+      await expect(
+        service.closeByTechnician(remoteSessionId, technicianA),
+      ).rejects.toBeInstanceOf(QueryFailedError);
+
+      // Rollback: la sesion sigue viva y la solicitud ACCEPTED.
+      expect(sessionRow(remoteSessionId)).toMatchObject({
+        status: RemoteSessionStatus.CONNECTING,
+        endedAt: null,
+        endedBy: null,
+      });
+      expect(requestRow(supportRequestId).status).toBe(
+        SupportRequestStatus.ACCEPTED,
+      );
+      expect(emitToDevice).not.toHaveBeenCalled();
+
+      // Y el reintento del cliente cierra de verdad, una sola vez.
+      failing.mockRestore();
+
+      await expect(
+        service.closeByTechnician(remoteSessionId, technicianA),
+      ).resolves.toMatchObject({ endedBy: RemoteSessionEndedBy.TECHNICIAN });
+      expect(emitToDevice).toHaveBeenCalledTimes(1);
+    });
+
+    it('un aviso a la tablet que falla no convierte el cierre en un error', async () => {
+      const { remoteSessionId } = await seedSession();
+
+      emitToDevice.mockImplementation(() => {
+        throw new Error('transporte caido');
+      });
+
+      await expect(
+        service.closeByTechnician(remoteSessionId, technicianA),
+      ).resolves.toMatchObject({ status: RemoteSessionStatus.CLOSED });
+      expect(sessionRow(remoteSessionId).status).toBe(
+        RemoteSessionStatus.CLOSED,
       );
     });
   });
@@ -2276,7 +2595,7 @@ describe('RemoteSessionsService', () => {
       );
     });
 
-    it('no informa de un activate repetido ni de un cierre fallido', async () => {
+    it('no informa de un activate repetido ni de un cierre repetido', async () => {
       const { remoteSessionId } = await seedSession();
       await service.activateByTechnician(remoteSessionId, technicianA);
       const listener = jest.fn();
@@ -2284,9 +2603,8 @@ describe('RemoteSessionsService', () => {
 
       await service.activateByTechnician(remoteSessionId, technicianA);
       await service.closeByDevice(remoteSessionId, deviceA);
-      await expect(
-        service.closeByTechnician(remoteSessionId, technicianA),
-      ).rejects.toBeInstanceOf(ConflictException);
+      await service.closeByTechnician(remoteSessionId, technicianA);
+      await service.closeByDevice(remoteSessionId, deviceA);
 
       expect(listener).toHaveBeenCalledTimes(1);
     });

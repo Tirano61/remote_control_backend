@@ -182,10 +182,20 @@ describe('remote-session:closed hacia el tecnico (Socket.IO)', () => {
     return builder;
   };
 
-  /** Sin locks ni rollback: el cierre no los necesita para estas pruebas. */
+  /**
+   * Sin locks ni rollback: estas pruebas no hacen competir dos cierres. El
+   * `findOne` del manager (el `SELECT ... FOR UPDATE` y la relectura con
+   * relaciones del cierre) lee las mismas filas que el repositorio.
+   */
   const dataSource = {
     transaction: (runInTransaction: (manager: unknown) => Promise<unknown>) =>
-      runInTransaction({ createQueryBuilder: createUpdateBuilder }),
+      runInTransaction({
+        createQueryBuilder: createUpdateBuilder,
+        findOne: (
+          _entity: unknown,
+          options: { where: FindOptionsWhere<RemoteSession> },
+        ) => remoteSessionRepository.findOne(options),
+      }),
   };
 
   const signUserToken = (user: User): string => userJwt.sign({ id: user.id });
