@@ -64,6 +64,15 @@ CORS for Socket.IO is configured on the **server**, not per namespace, from
 development list). It matters for `remote_control_web`, which is a browser. The
 Android client is not a browser and is unaffected.
 
+### Heartbeat
+
+The Engine.IO heartbeat (PING/PONG) is also configured on the **server**, once
+for both namespaces: `pingInterval` 10 s and `pingTimeout` 10 s by default, sent
+to every client in the Engine.IO handshake. Clients configure nothing. With
+these values a connection that dies without a clean close is detected at most
+~20 s after the network drops — see
+[Heartbeat and dead-connection detection](#heartbeat-and-dead-connection-detection).
+
 ### Identity is never taken from a payload
 
 For both namespaces the identity of the connection comes **only** from the token
@@ -271,6 +280,13 @@ Presence is:
 A device may hold more than one socket at once (this happens normally during a
 reconnection, when the new socket arrives before the old one is detected as
 dead). It goes `OFFLINE` when the last one closes.
+
+A socket "closes" either immediately, when the connection is closed cleanly
+(the app disconnects, the OS tears the socket down, TCP FIN/RST arrives), or —
+when the network simply stops delivering — once the server's heartbeat gives up
+on it: between ~10 s and ~20 s after the drop with the default heartbeat. Until
+then the device still reads `ONLINE`. See
+[Heartbeat and dead-connection detection](#heartbeat-and-dead-connection-detection).
 
 Every effective transition — `OFFLINE -> ONLINE` on the first socket,
 `ONLINE -> OFFLINE` when the last one goes away — is announced to the technician
@@ -1454,6 +1470,165 @@ Points that matter for the Flutter clients:
 
 ---
 
+# Heartbeat and dead-connection detection
+
+`/devices` and `/technicians` run on **one** Socket.IO server, so they share one
+Engine.IO server and one heartbeat. The server sends a `PING` to every
+connection and expects the client's `PONG`. Both values are announced to every
+client in the Engine.IO handshake (the `OPEN` packet), whatever the namespace:
+
+```text
+0{"sid":"…","upgrades":["websocket"],"pingInterval":10000,"pingTimeout":10000,"maxPayload":1000000}
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SOCKET_IO_PING_INTERVAL_MS` | `10000` | How often the server sends a `PING` to each connection. |
+| `SOCKET_IO_PING_TIMEOUT_MS` | `10000` | How long the server waits for the `PONG` before closing the connection (`ping timeout`). |
+
+Integer milliseconds between `5000` and `60000`; an empty or missing variable
+takes its default, and an invalid value prevents the backend from starting. They
+are server settings, read once at startup — not part of any payload. Before
+this change the server used the Socket.IO defaults, `25000` / `20000`.
+
+Nothing else changes: no namespace, event, payload, ACK, error code, transport
+(`websocket` upgrade, `maxPayload`) or authentication rule. There is **no
+application-level heartbeat event**: the only liveness signal is the Engine.IO
+`PING`/`PONG`, which the client packages answer by themselves.
+
+Both client packages read the values from the handshake: `socket.io-client`
+(JS) and `socket_io_client` 3.1.6 (Dart), which `remote_control_device` and
+`remote_control_web` use. A client does not need — and should not try — to
+configure them.
+
+## How a lost connection is detected
+
+```text
+Clean close (app disconnects, OS destroys the socket, TCP FIN/RST arrives)
+    -> detected immediately (well under a second), no heartbeat involved
+
+Half-open (the network stops delivering, nobody receives FIN/RST)
+    -> detected only by the heartbeat:
+       server  PING not answered within pingTimeout       -> "ping timeout"
+       client  no PING received within pingInterval+pingTimeout -> "ping timeout"
+```
+
+On the server, the next `PING` leaves `pingInterval` after the previous `PONG`
+and is given up `pingTimeout` later. A half-open connection is therefore
+detected `(pingInterval − time since the last PING) + pingTimeout` after the
+drop:
+
+```text
+                       best case            worst case
+default (10 s / 10 s)  ~10 s                ~20 s      (drop just after a PING)
+before  (25 s / 20 s)  ~20 s                ~45 s
+```
+
+The client applies the mirror rule: it considers the connection lost when no
+`PING` arrives within `pingInterval + pingTimeout` (20 s) of the last one, so
+it also notices a half-open drop 10–20 s after it happened.
+
+* **Short drops are not disconnections.** If the network comes back before
+  `pingTimeout` has elapsed, TCP delivers the delayed `PING`/`PONG` and nothing
+  is closed: presence, participation and the session are untouched. A drop
+  between `pingTimeout` and `pingInterval + pingTimeout` may or may not
+  disconnect, depending on where in the cycle it starts. A longer drop always
+  disconnects.
+* **One-way loss is detected the same way.** If the client cannot receive, no
+  `PING` reaches it and no `PONG` comes back: both sides time out. If the client
+  can receive but cannot send, its `PONG`s are lost and the server times out
+  (≤ 20 s). The server's WebSocket close frame does reach the client, but the
+  close handshake cannot complete, so the client ends with its own
+  `ping timeout`, `pingInterval + pingTimeout` after the last `PING` it
+  received. Because that last `PING` may arrive after the drop, the client side
+  can take up to ~30 s in this case.
+* **Browsers in the background.** In Engine.IO v4 the server sends the `PING`
+  and the client only answers it, so timer throttling in a background tab does
+  not make a healthy technician console miss its `PONG`.
+
+## What detection triggers (unchanged)
+
+A heartbeat timeout is an ordinary disconnect for the backend. From that moment
+the existing rules apply, with their existing timings:
+
+```text
+dead connection detected (10–20 s after a half-open drop, immediately on a clean close)
+  -> socket removed from presence; if it was the device's last socket:
+       OFFLINE + device:presence-updated to /technicians
+  -> socket removed from session participation; if it was that side's last
+     joined socket of an ACTIVE session: the SYSTEM grace starts (60 s)
+       -> the side reconnects and sends remote-session:join in time: stays ACTIVE
+       -> it does not: CLOSED, endedBy SYSTEM, SupportRequest COMPLETED
+```
+
+The heartbeat changes **when** the grace starts, not how long it lasts.
+`REMOTE_SESSION_DISCONNECT_GRACE_MS` (60 s), `REMOTE_SESSION_CONNECTING_TTL_MS`
+(120 s) and `REMOTE_SESSION_STARTUP_RECOVERY_MS` (90 s) are unchanged. From a
+half-open drop to a `SYSTEM` close the worst case is now about 20 s + 60 s
+(it was about 45 s + 60 s).
+
+## Measured
+
+Measured with the default heartbeat on a backend started from `dist/main`, a
+disposable PostgreSQL, real `socket.io-client` sockets for both namespaces and a
+local TCP relay that withholds packets (and FIN/RST) without closing anything.
+"Detected" is when `/technicians` received `device:presence-updated`
+(`OFFLINE`); times are from the drop.
+
+| Drop | Server detected | Client detected | Session |
+|---|---|---|---|
+| Clean close (FIN/RST) | 1 ms | immediate | grace started |
+| Half-open, 0.5 s after a `PING` | 19.5 s | 19.5 s (`ping timeout`) | `ACTIVE`, rejoined after restore |
+| Half-open, 5 s after a `PING` | 15.0 s | 15.0 s | `ACTIVE`, rejoined |
+| Half-open, 9.5 s after a `PING` | 10.5 s | 10.5 s | `ACTIVE`, rejoined |
+| Client can send, cannot receive | 19.0 s | 19.0 s | `ACTIVE`, rejoined |
+| Client can receive, cannot send | 19.0 s | 29.0 s (20.0 s after its last `PING`) | `ACTIVE`, rejoined |
+| 8 s drop, at 0.5 s / 5 s / 9.5 s of the cycle | not disconnected | not disconnected | `ACTIVE`, no presence event |
+| 30 s drop | 19.0 s | — | rejoined 11 s after detection; still `ACTIVE` past detection + 60 s |
+| Three 25 s drops in a row | each detected once | — | presence `OFF,ON` ×3, one socket left, `ACTIVE` |
+| Permanent drop | 19.0 s | — | `SYSTEM` close 60.06 s after detection (79 s after the drop); `SupportRequest` `COMPLETED`; one `remote-session:closed`; a late rejoin is refused `UNAUTHORIZED` and does not reopen it |
+
+The Dart client package used by both apps (`socket_io_client` 3.1.6, `dart:io`
+transport) was checked against the same backend: it reads `10000`/`10000` from
+the handshake, receives a `PING` every 10 s, survives an 8 s drop and reports
+`ping timeout` 20 s after the last `PING` of a half-open connection.
+
+These are measurements of the backend and of the client packages, not of the
+physical tablet: the Android network stack, Doze and the app's own handling of
+`disconnect` are outside them.
+
+## Impact on the clients
+
+* **remote_control_device.** It learns about a half-open drop through its own
+  `disconnect` (`ping timeout`) after at most ~20 s instead of ~45 s (~30 s
+  when it can still receive but not send), and
+  suspends as it already does on every `disconnect`. The backend change does not
+  give the tablet any faster local detection: it does not add a local watchdog
+  and does not guarantee a suspension in less than `pingInterval + pingTimeout`
+  after the last `PING`. Reconnection, the automatic rejoin, the REST
+  reconciliation and the handling of out-of-order responses are unchanged.
+* **remote_control_web.** Same detection bound for the technician console; the
+  reconnection indicator, the automatic rejoin, the WebRTC recovery and the
+  irreversible close keep working as before. Technicians see
+  `device:presence-updated` `OFFLINE` for a tablet whose network vanished
+  10–20 s after the drop instead of up to ~45 s.
+* **Traffic.** One `PING`/`PONG` pair (a few bytes) every 10 s per connection,
+  instead of every 25 s.
+
+## Limitations
+
+* Detection is bounded by the heartbeat, not instantaneous: between ~10 s and
+  ~20 s for a half-open drop with the defaults. A drop shorter than
+  `pingTimeout` is invisible by design.
+* The values are read at startup. Changing them requires a restart, after which
+  every client reconnects and receives the new values in its handshake.
+* The lower limit (5 s) is deliberate: a shorter `pingTimeout` would disconnect
+  healthy tablets on slow mobile networks, and every disconnection starts a
+  grace period.
+* Single backend instance, like presence and participation.
+
+---
+
 # Reconnection
 
 ```text
@@ -1585,12 +1760,14 @@ backend from starting. These are server settings, not part of any payload.
 Why these defaults (they are starting values, to be confirmed by the physical
 validation):
 
-* **Grace 60 s.** With Socket.IO defaults (`pingInterval` 25 s, `pingTimeout`
-  20 s) the server notices a connection that died without a clean close up to
-  ~45 s after the network dropped; the grace starts there. The clients retry
+* **Grace 60 s.** With the server heartbeat (`pingInterval` 10 s,
+  `pingTimeout` 10 s by default) the server notices a connection that died
+  without a clean close up to ~20 s after the network dropped; the grace starts
+  there, and its length does not depend on the heartbeat. The clients retry
   with `reconnectionDelayMax` 10 s (web) and 20 s (tablet), so 60 s covers
   several reconnection attempts plus the automatic rejoin. Worst case from
-  network loss to close is therefore about 45 s + 60 s.
+  network loss to close is therefore about 20 s + 60 s (it was 45 s + 60 s with
+  the Socket.IO defaults of 25 s / 20 s used before).
 * **TTL 120 s.** Covers `remote-session:created` reaching the tablet, the user
   accepting Android's screen-capture dialog, SDP/ICE negotiation and the
   technician's `/activate`. A healthy negotiation takes seconds.
