@@ -69,15 +69,19 @@ describe('CORS configurable', () => {
       .spyOn(IoAdapter.prototype, 'createIOServer')
       .mockReturnValue({});
 
-    const adapter = new SocketIoAdapter({} as never, [
-      'https://soporte.example.com',
-    ]);
+    const adapter = new SocketIoAdapter(
+      {} as never,
+      ['https://soporte.example.com'],
+      { pingIntervalMs: 10_000, pingTimeoutMs: 10_000 },
+    );
 
     adapter.createIOServer(3000, { path: '/socket.io' } as ServerOptions);
 
     expect(created).toHaveBeenCalledWith(3000, {
       path: '/socket.io',
       cors: { origin: ['https://soporte.example.com'], credentials: true },
+      pingInterval: 10_000,
+      pingTimeout: 10_000,
     });
 
     created.mockRestore();
