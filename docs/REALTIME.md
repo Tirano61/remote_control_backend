@@ -1593,9 +1593,29 @@ transport) was checked against the same backend: it reads `10000`/`10000` from
 the handshake, receives a `PING` every 10 s, survives an 8 s drop and reports
 `ping timeout` 20 s after the last `PING` of a half-open connection.
 
-These are measurements of the backend and of the client packages, not of the
-physical tablet: the Android network stack, Doze and the app's own handling of
-`disconnect` are outside them.
+### On the physical tablet
+
+T10A with `remote_control_device` `main` (ecc3b53) installed as a separate
+test package with its own enrollment (the tablet's regular installation and
+credential were not touched), `remote_control_web` `main` (f88e9d3) in Chrome,
+the backend above with a disposable PostgreSQL. The tablet reached the backend
+over the LAN through a relay that withholds packets without closing anything;
+WebRTC did not go through it. Times from the drop, and from the last `PING`
+the tablet received.
+
+| Drop | Tablet `disconnect`, authority suspended, video gate closed | Backend `OFFLINE` | After restore |
+|---|---|---|---|
+| Half-open 15 s, 7.0 s after a `PING` | 13.0 s (20.0 s after the `PING`), same millisecond | 13.0 s | reconnected +0.03 s, REST confirmation +0.08 s, gate reopened, same session, WebRTC never dropped |
+| Half-open 25 s, 1.0 s after a `PING` | 19.0 s (20.0 s after the `PING`) | 19.0 s | same as above, +0.1 s |
+| Wi-Fi off 5 s (`svc wifi`) | 0.3 s (Android closes the socket) | 9.8 s (reset when the network returned, before the heartbeat) | reconnected 12.0 s, confirmed 12.1 s; peer failed, recovery offer at 15.8 s reused the same MediaProjection (no new consent); video back at 16.8 s |
+| Permanent | 19.0 s (20.0 s after the `PING`) | 19.0 s | `SYSTEM` close 60.0 s after the backend's detection (79.0 s after the drop); the tablet, still offline, ended at its own 75 s limit (94.0 s) and stopped the capture; on reconnection `/current` confirmed the session gone, no rejoin |
+
+Video and control (tap) were verified before and after every recoverable drop,
+and a new assistance after the `SYSTEM` close needed, as expected, a new
+consent and a new capture.
+
+The Android network stack, Doze and long-term behaviour of real mobile
+networks are outside these runs.
 
 ## Impact on the clients
 
