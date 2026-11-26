@@ -14,9 +14,10 @@
  * Por que esos valores (ver tambien docs/REALTIME.md):
  *
  * - GRACIA 60 s. El servidor detecta una conexion muerta sin cierre limpio con
- *   los valores por defecto de Socket.IO (`pingInterval` 25 s +
- *   `pingTimeout` 20 s), es decir, hasta ~45 s DESPUES de que se cayo la red; la
- *   gracia empieza a contar ahi. Los clientes reintentan con
+ *   el heartbeat de Engine.IO (`socket-io-heartbeat.config.ts`: `pingInterval`
+ *   10 s + `pingTimeout` 10 s por defecto), es decir, hasta ~20 s DESPUES de que
+ *   se cayo la red; la gracia empieza a contar ahi y no depende del heartbeat:
+ *   acortarlo adelanta la deteccion, no la acorta. Los clientes reintentan con
  *   `reconnectionDelayMax` de 10 s (web) y 20 s (tablet), asi que 60 s cubren
  *   varios intentos de reconexion y el `remote-session:join` posterior, que ambos
  *   clientes envian solos al reconectar.
