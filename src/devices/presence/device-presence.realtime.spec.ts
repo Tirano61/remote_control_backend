@@ -1,4 +1,6 @@
 import { INestApplication, Logger, ValidationPipe } from '@nestjs/common';
+import { RemoteSessionsService } from '../../remote-sessions/remote-sessions.service';
+import { IdentityRevocationService } from '../../revocation/identity-revocation.service';
 import { ConfigService } from '@nestjs/config';
 import { JwtModule, JwtService } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
@@ -350,6 +352,7 @@ describe('device:presence-updated de punta a punta (Socket.IO + REST)', () => {
       ],
       controllers: [DevicesController, SupportRequestsController],
       providers: [
+        IdentityRevocationService,
         DevicesGateway,
         TechniciansGateway,
         DevicePresenceService,
@@ -398,6 +401,15 @@ describe('device:presence-updated de punta a punta (Socket.IO + REST)', () => {
             supportRequestRepository as unknown as Repository<SupportRequest>,
         },
         { provide: DataSource, useValue: dataSource },
+        // Desactivar cierra las sesiones vivas en la misma transaccion; aqui no
+        // hay ninguna (eso se prueba contra PostgreSQL en test/revocation).
+        {
+          provide: RemoteSessionsService,
+          useValue: {
+            closeLiveSessionsWithin: () => Promise.resolve([]),
+            announceSystemClosures: () => undefined,
+          },
+        },
       ],
     }).compile();
 
@@ -439,6 +451,19 @@ describe('device:presence-updated de punta a punta (Socket.IO + REST)', () => {
     };
     supportRequests = [];
     dataSource.transaction.mockReset();
+    // Por defecto, la transaccion de `PATCH /devices/:id` sobre el almacen en
+    // memoria. El re-enrolamiento la sustituye por su resultado ya confirmado.
+    dataSource.transaction.mockImplementation(
+      (run: (manager: unknown) => Promise<unknown>) =>
+        run({
+          findOne: (_entity: unknown, { where }: { where: { id: string } }) =>
+            deviceRepository.findOneBy(where),
+          merge: (_entity: unknown, target: Device, changes: object) =>
+            Object.assign(target, changes),
+          save: (_entity: unknown, updated: Device) =>
+            deviceRepository.save(updated),
+        }),
+    );
   });
 
   afterEach(async () => {

@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import { IdentityRevocationService } from '../../revocation/identity-revocation.service';
 import { TechnicianRealtimeService } from '../../signaling/realtime/technician-realtime.service';
 import {
   DEVICE_PRESENCE_UPDATED_EVENT,
@@ -59,9 +60,12 @@ describe('DevicePresenceService', () => {
       },
     );
 
-    presence = new DevicePresenceService({
-      emitToAllTechnicians,
-    } as unknown as TechnicianRealtimeService);
+    presence = new DevicePresenceService(
+      {
+        emitToAllTechnicians,
+      } as unknown as TechnicianRealtimeService,
+      new IdentityRevocationService(),
+    );
 
     jest.spyOn(Logger.prototype, 'log').mockImplementation(() => undefined);
     logError = jest

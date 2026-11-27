@@ -1,4 +1,5 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
+import { IdentityRevocationService } from '../../src/revocation/identity-revocation.service';
 import { ConfigService } from '@nestjs/config';
 import { JwtModule, JwtService } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
@@ -213,6 +214,9 @@ export const startRealtimeHeartbeatHarness = async (
       entity: unknown,
       { where, relations }: { where: Where; relations?: object },
     ) => {
+      // La creacion bloquea el dispositivo (FOR SHARE) y comprueba isActive.
+      if (entity === Device) return Promise.resolve(device);
+
       const row = rowsOf(entity).find((candidate) => matches(candidate, where));
 
       if (!row) return Promise.resolve(null);
@@ -278,6 +282,7 @@ export const startRealtimeHeartbeatHarness = async (
     ],
     controllers: [RemoteSessionsController, DeviceRemoteSessionsController],
     providers: [
+      IdentityRevocationService,
       DevicesGateway,
       TechniciansGateway,
       SignalingService,

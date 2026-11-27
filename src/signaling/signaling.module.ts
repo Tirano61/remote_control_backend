@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AuthModule } from '../auth/auth.module';
 import { RemoteSession } from '../remote-sessions/entities/remote-session.entity';
+import { IdentityRevocationModule } from '../revocation/identity-revocation.module';
 import { TechniciansGateway } from './gateway/technicians.gateway';
 import { SessionParticipationModule } from './participation/session-participation.module';
 import { SignalingRealtimeService } from './realtime/signaling-realtime.service';
@@ -39,6 +40,9 @@ import { SignalingService } from './signaling.service';
     // los joins validados y las desconexiones. Lo lee el cierre automatico de
     // `RemoteSessionsModule`, que importa el mismo modulo sin depender de este.
     SessionParticipationModule,
+    // Barrera de revocacion: el gateway de tecnicos la consulta en el handshake
+    // y en cada mensaje, y cierra los sockets de un tecnico revocado.
+    IdentityRevocationModule,
   ],
   exports: [SignalingService, SignalingRealtimeService],
 })

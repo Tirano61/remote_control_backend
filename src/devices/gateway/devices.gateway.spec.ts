@@ -1,4 +1,7 @@
 import { INestApplication } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+import { RemoteSessionsService } from '../../remote-sessions/remote-sessions.service';
+import { IdentityRevocationService } from '../../revocation/identity-revocation.service';
 import { JwtModule, JwtService } from '@nestjs/jwt';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
@@ -155,6 +158,7 @@ describe('DevicesGateway (Socket.IO)', () => {
         }),
       ],
       providers: [
+        IdentityRevocationService,
         DevicesGateway,
         DevicePresenceService,
         DeviceRealtimeService,
@@ -174,6 +178,33 @@ describe('DevicesGateway (Socket.IO)', () => {
         {
           provide: getRepositoryToken(RemoteSession),
           useValue: { findOne: () => Promise.resolve(null) },
+        },
+        // Desactivar cierra las sesiones vivas en la misma transaccion; aqui no
+        // hay ninguna (eso se prueba contra PostgreSQL en test/revocation).
+        {
+          provide: RemoteSessionsService,
+          useValue: {
+            closeLiveSessionsWithin: () => Promise.resolve([]),
+            announceSystemClosures: () => undefined,
+          },
+        },
+        // La transaccion de `DevicesService.update` sobre el mismo almacen en
+        // memoria: bloquear la fila no tiene sentido sin PostgreSQL.
+        {
+          provide: DataSource,
+          useValue: {
+            transaction: (run: (manager: unknown) => Promise<unknown>) =>
+              run({
+                findOne: (
+                  _entity: unknown,
+                  { where }: { where: { id: string } },
+                ) => deviceRepository.findOneBy(where),
+                merge: (_entity: unknown, target: Device, changes: object) =>
+                  Object.assign(target, changes),
+                save: (_entity: unknown, updated: Device) =>
+                  deviceRepository.save(updated),
+              }),
+          },
         },
         { provide: getRepositoryToken(Device), useValue: deviceRepository },
         {

@@ -35,6 +35,15 @@ export interface AuthenticatedDevice {
   credentialId: string;
 }
 
+/** Resultado de revalidar la identidad de un socket ya autenticado. */
+export enum DeviceAuthorizationStatus {
+  AUTHORIZED = 'AUTHORIZED',
+  /** Dispositivo inexistente o administrativamente inactivo. */
+  DEVICE_REVOKED = 'DEVICE_REVOKED',
+  /** Dispositivo activo, pero la credencial del socket ya no es la vigente. */
+  CREDENTIAL_REVOKED = 'CREDENTIAL_REVOKED',
+}
+
 /**
  * Autenticacion propia del dispositivo.
  *
@@ -177,6 +186,37 @@ export class DeviceAuthService {
       throw new UnauthorizedException('Token not valid');
 
     return { device, credentialId: credential.id };
+  }
+
+  /**
+   * Vuelve a comprobar, contra PostgreSQL, la identidad de un socket ya
+   * autenticado: el mismo criterio que `authorizePayload`, sin el token.
+   *
+   * Lo usa el signaling en cada `remote-session:join` y `webrtc:*`. Distingue
+   * dos rechazos porque piden reacciones distintas:
+   *
+   * - `DEVICE_REVOKED`: el dispositivo ya no existe o esta inactivo. Toda la
+   *   identidad perdio la autorizacion.
+   * - `CREDENTIAL_REVOKED`: el dispositivo sigue activo pero esa credencial ya
+   *   no es la vigente (re-enrolamiento). Solo pierde el acceso quien la usa; el
+   *   dispositivo puede tener otro socket legitimo con la credencial nueva.
+   *
+   * Un fallo de la base de datos no se captura: sale tal cual y nunca se
+   * confunde con un rechazo.
+   */
+  async checkAuthorization(
+    deviceId: string,
+    credentialId: string,
+  ): Promise<DeviceAuthorizationStatus> {
+    const device = await this.deviceRepository.findOneBy({ id: deviceId });
+
+    if (!device?.isActive) return DeviceAuthorizationStatus.DEVICE_REVOKED;
+
+    const credential = await this.findActiveCredential(device.id);
+
+    return credential?.id === credentialId
+      ? DeviceAuthorizationStatus.AUTHORIZED
+      : DeviceAuthorizationStatus.CREDENTIAL_REVOKED;
   }
 
   /** Informacion minima del dispositivo autenticado. */

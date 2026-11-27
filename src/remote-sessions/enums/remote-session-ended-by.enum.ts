@@ -18,6 +18,9 @@ export enum RemoteSessionEndedBy {
    * - un participante de una sesion `ACTIVE` falto mas que el periodo de gracia;
    * - tras un reinicio, nadie recupero la sesion dentro de la ventana de
    *   recuperacion.
+   * - uno de sus participantes perdio la autorizacion: el dispositivo se
+   *   desactivo o se re-enrolo (en la misma transaccion), o una revalidacion
+   *   encontro al tecnico o al dispositivo inactivo.
    */
   SYSTEM = 'SYSTEM',
 }

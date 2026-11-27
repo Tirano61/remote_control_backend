@@ -99,14 +99,23 @@ export class SignalingService {
 
     await this.leaveCurrentSession(socket, identity);
 
-    const remoteSession = await this.findJoinableSession(
-      dto.remoteSessionId,
-      identity,
-    );
+    // Una identidad ya revocada ni siquiera consulta la base de datos.
+    if (!identity.isCurrent())
+      return joinRejected(SignalingErrorCode.UNAUTHORIZED);
+
+    // La sesion y la identidad se leen de PostgreSQL en cada join: que el
+    // handshake fuera valido no dice si el dispositivo sigue activo, su
+    // credencial vigente o el tecnico habilitado AHORA.
+    const [remoteSession, identityAuthorized] = await Promise.all([
+      this.findJoinableSession(dto.remoteSessionId, identity),
+      identity.revalidate(),
+    ]);
 
     // Mismo criterio que en REST: una sesion ajena, inexistente o cerrada
     // responde igual. Conocer el UUID no autoriza nada ni confirma que exista.
-    if (!remoteSession) return joinRejected(SignalingErrorCode.UNAUTHORIZED);
+    // Una identidad revocada responde exactamente lo mismo.
+    if (!remoteSession || !identityAuthorized)
+      return joinRejected(SignalingErrorCode.UNAUTHORIZED);
 
     // Antes de entrar: si ya habia otro socket de ESTE mismo extremo en la room,
     // el otro lado ya fue avisado en su momento y no hace falta repetirselo. Es
@@ -122,7 +131,12 @@ export class SignalingService {
     // Si el socket se desconecto durante los `await` anteriores, su
     // `handleDisconnect` ya corrio sin sesion que dar de baja: registrarlo ahora
     // dejaria un participante fantasma que mantendria viva la sesion.
-    if (socket.disconnected) {
+    //
+    // Y si su identidad se revoco durante esos `await`, las lecturas de arriba
+    // son anteriores a la revocacion y ya no valen: no se concede la entrada.
+    // Entre esta comprobacion y el registro de la participacion no hay ningun
+    // `await`.
+    if (socket.disconnected || !identity.isCurrent()) {
       await socket.leave(remoteSessionRoom(remoteSession.id));
       return joinRejected(SignalingErrorCode.UNAUTHORIZED);
     }
@@ -145,6 +159,21 @@ export class SignalingService {
         peerOf(identity.participant),
         remoteSession.id,
       );
+
+    // Revocado (o desconectado, o cambiado de sesion) mientras se consultaba al
+    // peer: ni se le anuncia nada ni se confirma el join. Si el barrido ya cerro
+    // el socket, `handleDisconnect` dio de baja la participacion; si no, se da
+    // de baja aqui.
+    if (
+      socket.disconnected ||
+      !identity.isCurrent() ||
+      socket.data.remoteSessionId !== remoteSession.id
+    ) {
+      if (socket.data.remoteSessionId === remoteSession.id)
+        await this.leaveCurrentSession(socket, identity);
+
+      return joinRejected(SignalingErrorCode.UNAUTHORIZED);
+    }
 
     if (peerJoined && !ownSideWasPresent)
       this.announceToPeer(identity, remoteSession.id);
@@ -201,6 +230,7 @@ export class SignalingService {
     };
 
     return this.emitToPeer(
+      socket,
       identity,
       dto.remoteSessionId,
       WEBRTC_ICE_CANDIDATE_EVENT,
@@ -283,16 +313,28 @@ export class SignalingService {
       sdp: dto.sdp,
     };
 
-    return this.emitToPeer(identity, dto.remoteSessionId, event, relayed);
+    return this.emitToPeer(
+      socket,
+      identity,
+      dto.remoteSessionId,
+      event,
+      relayed,
+    );
   }
 
   /**
    * Revalidacion por evento.
    *
    * No basta con que el `remote-session:join` fuera valido hace unos minutos: la
-   * sesion pudo cerrarse desde entonces. Cada mensaje comprueba de nuevo que el
-   * socket esta unido a ESA sesion y que la sesion sigue viva y siendo suya, de
-   * modo que un `CLOSED` corta el signaling de inmediato.
+   * sesion pudo cerrarse desde entonces, y la identidad del socket pudo perder
+   * la autorizacion (dispositivo desactivado o re-enrolado, tecnico
+   * deshabilitado). Cada mensaje comprueba de nuevo que el socket esta unido a
+   * ESA sesion, que la sesion sigue viva y siendo suya, y que su identidad sigue
+   * autorizada en PostgreSQL, de modo que un `CLOSED` o una revocacion cortan el
+   * signaling de inmediato.
+   *
+   * Pertenecer a la room no autoriza nada por si solo: un socket que sigue en
+   * ella porque se unio antes de una revocacion no pasa de aqui.
    */
   private async authorizeRelay(
     socket: SignalingSocket,
@@ -305,12 +347,39 @@ export class SignalingService {
     if (socket.data.remoteSessionId !== remoteSessionId)
       return SignalingErrorCode.NOT_JOINED;
 
-    const remoteSession = await this.findJoinableSession(
-      remoteSessionId,
-      identity,
-    );
+    if (!identity.isCurrent()) return SignalingErrorCode.UNAUTHORIZED;
 
-    return remoteSession ? null : SignalingErrorCode.UNAUTHORIZED;
+    const [remoteSession, identityAuthorized] = await Promise.all([
+      this.findJoinableSession(remoteSessionId, identity),
+      identity.revalidate(),
+    ]);
+
+    return remoteSession && identityAuthorized
+      ? null
+      : SignalingErrorCode.UNAUTHORIZED;
+  }
+
+  /**
+   * Ultima comprobacion antes de un efecto, SIN I/O.
+   *
+   * Las lecturas de `authorizeRelay` pudieron hacerse antes de una revocacion
+   * que confirmo mientras se esperaban. Esta comprobacion es sincrona y va
+   * justo antes de emitir, sin ningun `await` entre medias: si la revocacion
+   * llego, la barrera ya esta levantada y el mensaje no sale.
+   */
+  private stillAuthorized(
+    socket: SignalingSocket,
+    identity: SignalingIdentity,
+    remoteSessionId: string,
+  ): SignalingErrorCode | null {
+    if (socket.disconnected || !identity.isCurrent())
+      return SignalingErrorCode.UNAUTHORIZED;
+
+    // Cambio de sesion en el mismo socket mientras se revalidaba.
+    if (socket.data.remoteSessionId !== remoteSessionId)
+      return SignalingErrorCode.NOT_JOINED;
+
+    return null;
   }
 
   /**
@@ -375,13 +444,21 @@ export class SignalingService {
    *
    * Nunca hay broadcast: el destino es la room de esa sesion y nada mas. Como el
    * emisor esta en el namespace contrario, tampoco recibe su propio mensaje.
+   *
+   * Lo primero, y sin ningun `await` antes de emitir, es `stillAuthorized`: una
+   * revocacion confirmada mientras se revalidaba impide el envio.
    */
   private emitToPeer(
+    socket: SignalingSocket,
     identity: SignalingIdentity,
     remoteSessionId: string,
     event: string,
     payload: WebrtcSdpPayload | WebrtcIceCandidatePayload,
   ): SignalingRelayAck {
+    const refusal = this.stillAuthorized(socket, identity, remoteSessionId);
+
+    if (refusal) return relayRejected(refusal);
+
     const delivered = this.signalingRealtimeService.emitToParticipantSession(
       peerOf(identity.participant),
       remoteSessionId,

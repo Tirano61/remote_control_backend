@@ -12,6 +12,10 @@ import {
   type RemoteSessionLifecycleConfig,
 } from '../../config/remote-session-lifecycle.config';
 import {
+  IdentityRevocationService,
+  RevocableIdentityKind,
+} from '../../revocation/identity-revocation.service';
+import {
   SessionParticipationChange,
   SessionParticipationEvent,
   SessionParticipationService,
@@ -19,6 +23,7 @@ import {
 import { RemoteSessionStatus } from '../enums/remote-session-status.enum';
 import {
   RemoteSessionLifecycleSnapshot,
+  RemoteSessionParticipant,
   RemoteSessionsService,
 } from '../remote-sessions.service';
 import { ExpiryDeadline, nextExpiry } from './remote-session-expiry.policy';
@@ -47,6 +52,8 @@ const iso = (at: number): string => new Date(at).toISOString();
  * - al crear una sesion: su TTL de CONNECTING;
  * - al activarla o cerrarla: se recalcula o se olvida;
  * - cuando el ULTIMO socket de un extremo deja la sesion: su gracia;
+ * - cuando se revoca la identidad de un participante
+ *   (`IdentityRevocationService`): cierre inmediato de sus sesiones vivas;
  * - si una evaluacion falla (por ejemplo, PostgreSQL no responde): reintento.
  *
  * Todas las sesiones nacen en `RemoteSessionsService.create`, asi que no hay
@@ -80,6 +87,7 @@ export class RemoteSessionLifecycleService
     private readonly sessionParticipationService: SessionParticipationService,
     @Inject(REMOTE_SESSION_LIFECYCLE_CONFIG)
     private readonly config: RemoteSessionLifecycleConfig,
+    private readonly identityRevocationService: IdentityRevocationService,
   ) {}
 
   onModuleInit(): void {
@@ -89,6 +97,9 @@ export class RemoteSessionLifecycleService
       ),
       this.remoteSessionsService.onSessionChanged((session) =>
         this.onSessionChanged(session),
+      ),
+      this.identityRevocationService.subscribe((kind, id) =>
+        this.onIdentityRevoked(kind, id),
       ),
     );
   }
@@ -266,6 +277,58 @@ export class RemoteSessionLifecycleService
       this.logger.log(
         `${participant} recovered participation in remote session ${remoteSessionId} (episode ${episode})`,
       );
+  }
+
+  /**
+   * Una identidad perdio la autorizacion: sus sesiones vivas terminan YA, sin
+   * esperar a ninguna gracia.
+   *
+   * Cuando la revocacion la hizo una operacion del backend (desactivar o
+   * re-enrolar un dispositivo), las sesiones ya se cerraron dentro de su misma
+   * transaccion y aqui no se encuentra ninguna viva: no se escribe nada. Lo que
+   * cubre este camino es la revocacion DETECTADA al revalidar (un tecnico o un
+   * dispositivo desactivado por fuera del backend), donde no habia transaccion.
+   *
+   * Si PostgreSQL falla se reintenta. Mientras tanto la sesion no da acceso a
+   * nadie: los sockets de la identidad ya se cerraron y el signaling la
+   * revalida en cada mensaje; y si nunca llegara a cerrarse por aqui, la
+   * ausencia del participante la cerraria al vencer su gracia.
+   */
+  private onIdentityRevoked(kind: RevocableIdentityKind, id: string): void {
+    const owner: RemoteSessionParticipant =
+      kind === RevocableIdentityKind.DEVICE
+        ? { deviceId: id }
+        : { technicianId: id };
+
+    void this.closeSessionsOfRevoked(kind, owner);
+  }
+
+  private async closeSessionsOfRevoked(
+    kind: RevocableIdentityKind,
+    owner: RemoteSessionParticipant,
+  ): Promise<void> {
+    if (this.destroyed) return;
+
+    try {
+      const closed =
+        await this.remoteSessionsService.closeLiveSessionsOf(owner);
+
+      for (const session of closed)
+        this.logger.warn(
+          `Remote session ${session.id} closed by SYSTEM: ${kind.toLowerCase()} access revoked; device ${session.deviceId}, technician ${session.technicianId}`,
+        );
+    } catch (error) {
+      this.logger.error(
+        `Could not close the live remote sessions of a revoked ${kind.toLowerCase()}; retrying in ${REMOTE_SESSION_EVALUATION_RETRY_MS} ms`,
+        error instanceof Error ? error.stack : undefined,
+      );
+
+      const handle = setTimeout(
+        () => void this.closeSessionsOfRevoked(kind, owner),
+        REMOTE_SESSION_EVALUATION_RETRY_MS,
+      );
+      handle.unref?.();
+    }
   }
 
   private onSessionChanged(session: RemoteSessionLifecycleSnapshot): void {

@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { IdentityRevocationModule } from '../../revocation/identity-revocation.module';
 import { TechnicianRealtimeModule } from '../../signaling/realtime/technician-realtime.module';
 import { DevicePresenceService } from './device-presence.service';
 
@@ -12,9 +13,12 @@ import { DevicePresenceService } from './device-presence.service';
  * Su unica dependencia es `TechnicianRealtimeModule`, la salida de eventos hacia
  * los tecnicos (`device:presence-updated`). Ese modulo no tiene dependencias, asi
  * que no aparece ningun ciclo con `DevicesGateway` ni con `TechniciansGateway`.
+ *
+ * `IdentityRevocationModule` (tampoco tiene dependencias) aporta la barrera de
+ * revocacion: la presencia cierra los sockets de un dispositivo revocado.
  */
 @Module({
-  imports: [TechnicianRealtimeModule],
+  imports: [TechnicianRealtimeModule, IdentityRevocationModule],
   providers: [DevicePresenceService],
   exports: [DevicePresenceService],
 })

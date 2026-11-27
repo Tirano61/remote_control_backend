@@ -1,4 +1,5 @@
 import { ConflictException, INestApplication } from '@nestjs/common';
+import { IdentityRevocationService } from '../revocation/identity-revocation.service';
 import { JwtModule, JwtService } from '@nestjs/jwt';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
@@ -281,6 +282,7 @@ describe('remote-session:active (Socket.IO)', () => {
         }),
       ],
       providers: [
+        IdentityRevocationService,
         DevicesGateway,
         TechniciansGateway,
         RemoteSessionsService,

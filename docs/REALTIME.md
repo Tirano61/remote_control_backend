@@ -101,7 +101,10 @@ The token is the one returned by `POST /device-auth/login`. Only
 
 The checks applied are the same ones `@DeviceAuth()` applies over HTTP: signature
 and expiry, `tokenType: "device"`, the device exists and is `isActive`, and the
-credential referenced by the token is still the active one for that device.
+credential referenced by the token is still the active one for that device. On
+top of that, a handshake whose device was revoked **while those checks were
+running** (deactivated or re-enrolled) is refused with `DEVICE_AUTH_UNAUTHORIZED`
+even though its reads said "active"; see [Revocation](#revocation).
 
 On success the socket is joined by the server to the device's private room and
 receives `device:connected`.
@@ -302,17 +305,37 @@ The backend closes a device's sockets immediately when its authorization is
 withdrawn, instead of waiting for the Device JWT to expire:
 
 ```text
-PATCH /devices/:id  with isActive: false      -> all sockets of that device closed
-POST  /device-enrollment/activate (success)   -> all sockets of that device closed
+PATCH /devices/:id  with isActive: false      -> live sessions closed (SYSTEM), all sockets closed
+POST  /device-enrollment/activate (success)   -> live sessions closed (SYSTEM), all sockets closed
 ```
 
 The second case is a re-enrollment: the previous credential is revoked, so the
 sockets authenticated with it are no longer authorized. The tablet reconnects
 with the Device JWT obtained from its new `deviceSecret`.
 
+Before its sockets are closed, the device receives `remote-session:closed`
+(`endedBy: "SYSTEM"`) for the session that was live, if any. The technician
+receives the same event.
+
+Closing the sockets is **not** the only protection: a handshake or a signaling
+message that was already in flight is refused as well. See
+[Revocation](#revocation).
+
 If the device had at least one socket, closing them is an `ONLINE -> OFFLINE`
 transition and the technicians receive exactly one `device:presence-updated`,
 however many sockets were closed. If it had none, nothing is emitted.
+
+What the tablet observes, depending on where its connection was:
+
+```text
+connected (with or without a joined session)   disconnect, reason "io server disconnect"
+handshake in flight                            connect_error, data.code DEVICE_AUTH_UNAUTHORIZED
+CONNECT received, server still registering it  disconnect, reason "io server disconnect"
+                                               (no device:connected is ever sent)
+reconnecting afterwards with the same JWT      connect_error, data.code DEVICE_AUTH_UNAUTHORIZED
+```
+
+All of them are the existing contract: no new event, code or field.
 
 ## Events received by remote_control_device
 
@@ -562,7 +585,9 @@ The checks are:
 
 1. the same ones the HTTP strategy applies — signature and expiry, the user
    exists, and the user is `isActive`. An inactive user is rejected;
-2. the user holds at least one of the namespace roles, read from the freshly
+2. the user was not revoked while those checks were running (see
+   [Revocation](#revocation));
+3. the user holds at least one of the namespace roles, read from the freshly
    loaded user record and not from the token:
 
 ```text
@@ -642,28 +667,57 @@ authenticated user, so an `admin` who is not the assigned technician is rejected
 with `UNAUTHORIZED`, exactly like any other user. There is no supervision or
 takeover mode.
 
-## Known limitation — role and isActive are checked at connect time
+## Technician deactivation
 
-Roles and `isActive` are verified when the socket is opened. If a technician's
-access is withdrawn afterwards, the already-open socket stays open until it
-disconnects on its own. What still protects the system in the meantime:
+Roles and `isActive` are verified when the socket is opened **and again, against
+PostgreSQL, on every `remote-session:join` and every `webrtc:*` message**.
 
-* their HTTP requests stop working immediately;
-* closing the `RemoteSession` cuts their signaling immediately, because every
-  `webrtc:*` message re-validates the session.
+When that re-validation finds the user inactive, deleted, or without the
+`admin`/`tecnico` role, the backend revokes the technician:
 
-Force-closing a technician's sockets would require a technician presence
-registry, which does not exist today. The handshake rooms used to deliver
-`device:presence-updated`, `support-request:queue-updated`,
-`support-request:updated`, `remote-session:active` and `remote-session:closed`
-are not one: they address
-sockets, they do not track who is connected, and nothing reads them back.
+* the message is refused with `UNAUTHORIZED`;
+* **every** socket of that user on `/technicians` is closed (reason
+  `io server disconnect`), not only the one that sent the message;
+* their live remote session, if any, is closed with `endedBy: "SYSTEM"` and
+  its support request becomes `COMPLETED`; the tablet receives
+  `remote-session:closed`;
+* a join or a message of another tab that was in flight is refused too;
+* a new handshake answers `Unauthorized`, and their REST calls answer `401`.
 
-A consequence for the queue: a socket whose user lost the `admin`/`tecnico` role
-after connecting keeps receiving `support-request:queue-updated` and
-`device:presence-updated` until it disconnects. Those events carry only an id;
-reading the queue or the devices still requires `GET /support-requests` or
-`GET /devices`, which reject that user immediately.
+**Scope today.** The backend has no operation that deactivates a user or
+changes its roles: no endpoint and no script (`bootstrap:admin` and
+`reset:admin-password` never touch `isActive` or roles). A technician can only be
+deactivated outside the backend (directly in PostgreSQL), so nothing tells the
+backend at that moment. The revocation happens **at the technician's next
+realtime operation** that reads PostgreSQL after the change. Until then:
+
+* REST is already refused (`401`);
+* the open socket stays connected and keeps receiving the events of
+  `technicians:all` and of its personal room (`support-request:queue-updated`,
+  `device:presence-updated`, `support-request:updated`,
+  `remote-session:active`, `remote-session:closed`). They carry only ids;
+  reading anything behind them requires REST, which is refused;
+* their remote session stays as it is until that operation, until the tablet
+  ends it, or until the automatic close applies.
+
+Closing that gap requires a formal deactivation operation. Proposed contract, not
+implemented:
+
+```text
+PATCH /auth/users/:id      @Auth(ValidRoles.admin)
+body  { "isActive": false }            only field accepted
+
+In one transaction: users.isActive = false, and close with endedBy SYSTEM the
+live remote session whose technicianId is that user (session CLOSED +
+support request COMPLETED). After the commit: remote-session:closed to both
+sides, then revoke the technician in the realtime layer (same mechanism the
+re-validation already uses), which closes all their sockets and refuses any
+in-flight handshake, join or signaling message.
+200 when done; 404 unknown user; 409 when an admin tries to deactivate itself.
+```
+
+With it, a technician deactivation would be confirmed exactly like a device
+deactivation (see [Revocation](#revocation)).
 
 ## Events received by remote_control_web
 
@@ -1366,10 +1420,28 @@ time:
 1. the session id in the payload must equal the session stored on the socket by
    a previous successful `remote-session:join` → otherwise `NOT_JOINED`;
 2. the session must still exist, still be live (`CONNECTING` / `ACTIVE`), and
-   still belong to the caller → otherwise `UNAUTHORIZED`.
+   still belong to the caller → otherwise `UNAUTHORIZED`;
+3. the identity of the socket must still be authorized in PostgreSQL → otherwise
+   `UNAUTHORIZED`:
+   * a tablet: the device exists, is `isActive`, and the credential the socket
+     authenticated with is still the device's current one;
+   * a technician: the user exists, is `isActive` and still has the `admin` or
+     `tecnico` role;
+4. the identity must not have been revoked while 2 and 3 were being read, and
+   the socket must still be connected and joined to that session → otherwise
+   `UNAUTHORIZED` (or `NOT_JOINED` if it switched sessions meanwhile). This last
+   check happens right before the message is handed over, with nothing in
+   between.
 
-So closing a `RemoteSession` over REST cuts signaling immediately: subsequent
-messages start answering `UNAUTHORIZED` without any extra step.
+`remote-session:join` applies 2, 3 and 4 as well.
+
+Being in the session room is never enough by itself. So closing a
+`RemoteSession` over REST, or revoking a device or a technician, cuts signaling
+immediately: subsequent messages start answering `UNAUTHORIZED` without any
+extra step.
+
+If PostgreSQL cannot be reached during the re-validation, the message is not
+relayed and no revocation is assumed.
 
 ## Signaling error codes
 
@@ -1383,9 +1455,13 @@ NOT_JOINED       The socket has not joined that RemoteSession, or it is joined
                  Fix: send remote-session:join first.
 
 UNAUTHORIZED     The session does not exist, is CLOSED, or belongs to another
-                 device/technician. The three cases are indistinguishable on
-                 purpose. Also returned if the socket somehow carries no
-                 identity.
+                 device/technician; or the identity of the socket is no longer
+                 authorized (device deactivated or re-enrolled, technician
+                 inactive or without a technician role). The cases are
+                 indistinguishable on purpose. Also returned if the socket
+                 somehow carries no identity. After a revocation the socket is
+                 usually closed by the server as well, so the ACK may never
+                 arrive: the client sees "io server disconnect" instead.
 
 UNAVAILABLE      The destination namespace is not registered in the server yet,
                  so the message could not be handed over. A transient
@@ -1397,6 +1473,185 @@ These codes are the stable part of the contract — clients must branch on
 
 Handlers always answer their ACK, including on rejection: a client waiting on an
 acknowledgement never hangs.
+
+---
+
+# Revocation
+
+What happens when the backend withdraws the authorization of an identity that
+may be connected: a **device** (`PATCH /devices/:id` with `isActive: false`, or
+a re-enrollment through `POST /device-enrollment/activate`) or a **technician**
+(found inactive or without a technician role by the re-validation; see
+[Technician deactivation](#technician-deactivation)).
+
+## The property
+
+> Once the backend has confirmed a revocation, that identity cannot start or
+> continue any authorized operation: no handshake completes, no socket remains
+> authorized, no `remote-session:join` succeeds, no `webrtc:*` message is
+> relayed, and no remote session of it stays `CONNECTING` or `ACTIVE`.
+
+This holds for simultaneous handshakes, joins and signaling messages that were
+already in flight, several sockets of the same identity, retries and
+reconnections. It does not rely on the client honouring a `disconnect`.
+
+## When a revocation is confirmed
+
+For a device:
+
+```text
+1. transaction  lock the device row (FOR NO KEY UPDATE)
+                write isActive = false  /  revoke credential + issue new one
+                close its live sessions: CLOSED + endedBy SYSTEM,
+                support request COMPLETED
+2. commit
+3. same tick    remote-session:closed to both sides of each closed session
+                raise the revocation barrier for that device
+                close every registered socket of the device
+4. 200          the HTTP response
+```
+
+The revocation is **confirmed when step 3 ends**, before the response. If the
+transaction fails (step 1 or 2), nothing happened: the device keeps its state,
+its sessions stay live, no socket is closed and no barrier is raised; the
+request answers `500` and can be retried.
+
+For a technician (today, only through the re-validation): the change is already
+committed in PostgreSQL by whoever made it; the backend raises the barrier and
+closes every socket of the user at once, then closes their live session in its
+own transaction (retried every 15 s if PostgreSQL fails; meanwhile the session
+grants nothing to anybody, and the absence of the technician would close it at
+the end of the grace period anyway).
+
+## Why closing the sockets was not enough (audit C1)
+
+Authenticating a `/devices` handshake reads the device and then its credential
+from PostgreSQL, and the gateway then joins the socket to its private room
+before registering its presence. Each of those steps waits. Before this change,
+a deactivation that committed in the middle closed only the sockets already
+registered; the late handshake, which had read `isActive = true` before the
+commit, finished afterwards and stayed **ONLINE with `isActive = false`**, able
+to join the live session, receive the offer and send answer and ICE, while the
+same Device JWT already answered `401` over REST. Signaling did not re-check the
+identity, only the session, and the session itself stayed live (audit A1).
+
+Re-checking `isActive` right before registering would not have fixed it: that
+read also waits, and the deactivation can commit after it.
+
+## The barrier
+
+The backend keeps, in the memory of the process, a logical clock and the tick at
+which each identity was last revoked:
+
+* every handshake takes a **stamp** of the clock **before** reading anything
+  from PostgreSQL;
+* a revocation (step 3 above) advances the clock and records it for that
+  identity;
+* an operation is admissible only if its identity was not revoked after its
+  stamp.
+
+The barrier is checked, synchronously and right before the effect, at the end of
+the handshake middleware, before registering presence, before entering the
+personal rooms (`/technicians`), before registering session participation and
+before relaying any message. Node runs one JavaScript thread, so nothing can
+slip between the check and the effect, and nothing can slip between raising the
+barrier and closing the registered sockets. For a handshake that read
+"active":
+
+* if it registered before the revocation, the revocation closes it;
+* if it reaches registration after, its stamp is older than the revocation and
+  it is refused;
+* if its read happened after the commit, it already read "inactive".
+
+The barrier only removes permissions; it never grants any. Every operation is
+still authorized by PostgreSQL (device, credential, user, session), so it is not
+an authorization cache.
+
+## Signaling
+
+Every `remote-session:join` and every `webrtc:*` message re-validates the
+identity against PostgreSQL and then checks the barrier with the socket's stamp
+(see [Per-message re-validation](#per-message-re-validation)). A message whose
+reads happened before the revocation and whose delivery would happen after it is
+refused. A socket that stays in a session room from before the revocation gains
+nothing from it.
+
+A message sent by the **other** side towards a revoked device while the
+revocation commits may still be acknowledged `delivered: true`: it is handed to
+the device's session room, which at that point has no socket left. Nothing
+reaches the revoked identity.
+
+## Re-enrollment
+
+The barrier is per device, not per credential, and it is raised after the
+credential rotation commits. Handshakes and messages that started with the old
+credential are refused; the old credential no longer logs in. The new credential
+can only be used after the activation returns it, so every handshake made with
+it takes a stamp after the revocation and is admitted normally. Credentials of
+other devices are never involved.
+
+The live session of the device is closed by the re-enrollment: the user
+authorized it from the previous installation. A new support request is needed.
+
+## Concurrency
+
+* **Close races.** Revocation, `POST /remote-sessions/:id/close`,
+  `POST /device/remote-sessions/:id/close` and the automatic close all lock the
+  same session row: exactly one transition happens, `endedAt`/`endedBy` and the
+  support request's `closedAt` are the winner's, and only the winner emits. A
+  device close that loses against its own deactivation answers `200` (it got
+  the lock before the commit) or `401` (its Device JWT no longer authenticates).
+* **Session creation.** `POST /remote-sessions` locks the device row with
+  `FOR SHARE` and checks `isActive`: it serializes with the revocation's
+  `FOR NO KEY UPDATE`. Revocation first → `409`; creation first → the
+  revocation sees the new session and closes it.
+* **Lock order** is always device → remote session → support request in the
+  revocation, remote session → support request in the closes, and support
+  request → device (shared) in the creation. A creation never waits on the
+  device while holding the support request of a live session (it answers `409`
+  before reaching that point), so the orders cannot form a cycle. If PostgreSQL
+  ever reported a deadlock, the aborted transaction would leave nothing half
+  done and the request would answer `500`.
+* **Idempotency.** Revoking an identity that has nothing left changes nothing
+  and emits nothing.
+
+## Tests
+
+Deterministic, against PostgreSQL and real Socket.IO clients
+(`test/revocation.db-spec.ts`, `npm run test:db`): a handshake is held right
+after reading the active device and its credential, or while joining its room,
+or with its join pending; a join, offer, answer or ICE is held after reading the
+live session; a close or a creation is held on a real PostgreSQL row lock. Then
+the revocation is confirmed and the held operation released. Also: bursts of 50
+simultaneous handshakes around a deactivation, re-enrollment, technicians
+deactivated in PostgreSQL, rollback on a PostgreSQL failure, historical sessions,
+other devices, and a new assistance after reactivation. Unit tests cover the
+barrier and `SignalingService` around every `await`.
+
+## Limitations
+
+* **One backend instance.** The barrier lives in the memory of the process,
+  like presence and participation. With several instances, a revocation made in
+  instance A would not raise the barrier in B: B's sockets would be refused at
+  their next join or message (those re-read PostgreSQL), and the participation
+  would drop, but a handshake in flight in B could complete, and B would not
+  close its sockets until then. Several instances need the revocation broadcast
+  between them (shared Socket.IO adapter, or PostgreSQL `LISTEN/NOTIFY`).
+* **Technicians are revoked lazily**, at their next realtime operation, because
+  there is no deactivation operation in the backend. See
+  [Technician deactivation](#technician-deactivation).
+* **Out-of-band device changes** (editing `devices` or `device_credentials`
+  directly in PostgreSQL) are handled the same lazy way: the next join or
+  message of a socket finds the device inactive (the whole device is revoked,
+  and its session closed) or its credential replaced (only that socket is
+  closed). Supported revocations are `PATCH /devices/:id` and the enrollment.
+* **WebRTC already established** is not cut by the backend: closing the session
+  revokes the authorization, the clients must stop capture and control (see
+  [WebRTC is not cut by this event alone](#webrtc-is-not-cut-by-this-event-alone)).
+* **Support requests still open** (`WAITING`, `ASSIGNED`, `ACCEPTED` without a
+  session) of a deactivated device are left as they are: they grant no access by
+  themselves, and creating a session on them answers `409` while the device is
+  inactive.
 
 ---
 
@@ -1829,6 +2084,12 @@ After the commit, and only then, `remote-session:closed` is emitted to **both**
 `/devices` and `/technicians` with `{ remoteSessionId, endedBy: "SYSTEM" }`.
 Technician and device closes keep their existing behaviour (event only to the
 side that did not close).
+
+A revocation is also a SYSTEM close, without any grace period: deactivating or
+re-enrolling a device closes its live session inside the same transaction, and
+a technician found inactive by the re-validation gets their live session closed
+right away. It uses the same transition, the same row lock and the same events,
+so the race rules above apply unchanged. See [Revocation](#revocation).
 
 ## Delivery limits
 

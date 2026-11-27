@@ -12,6 +12,7 @@ import {
 import { DeviceAuthModule } from '../devices/auth/device-auth.module';
 import { DevicePresenceModule } from '../devices/presence/device-presence.module';
 import { DeviceRealtimeModule } from '../devices/realtime/device-realtime.module';
+import { IdentityRevocationModule } from '../revocation/identity-revocation.module';
 import { SessionParticipationModule } from '../signaling/participation/session-participation.module';
 import { TechnicianRealtimeModule } from '../signaling/realtime/technician-realtime.module';
 import { SupportRequest } from '../support-requests/entities/support-request.entity';
@@ -76,6 +77,9 @@ import { RemoteSessionsService } from './remote-sessions.service';
     SessionParticipationModule,
     // Variables REMOTE_SESSION_* del cierre automatico.
     ConfigModule,
+    // Barrera de revocacion: el cierre automatico termina las sesiones vivas de
+    // una identidad revocada.
+    IdentityRevocationModule,
   ],
   exports: [TypeOrmModule, RemoteSessionsService],
 })

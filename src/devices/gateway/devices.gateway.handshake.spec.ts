@@ -1,4 +1,5 @@
 import { Logger, UnauthorizedException } from '@nestjs/common';
+import { IdentityRevocationService } from '../../revocation/identity-revocation.service';
 import { JwtService } from '@nestjs/jwt';
 import { Repository } from 'typeorm';
 import {
@@ -187,6 +188,7 @@ describe('DevicesGateway — clasificacion de errores del handshake', () => {
       {
         bindDeviceNamespace: () => undefined,
       } as unknown as SignalingRealtimeService,
+      new IdentityRevocationService(),
     );
 
     const namespace = {
@@ -242,6 +244,7 @@ describe('DevicesGateway — clasificacion de errores del handshake', () => {
       expect(outcome.error).toBeUndefined();
       expect(outcome.nextCalls).toBe(1);
       expect(outcome.socket.data.device).toEqual({
+        admittedAt: 0,
         deviceId: DEVICE_ID,
         credentialId: CREDENTIAL_ID,
         publicId: PUBLIC_ID,

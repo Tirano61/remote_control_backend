@@ -1,4 +1,5 @@
 import { ConflictException, INestApplication } from '@nestjs/common';
+import { IdentityRevocationService } from '../revocation/identity-revocation.service';
 import { JwtService } from '@nestjs/jwt';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
@@ -225,6 +226,7 @@ describe('support-request:updated hacia el tecnico (Socket.IO)', () => {
   beforeAll(async () => {
     const moduleRef = await Test.createTestingModule({
       providers: [
+        IdentityRevocationService,
         TechniciansGateway,
         TechnicianRealtimeService,
         SupportRequestsService,

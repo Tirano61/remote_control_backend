@@ -134,7 +134,7 @@ const UNIQUE_VIOLATION = '23505';
  * Quien pide algo sobre una sesion, tal como viaja en el WHERE: el tecnico del
  * User JWT o el dispositivo del Device JWT, nunca un id que mande el cliente.
  */
-type RemoteSessionParticipant =
+export type RemoteSessionParticipant =
   | Pick<RemoteSession, 'technicianId'>
   | Pick<RemoteSession, 'deviceId'>;
 
@@ -237,6 +237,26 @@ export class RemoteSessionsService {
           `Device with id ${supportRequest.deviceId} is offline`,
         );
 
+      // Punto de serializacion con la REVOCACION del dispositivo (desactivacion
+      // o re-enrolamiento), que bloquea esta misma fila con
+      // `FOR NO KEY UPDATE`. Con `FOR SHARE`:
+      //
+      // - si la revocacion llego antes, aqui se espera a su commit y se lee
+      //   `isActive = false` (o se ve que ya no corresponde) -> 409;
+      // - si esta creacion llego antes, la revocacion espera a este commit y
+      //   despues VE la sesion nueva y la cierra con SYSTEM.
+      //
+      // En ningun caso queda una sesion viva sobre un dispositivo revocado.
+      const device = await manager.findOne(Device, {
+        where: { id: supportRequest.deviceId },
+        lock: { mode: 'pessimistic_read' },
+      });
+
+      if (!device?.isActive)
+        throw new ConflictException(
+          `Device with id ${supportRequest.deviceId} is not active`,
+        );
+
       const remoteSession = this.remoteSessionRepository.create({
         supportRequestId: supportRequest.id,
         deviceId: supportRequest.deviceId,
@@ -259,11 +279,10 @@ export class RemoteSessionsService {
 
       const session = await this.save(manager, remoteSession);
 
-      // El tecnico es el usuario autenticado; el dispositivo se lee aparte
-      // porque la consulta bloqueante no puede arrastrar relaciones.
-      session.device = await manager.findOneByOrFail(Device, {
-        id: supportRequest.deviceId,
-      });
+      // El tecnico es el usuario autenticado; el dispositivo es la fila que se
+      // acaba de bloquear (la consulta bloqueante de la solicitud no puede
+      // arrastrar relaciones).
+      session.device = device;
       session.technician = user;
 
       return session;
@@ -584,6 +603,103 @@ export class RemoteSessionsService {
 
     this.notifyClosedToBoth(closed);
     this.notifyChanged(closed);
+
+    return closed;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Revocacion (dispositivo desactivado o re-enrolado, tecnico deshabilitado)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Cierra con `endedBy: SYSTEM` las sesiones vivas de un participante que
+   * acaba de perder la autorizacion, DENTRO de la transaccion de quien la
+   * retira.
+   *
+   * Es la misma transicion de siempre (`closeWithin`: sesion CLOSED + solicitud
+   * COMPLETED, o nada), sobre las filas bloqueadas con `FOR UPDATE` igual que
+   * `closeBySystem` y los cierres de los participantes, asi que frente a un
+   * cierre TECHNICIAN, DEVICE o SYSTEM simultaneo gana el primero que llega a la
+   * fila y el otro ve `CLOSED` sin reescribir nada.
+   *
+   * Ir dentro de la transaccion de la revocacion es lo que la hace atomica: o
+   * el dispositivo queda inactivo (o con la credencial nueva) Y sus sesiones
+   * cerradas, o no cambia nada. Un rollback no deja un dispositivo inactivo con
+   * una sesion ACTIVE ni una sesion cerrada con el dispositivo activo.
+   *
+   * Las sesiones `CLOSED` historicas no se tocan: ni siquiera se leen. Lo
+   * normal es que haya como mucho una (indices unicos parciales); se recorren
+   * todas por robustez.
+   *
+   * No avisa a nadie: la transaccion todavia puede deshacerse. Quien llama
+   * avisa con `announceSystemClosures` DESPUES del commit.
+   */
+  async closeLiveSessionsWithin(
+    manager: EntityManager,
+    owner: RemoteSessionParticipant,
+    endedAt: Date,
+  ): Promise<RemoteSession[]> {
+    const live = await manager.find(RemoteSession, {
+      where: { ...owner, status: In([...ACTIVE_REMOTE_SESSION_STATUSES]) },
+      lock: { mode: 'pessimistic_write' },
+      order: { createdAt: 'ASC' },
+    });
+
+    const closed: RemoteSession[] = [];
+
+    for (const session of live) {
+      // Con la fila bloqueada el estado leido es el vigente: el UPDATE va
+      // condicionado a el igualmente.
+      const done = await this.closeWithin(
+        manager,
+        session,
+        endedAt,
+        RemoteSessionEndedBy.SYSTEM,
+        [session.status],
+      );
+
+      if (done)
+        closed.push(
+          Object.assign(session, {
+            status: RemoteSessionStatus.CLOSED,
+            endedAt,
+            endedBy: RemoteSessionEndedBy.SYSTEM,
+          }),
+        );
+    }
+
+    return closed;
+  }
+
+  /**
+   * Avisos de los cierres de `closeLiveSessionsWithin`, una vez confirmada la
+   * transaccion: `remote-session:closed` con `endedBy: SYSTEM` a los DOS
+   * extremos (como cualquier cierre del sistema) y el aviso en proceso al
+   * cierre automatico, que olvida la sesion y su participacion.
+   */
+  announceSystemClosures(sessions: readonly RemoteSession[]): void {
+    for (const session of sessions) {
+      this.notifyClosedToBoth(session);
+      this.notifyChanged(session);
+    }
+  }
+
+  /**
+   * Transaccion propia + avisos: para cuando la autorizacion ya se perdio en
+   * PostgreSQL y no hay ninguna transaccion de revocacion en curso (una
+   * revalidacion del signaling que encuentra al tecnico o al dispositivo
+   * inactivo).
+   *
+   * Devuelve las sesiones cerradas; ninguna si ya estaban cerradas.
+   */
+  async closeLiveSessionsOf(
+    owner: RemoteSessionParticipant,
+  ): Promise<RemoteSession[]> {
+    const closed = await this.dataSource.transaction((manager) =>
+      this.closeLiveSessionsWithin(manager, owner, new Date()),
+    );
+
+    this.announceSystemClosures(closed);
 
     return closed;
   }

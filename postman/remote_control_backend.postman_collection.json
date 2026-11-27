@@ -430,7 +430,7 @@
                 "{{deviceId}}"
               ]
             },
-            "description": "Updates the administrative fields of a device. Only the properties present in\nthe body are applied. id, publicId, createdAt and updatedAt are rejected.\n\nThis body only renames the device on purpose. Sending \"isActive\": false also\nforce-closes every open Socket.IO connection of the device and makes all its\nREST calls fail with 401, which would interrupt the end-to-end flow.",
+            "description": "Updates the administrative fields of a device. Only the properties present in\nthe body are applied. id, publicId, createdAt and updatedAt are rejected.\n\nThis body only renames the device on purpose. Sending \"isActive\": false revokes the\ndevice: its live remote session is closed with endedBy SYSTEM in the same\ntransaction, every open Socket.IO connection of the device is force-closed and\nall its REST calls fail with 401, which would interrupt the end-to-end flow.",
             "body": {
               "mode": "raw",
               "raw": "{\n  \"name\": \"Tablet Tolva 02\"\n}",

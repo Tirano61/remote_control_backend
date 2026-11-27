@@ -553,17 +553,36 @@ Errors:
 401 — Not authenticated.
 403 — Authenticated without role admin/tecnico.
 404 — Device not found.
+500 — The database failed. Nothing was applied: the device keeps its previous
+      state, no session was closed and no connection was cut. Retrying is safe.
 ```
 
 Notes:
-Setting `isActive: false` immediately **force-closes every open Socket.IO
-connection** of that device, so it also becomes `isOnline: false`. Authorization
-is not left to expire with the Device JWT. If the device was online, the
-technicians receive one `device:presence-updated` — see
-[REALTIME.md](REALTIME.md).
+Setting `isActive: false` is a **revocation** of the device. When the request
+answers `200` the revocation is complete:
 
-A deactivated device also stops passing `@DeviceAuth()`, so all its REST calls
-start failing with `401`.
+1. In ONE transaction the device row is updated and every live remote session
+   of the device (`CONNECTING` or `ACTIVE`) is closed with
+   `endedBy: "SYSTEM"`; its support request becomes `COMPLETED`. Either all of
+   that commits or nothing does. Historical `CLOSED` sessions are not touched.
+2. After the commit, `remote-session:closed` (`endedBy: "SYSTEM"`) is emitted
+   to both sides of each closed session, and then every open Socket.IO
+   connection of the device is **force-closed**, so it also becomes
+   `isOnline: false`. If the device was online, the technicians receive one
+   `device:presence-updated`.
+3. From that moment no handshake, `remote-session:join` or `webrtc:*` message
+   of the device succeeds, including ones that were already in flight when the
+   request arrived. See "Revocation" in [REALTIME.md](REALTIME.md).
+
+Authorization is not left to expire with the Device JWT. A deactivated device
+also stops passing `@DeviceAuth()`, so all its REST calls start failing with
+`401`. Its credential is **not** revoked: setting `isActive: true` again lets
+the same `deviceSecret` log in, but nothing of the previous sessions comes back.
+
+Repeating `isActive: false` on an inactive device is harmless: no session is
+closed and nothing is emitted. A body without `isActive: false` (renaming the
+device, for example) does not revoke anything, unless the device was already
+inactive, in which case it is handled as above with nothing left to close.
 
 ## POST /devices/:id/enrollment
 
@@ -690,9 +709,21 @@ backend keeps only a hash of it and never returns it again.
 wrong code, expired code and already-used code all answer identically, so
 guessing cannot be used to probe the system.
 
-A successful activation revokes the previous credential of that device and
-**force-closes its open Socket.IO connections**; the tablet reconnects with the
-new credential.
+A successful activation on a device that already had a credential is a
+**re-enrollment**, and therefore a revocation of the previous credential:
+
+* in the same transaction that revokes it and issues the new one, every live
+  remote session of the device is closed with `endedBy: "SYSTEM"` (the user
+  authorized it from the previous installation) and its support request becomes
+  `COMPLETED`;
+* after the commit, `remote-session:closed` is emitted to both sides and every
+  open Socket.IO connection of the device is **force-closed**;
+* handshakes and signaling messages that were in flight with the previous
+  credential are refused (`DEVICE_AUTH_UNAUTHORIZED` / `UNAUTHORIZED`), and that
+  credential no longer logs in (`401 DEVICE_CREDENTIAL_REJECTED`).
+
+The tablet reconnects with the Device JWT obtained from the new
+`deviceSecret`. Credentials of other devices are never affected.
 
 ---
 
@@ -1494,8 +1525,9 @@ Errors:
       authenticated technician.
 409 — The request was not accepted by the device; OR the authenticated
       technician already has a live remote session; OR the device is offline;
-      OR the device already has a live remote session; OR the request already
-      originated a remote session.
+      OR the device is not active (deactivated while this request was being
+      processed); OR the device already has a live remote session; OR the
+      request already originated a remote session.
 ```
 
 Notes:
@@ -1515,6 +1547,12 @@ One live session per technician, one live session per device and one session per
 support request are all enforced by unique indexes in PostgreSQL, not only by a
 check in the application, so two simultaneous requests cannot both win: one gets
 `201` and the other `409`.
+
+The creation and a deactivation or re-enrollment of the same device are
+serialized on the device row: if the revocation commits first the creation
+answers `409`; if the creation commits first, the revocation closes the new
+session right after with `endedBy: "SYSTEM"`. A live session never survives on
+a revoked device.
 
 On success the backend emits `remote-session:created` to the device over
 Socket.IO, after the transaction commits. Delivery is best-effort; the tablet can
@@ -1860,8 +1898,11 @@ TECHNICIAN  Closed through POST /remote-sessions/:id/close
 DEVICE      Closed through POST /device/remote-sessions/:id/close
 SYSTEM      Closed automatically by the backend: a CONNECTING session reached
             its TTL, an ACTIVE session lost a side for longer than the grace
-            period, or nobody recovered it after a backend restart. No client
-            can request it. See the automatic close in REALTIME.md.
+            period, nobody recovered it after a backend restart, or one of its
+            participants lost its authorization (device deactivated or
+            re-enrolled, technician found inactive or without a technician
+            role). No client can request it. See the automatic close and
+            "Revocation" in REALTIME.md.
 ```
 
 ### ValidRoles
