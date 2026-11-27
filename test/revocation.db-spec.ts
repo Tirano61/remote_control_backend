@@ -1047,6 +1047,73 @@ describe('revocacion frente a operaciones en vuelo (PostgreSQL + Socket.IO)', ()
   });
 
   // ---------------------------------------------------------------------------
+  // Cambios del dispositivo hechos por fuera del backend (SQL)
+  // ---------------------------------------------------------------------------
+
+  describe('dispositivo modificado por fuera del backend', () => {
+    it('desactivado por SQL: su siguiente mensaje revoca el dispositivo entero y cierra su sesion', async () => {
+      const scenario = await liveSession({ tabletJoined: true });
+
+      await rc.dataSource.query(
+        `UPDATE "${rc.schema}"."devices" SET "isActive" = false WHERE id = $1`,
+        [scenario.tablet.device.id],
+      );
+
+      expect(
+        granted(
+          await answer(scenario.tabletSocket, scenario.sessionId),
+          'delivered',
+        ),
+      ).toBe(false);
+      expect(scenario.console.received(WEBRTC_ANSWER_EVENT)).toEqual([]);
+      expect(await scenario.tabletSocket.disconnected).toBe(
+        'io server disconnect',
+      );
+
+      await waitFor(
+        async () =>
+          (await rc.sessionRow(scenario.sessionId)).status ===
+          RemoteSessionStatus.CLOSED,
+        'sesion cerrada',
+      );
+      await expectClosedBySystem(scenario.sessionId, scenario.supportRequestId);
+      await waitFor(
+        () => scenario.console.received(REMOTE_SESSION_CLOSED_EVENT).length > 0,
+        'remote-session:closed al tecnico',
+      );
+    });
+
+    it('credencial revocada por SQL: solo se cierra ese socket; la sesion no se toca', async () => {
+      const scenario = await liveSession({ tabletJoined: true });
+
+      await rc.dataSource.query(
+        `UPDATE "${rc.schema}"."device_credentials" SET "revokedAt" = now()
+          WHERE "deviceId" = $1 AND "revokedAt" IS NULL`,
+        [scenario.tablet.device.id],
+      );
+
+      expect(
+        granted(
+          await ice(scenario.tabletSocket, scenario.sessionId),
+          'delivered',
+        ),
+      ).toBe(false);
+      expect(await scenario.tabletSocket.disconnected).toBe(
+        'io server disconnect',
+      );
+
+      await settle();
+      // El dispositivo sigue activo: no se revoca su identidad ni su sesion.
+      expect((await rc.sessionRow(scenario.sessionId)).status).toBe(
+        RemoteSessionStatus.CONNECTING,
+      );
+      expect(scenario.console.received(REMOTE_SESSION_CLOSED_EVENT)).toEqual(
+        [],
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------------
   // Re-enrolamiento
   // ---------------------------------------------------------------------------
 
