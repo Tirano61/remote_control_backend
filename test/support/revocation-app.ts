@@ -3,7 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { Test } from '@nestjs/testing';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { randomUUID } from 'crypto';
+import { randomInt, randomUUID } from 'crypto';
 import { Server as HttpServer } from 'http';
 import { AddressInfo } from 'net';
 import type { Server as IoServer, ServerOptions } from 'socket.io';
@@ -40,7 +40,8 @@ import { SupportRequestsModule } from '../../src/support-requests/support-reques
  */
 
 export const REVOCATION_USER_JWT_SECRET = 'user-secret-for-revocation-tests';
-export const REVOCATION_DEVICE_JWT_SECRET = 'device-secret-for-revocation-tests';
+export const REVOCATION_DEVICE_JWT_SECRET =
+  'device-secret-for-revocation-tests';
 
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
 
@@ -80,7 +81,11 @@ export interface TestSocket {
   disconnected: Promise<string>;
   received(event: string): unknown[];
   /** ACK del evento, o `NO_ACK` si no llego (socket cerrado o rechazado). */
-  emitWithAck(event: string, payload: unknown, timeoutMs?: number): Promise<unknown>;
+  emitWithAck(
+    event: string,
+    payload: unknown,
+    timeoutMs?: number,
+  ): Promise<unknown>;
 }
 
 export interface EnrolledDevice {
@@ -104,9 +109,22 @@ export interface RevocationApp {
   seedTechnician(roles?: ValidRoles[]): Promise<Technician>;
   enrollDevice(): Promise<EnrolledDevice>;
   loginDevice(deviceId: string, deviceSecret: string): Promise<string>;
-  seedAcceptedRequest(deviceId: string, technicianId: string): Promise<SupportRequest>;
+  seedAcceptedRequest(
+    deviceId: string,
+    technicianId: string,
+  ): Promise<SupportRequest>;
+  /**
+   * Re-enrolamiento por el flujo real: codigo generado por un tecnico y
+   * activacion desde la tablet. Devuelve el secreto nuevo.
+   */
+  reEnroll(admin: Technician, device: Device): Promise<string>;
+  /** Sesiones de PostgreSQL esperando un lock en el esquema de la prueba. */
+  lockWaiters(): Promise<number>;
   /** `POST /remote-sessions` real. Devuelve el id de la sesion creada. */
-  createSession(technician: Technician, supportRequestId: string): Promise<string>;
+  createSession(
+    technician: Technician,
+    supportRequestId: string,
+  ): Promise<string>;
   connectDevice(token: string): TestSocket;
   connectTechnician(token: string): TestSocket;
   sessionRow(id: string): Promise<RemoteSession>;
@@ -213,12 +231,14 @@ export const startRevocationApp = async (): Promise<RevocationApp> => {
 
     const outcome = new Promise<HandshakeOutcome>((resolve) => {
       client.once('connect', () => resolve({ connected: true }));
-      client.once('connect_error', (error: Error & { data?: { code?: string } }) =>
-        resolve({
-          connected: false,
-          code: error.data?.code,
-          message: error.message,
-        }),
+      client.once(
+        'connect_error',
+        (error: Error & { data?: { code?: string } }) =>
+          resolve({
+            connected: false,
+            code: error.data?.code,
+            message: error.message,
+          }),
       );
     });
 
@@ -232,11 +252,15 @@ export const startRevocationApp = async (): Promise<RevocationApp> => {
       outcome,
       disconnected,
       received: (event) => events.get(event) ?? [],
+      // Un cliente desconectado solo encolaria el evento: el servidor nunca lo
+      // recibiria. Se dice asi en lugar de esperar al timeout.
       emitWithAck: (event, payload, timeoutMs = 1_500) =>
-        client
-          .timeout(timeoutMs)
-          .emitWithAck(event, payload)
-          .catch(() => 'NO_ACK'),
+        client.connected
+          ? client
+              .timeout(timeoutMs)
+              .emitWithAck(event, payload)
+              .catch(() => 'NO_ACK')
+          : Promise.resolve('NOT_CONNECTED'),
     };
   };
 
@@ -279,7 +303,9 @@ export const startRevocationApp = async (): Promise<RevocationApp> => {
       const devices = dataSource.getRepository(Device);
       const device = await devices.save(
         devices.create({
-          publicId: `${randomUUID().slice(0, 3)}-${randomUUID().slice(0, 3)}-${randomUUID().slice(0, 3)}`,
+          publicId: [0, 1, 2]
+            .map(() => String(randomInt(0, 1000)).padStart(3, '0'))
+            .join('-'),
           name: 'Tablet de prueba',
           isActive: true,
         }),
@@ -302,6 +328,32 @@ export const startRevocationApp = async (): Promise<RevocationApp> => {
     },
 
     loginDevice,
+
+    reEnroll: async (admin, device) => {
+      const code = await request(http)
+        .post(`/devices/${device.id}/enrollment`)
+        .set('Authorization', `Bearer ${admin.token}`)
+        .expect(201);
+
+      const activation = await request(http)
+        .post('/device-enrollment/activate')
+        .send({
+          publicId: device.publicId,
+          code: (code.body as { enrollmentCode: string }).enrollmentCode,
+        })
+        .expect(200);
+
+      return (activation.body as { deviceSecret: string }).deviceSecret;
+    },
+
+    lockWaiters: async () => {
+      const rows: Array<{ waiting: string }> = await dataSource.query(
+        `SELECT count(*)::text AS waiting FROM pg_stat_activity
+          WHERE datname = current_database() AND wait_event_type = 'Lock'`,
+      );
+
+      return Number(rows[0]?.waiting ?? 0);
+    },
 
     seedAcceptedRequest: (deviceId, technicianId) => {
       const requests = dataSource.getRepository(SupportRequest);
@@ -346,7 +398,11 @@ export const startRevocationApp = async (): Promise<RevocationApp> => {
       harness.closeClients();
       await app.close();
 
-      const cleanup = new DataSource({ type: 'postgres', url: databaseUrl, ssl });
+      const cleanup = new DataSource({
+        type: 'postgres',
+        url: databaseUrl,
+        ssl,
+      });
       await cleanup.initialize();
       await cleanup.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
       await cleanup.destroy();

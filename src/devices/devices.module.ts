@@ -12,6 +12,8 @@ import { Device } from './entities/device.entity';
 import { DevicePresenceModule } from './presence/device-presence.module';
 import { DeviceRealtimeModule } from './realtime/device-realtime.module';
 import { SignalingModule } from '../signaling/signaling.module';
+import { RemoteSessionsModule } from '../remote-sessions/remote-sessions.module';
+import { IdentityRevocationModule } from '../revocation/identity-revocation.module';
 
 @Module({
   controllers: [DevicesController, DeviceEnrollmentController],
@@ -33,6 +35,13 @@ import { SignalingModule } from '../signaling/signaling.module';
     // `SignalingService` toda la validacion y el relay. La dependencia va solo
     // en este sentido; `SignalingModule` no conoce `DevicesModule`.
     SignalingModule,
+    // Desactivar o re-enrolar un dispositivo cierra sus sesiones vivas dentro
+    // de la misma transaccion. `RemoteSessionsModule` no importa este modulo:
+    // no hay ciclo.
+    RemoteSessionsModule,
+    // Barrera de revocacion: el gateway la consulta en el handshake y en cada
+    // mensaje, y la desactivacion y el re-enrolamiento la levantan.
+    IdentityRevocationModule,
   ],
   exports: [TypeOrmModule, DevicesService],
 })

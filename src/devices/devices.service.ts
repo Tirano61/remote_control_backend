@@ -5,13 +5,23 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { QueryFailedError, Repository } from 'typeorm';
+import {
+  DataSource,
+  EntityManager,
+  QueryFailedError,
+  Repository,
+} from 'typeorm';
 import { randomInt } from 'crypto';
 import { CreateDeviceDto } from './dto/create-device.dto';
 import { DeviceResponseDto } from './dto/device-response.dto';
 import { UpdateDeviceDto } from './dto/update-device.dto';
 import { Device } from './entities/device.entity';
 import { DevicePresenceService } from './presence/device-presence.service';
+import { RemoteSessionsService } from '../remote-sessions/remote-sessions.service';
+import {
+  IdentityRevocationService,
+  RevocableIdentityKind,
+} from '../revocation/identity-revocation.service';
 
 /** Forma minima del error que devuelve el driver de PostgreSQL. */
 interface PostgresError {
@@ -33,6 +43,12 @@ export class DevicesService {
     private readonly deviceRepository: Repository<Device>,
 
     private readonly devicePresenceService: DevicePresenceService,
+
+    private readonly dataSource: DataSource,
+
+    private readonly remoteSessionsService: RemoteSessionsService,
+
+    private readonly identityRevocationService: IdentityRevocationService,
   ) {}
 
   async create(createDeviceDto: CreateDeviceDto): Promise<DeviceResponseDto> {
@@ -87,24 +103,69 @@ export class DevicesService {
     return device;
   }
 
+  /**
+   * Edicion administrativa. Si el dispositivo queda inactivo, es una
+   * REVOCACION y se aplica en este orden:
+   *
+   * 1. Transaccion: bloquea la fila del dispositivo (`FOR NO KEY UPDATE`),
+   *    escribe los cambios y cierra con `endedBy: SYSTEM` sus sesiones vivas
+   *    (sesion CLOSED + solicitud COMPLETED). O se confirma todo o nada.
+   * 2. Commit. Desde aqui ningun handshake ni ninguna revalidacion lo da por
+   *    activo, y `POST /remote-sessions` ya no puede abrirle otra sesion (espera
+   *    a este lock y despues lee `isActive = false`).
+   * 3. En el mismo tick, sin `await`: avisa `remote-session:closed` a los dos
+   *    extremos y levanta la barrera de revocacion, que cierra todos sus sockets
+   *    registrados e invalida cualquier handshake u operacion de signaling que
+   *    hubiera leido el estado anterior.
+   *
+   * La revocacion queda CONFIRMADA cuando termina el paso 3, antes de responder
+   * `200`. Ver `docs/REALTIME.md`, "Revocation".
+   *
+   * Desactivar un dispositivo que ya estaba inactivo repite los pasos sin
+   * efecto: no hay sesiones vivas que cerrar ni sockets que barrer.
+   */
   async update(
     id: string,
     updateDeviceDto: UpdateDeviceDto,
   ): Promise<DeviceResponseDto> {
-    // preload solo aplica los campos presentes en el DTO.
-    const device = await this.deviceRepository.preload({
-      id,
-      ...updateDeviceDto,
-    });
+    const { updated, closed } = await this.dataSource.transaction(
+      async (manager) => {
+        // Serializa con `RemoteSessionsService.create` (FOR SHARE sobre esta
+        // fila) y con el re-enrolamiento (este mismo lock).
+        const device = await manager.findOne(Device, {
+          where: { id },
+          lock: { mode: 'for_no_key_update' },
+        });
 
-    if (!device) throw new NotFoundException(`Device with id ${id} not found`);
+        if (!device)
+          throw new NotFoundException(`Device with id ${id} not found`);
 
-    const updated = await this.save(device);
+        // `merge` solo aplica los campos presentes en el DTO, igual que
+        // `preload`.
+        manager.merge(Device, device, updateDeviceDto);
+
+        const saved = await this.save(manager, device);
+
+        const closedSessions = saved.isActive
+          ? []
+          : await this.remoteSessionsService.closeLiveSessionsWithin(
+              manager,
+              { deviceId: id },
+              new Date(),
+            );
+
+        return { updated: saved, closed: closedSessions };
+      },
+    );
 
     // Un socket ya abierto no vuelve a comprobar la autorizacion por si mismo:
     // si el dispositivo queda deshabilitado hay que cerrar sus conexiones ahora
-    // y no esperar a que venza su Device JWT.
-    if (!updated.isActive) this.devicePresenceService.disconnectDevice(id);
+    // y no esperar a que venza su Device JWT. Primero el aviso de cierre (aun
+    // llega a la tablet), despues la barrera, que la desconecta.
+    if (!updated.isActive) {
+      this.remoteSessionsService.announceSystemClosures(closed);
+      this.identityRevocationService.revoke(RevocableIdentityKind.DEVICE, id);
+    }
 
     return this.toResponse(updated);
   }
@@ -122,9 +183,9 @@ export class DevicesService {
     );
   }
 
-  private async save(device: Device): Promise<Device> {
+  private async save(manager: EntityManager, device: Device): Promise<Device> {
     try {
-      return await this.deviceRepository.save(device);
+      return await manager.save(Device, device);
     } catch (error) {
       this.handleDBError(error);
     }

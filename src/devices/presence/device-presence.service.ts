@@ -1,4 +1,13 @@
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
+import {
+  IdentityRevocationService,
+  RevocableIdentityKind,
+} from '../../revocation/identity-revocation.service';
 import { TechnicianRealtimeService } from '../../signaling/realtime/technician-realtime.service';
 
 /**
@@ -54,17 +63,37 @@ export interface DevicePresenceUpdatedPayload {
  *
  * Tras reiniciar el proceso el registro queda vacio: todos los dispositivos son
  * OFFLINE hasta que vuelvan a conectarse.
+ *
+ * REVOCACION. Escucha a `IdentityRevocationService`: en cuanto se revoca un
+ * dispositivo (desactivacion, re-enrolamiento, o una revalidacion que lo
+ * encuentra inactivo) cierra todos sus sockets registrados en el mismo tick que
+ * levanta la barrera. Los que todavia no se habian registrado no los ve, y no
+ * hace falta: el gateway comprueba la barrera antes de registrar y los rechaza.
  */
 @Injectable()
-export class DevicePresenceService {
+export class DevicePresenceService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(DevicePresenceService.name);
 
   /** deviceId -> sockets autenticados de ese dispositivo (socketId -> socket). */
   private readonly connections = new Map<string, Map<string, PresenceSocket>>();
 
+  private unsubscribe: (() => void) | null = null;
+
   constructor(
     private readonly technicianRealtimeService: TechnicianRealtimeService,
+    private readonly identityRevocationService: IdentityRevocationService,
   ) {}
+
+  onModuleInit(): void {
+    this.unsubscribe = this.identityRevocationService.subscribe((kind, id) => {
+      if (kind === RevocableIdentityKind.DEVICE) this.disconnectDevice(id);
+    });
+  }
+
+  onModuleDestroy(): void {
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+  }
 
   /**
    * Registra un socket ya autenticado.
@@ -129,10 +158,12 @@ export class DevicePresenceService {
   /**
    * Cierra todas las conexiones del dispositivo, que queda OFFLINE.
    *
-   * Lo usan los flujos que retiran la autorizacion (desactivacion
-   * administrativa, re-enrolamiento): un socket ya abierto no revalida nada por
-   * si mismo, asi que hay que cerrarlo en ese momento y no esperar a que venza
-   * el Device JWT.
+   * Lo dispara la revocacion del dispositivo (desactivacion administrativa,
+   * re-enrolamiento, revalidacion que lo encuentra inactivo): un socket ya
+   * abierto no se cierra solo, asi que hay que cerrarlo en ese momento y no
+   * esperar a que venza el Device JWT. Cerrar no es la unica barrera: el
+   * signaling revalida cada mensaje y la barrera de revocacion rechaza lo que
+   * llegue tarde.
    *
    * Devuelve cuantos sockets se cerraron. Solo avisa a los tecnicos si habia
    * alguno, es decir, si el dispositivo estaba ONLINE de verdad.

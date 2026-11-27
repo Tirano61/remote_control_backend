@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import { IdentityRevocationService } from '../../revocation/identity-revocation.service';
 import {
   REMOTE_SESSION_EVALUATION_RETRY_MS,
   RemoteSessionLifecycleConfig,
@@ -167,6 +168,7 @@ describe('RemoteSessionLifecycleService', () => {
       sessions as unknown as RemoteSessionsService,
       participation,
       config(startupRecoveryMs),
+      new IdentityRevocationService(),
     );
     lifecycle.onModuleInit();
     lifecycle.onApplicationBootstrap();

@@ -36,6 +36,28 @@ export interface SignalingIdentity {
    * evento.
    */
   id: string;
+
+  /**
+   * Vuelve a comprobar CONTRA POSTGRESQL que la identidad del socket sigue
+   * autorizada: dispositivo activo con la MISMA credencial con la que se
+   * autentico el socket, o usuario activo con un rol de tecnico.
+   *
+   * `false` es un rechazo confirmado (y quien construye la identidad ya se ocupo
+   * de retirar el acceso). Si PostgreSQL no responde, LANZA: no poder comprobar
+   * no es lo mismo que estar revocado.
+   */
+  revalidate(): Promise<boolean>;
+
+  /**
+   * Comprobacion sincrona, sin I/O: el socket sigue conectado y su identidad no
+   * fue revocada desde que se autentico (`IdentityRevocationService`).
+   *
+   * Es lo ULTIMO que se mira antes de un efecto (entrar en la room, registrar la
+   * participacion, retransmitir), sin ningun `await` entre la comprobacion y el
+   * efecto: asi un resultado que llega despues de una revocacion no concede
+   * nada aunque la lectura de PostgreSQL fuera anterior a ella.
+   */
+  isCurrent(): boolean;
 }
 
 /** Lo que el signaling guarda en el socket. Lo escribe solo el servidor. */

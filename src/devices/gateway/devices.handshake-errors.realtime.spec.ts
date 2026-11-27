@@ -1,4 +1,7 @@
 import { INestApplication, Logger } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+import { RemoteSessionsService } from '../../remote-sessions/remote-sessions.service';
+import { IdentityRevocationService } from '../../revocation/identity-revocation.service';
 import { JwtModule, JwtService } from '@nestjs/jwt';
 import { Test } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
@@ -230,12 +233,24 @@ describe('DevicesGateway — connect_error por Socket.IO real', () => {
         }),
       ],
       providers: [
+        IdentityRevocationService,
         DevicesGateway,
         DevicePresenceService,
         DeviceRealtimeService,
         DeviceAuthService,
         DeviceCredentialsService,
         DevicesService,
+        // Desactivar cierra las sesiones vivas en la misma transaccion; aqui no
+        // hay ninguna (eso se prueba contra PostgreSQL en test/revocation).
+        {
+          provide: RemoteSessionsService,
+          useValue: {
+            closeLiveSessionsWithin: () => Promise.resolve([]),
+            announceSystemClosures: () => undefined,
+          },
+        },
+        // `DevicesService` no se ejercita aqui: solo tiene que resolverse.
+        { provide: DataSource, useValue: {} },
         SignalingService,
         SessionParticipationService,
         SignalingRealtimeService,

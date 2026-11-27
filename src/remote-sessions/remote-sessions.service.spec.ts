@@ -501,6 +501,11 @@ describe('RemoteSessionsService', () => {
           lock?: { mode: string };
         },
       ) => {
+        // La creacion bloquea el dispositivo (FOR SHARE) y comprueba isActive.
+        // Su lock no compite con los de sesion/solicitud que se prueban aqui.
+        if (entity === Device)
+          return devices[options.where.id as string] ?? null;
+
         // La fila se lee DESPUES de obtener el lock, igual que hace PostgreSQL
         // al reevaluar la fila bloqueada: quien espera ve lo que dejo el otro.
         if (options.lock)
@@ -600,6 +605,23 @@ describe('RemoteSessionsService', () => {
   });
 
   describe('creacion por el tecnico', () => {
+    it('un dispositivo ya inactivo (desactivacion confirmada) responde 409 y no crea nada', async () => {
+      const supportRequestId = await seedAcceptedRequest(deviceA);
+      // La desactivacion ya confirmo; la presencia todavia lo veia ONLINE
+      // cuando esta peticion lo consulto.
+      devices[deviceA.id] = { ...deviceA, isActive: false };
+
+      await expect(
+        service.create({ supportRequestId }, technicianA),
+      ).rejects.toThrow(`Device with id ${deviceA.id} is not active`);
+
+      expect(remoteSessions.rows).toHaveLength(0);
+      expect(
+        (await supportRequests.findOne({ where: { id: supportRequestId } }))
+          ?.status,
+      ).toBe(SupportRequestStatus.ACCEPTED);
+    });
+
     it('escribe createdAt desde Node, con el mismo reloj que connectedAt y endedAt', async () => {
       // Si se dejara al `DEFAULT now()` de PostgreSQL, el TTL de CONNECTING se
       // calcularia sobre otro reloj (ver test/remote-sessions.db-spec.ts).

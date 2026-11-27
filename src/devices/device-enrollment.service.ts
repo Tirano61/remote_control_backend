@@ -11,7 +11,12 @@ import { DevicesService } from './devices.service';
 import { Device } from './entities/device.entity';
 import { DeviceEnrollment } from './entities/device-enrollment.entity';
 import { DeviceCredentialsService } from './auth/device-credentials.service';
-import { DevicePresenceService } from './presence/device-presence.service';
+import { RemoteSession } from '../remote-sessions/entities/remote-session.entity';
+import { RemoteSessionsService } from '../remote-sessions/remote-sessions.service';
+import {
+  IdentityRevocationService,
+  RevocableIdentityKind,
+} from '../revocation/identity-revocation.service';
 
 /** Respuesta del endpoint administrativo: el codigo viaja una unica vez. */
 export interface EnrollmentCodeResponse {
@@ -64,7 +69,8 @@ export class DeviceEnrollmentService {
     private readonly dataSource: DataSource,
     private readonly devicesService: DevicesService,
     private readonly deviceCredentialsService: DeviceCredentialsService,
-    private readonly devicePresenceService: DevicePresenceService,
+    private readonly remoteSessionsService: RemoteSessionsService,
+    private readonly identityRevocationService: IdentityRevocationService,
   ) {}
 
   /**
@@ -124,22 +130,48 @@ export class DeviceEnrollmentService {
    * Cualquier motivo de rechazo (publicId inexistente, dispositivo inactivo,
    * codigo incorrecto, vencido o ya usado) devuelve el mismo error generico
    * para no dar informacion util a quien pruebe codigos al azar.
+   *
+   * Una activacion correcta es un RE-ENROLAMIENTO si el dispositivo ya tenia
+   * credencial, y entonces es tambien una revocacion: la credencial anterior y
+   * todo lo que se autorizo con ella dejan de valer. Por eso, en la MISMA
+   * transaccion que revoca la credencial, se cierran con `endedBy: SYSTEM` sus
+   * sesiones vivas: el consentimiento se dio desde la instalacion anterior. Tras
+   * el commit se avisa del cierre y se levanta la barrera de revocacion, que
+   * cierra los sockets de la credencial anterior e invalida sus handshakes y
+   * mensajes de signaling en vuelo. Las credenciales de otros dispositivos no se
+   * tocan.
    */
   async activate(
     activateDeviceDto: ActivateDeviceDto,
   ): Promise<DeviceActivationResponse> {
+    let closed: RemoteSession[] = [];
+
     // La transaccion devuelve `null` en lugar de lanzar, para que el conteo de
     // intentos fallidos se confirme en vez de perderse en el rollback.
-    const activation = await this.dataSource.transaction((manager) =>
-      this.runActivation(manager, activateDeviceDto),
-    );
+    const activation = await this.dataSource.transaction(async (manager) => {
+      const result = await this.runActivation(manager, activateDeviceDto);
+
+      if (result)
+        closed = await this.remoteSessionsService.closeLiveSessionsWithin(
+          manager,
+          { deviceId: result.deviceId },
+          new Date(),
+        );
+
+      return result;
+    });
 
     if (!activation) throw new UnauthorizedException('Invalid activation');
 
     // La transaccion ya esta confirmada: la credencial anterior quedo revocada,
     // asi que los sockets autenticados con ella dejan de estar autorizados y se
-    // cierran. La tablet volvera a conectarse con su credencial nueva.
-    this.devicePresenceService.disconnectDevice(activation.deviceId);
+    // cierran (lo hace la presencia al levantarse la barrera). La tablet volvera
+    // a conectarse con su credencial nueva.
+    this.remoteSessionsService.announceSystemClosures(closed);
+    this.identityRevocationService.revoke(
+      RevocableIdentityKind.DEVICE,
+      activation.deviceId,
+    );
 
     return activation;
   }
@@ -151,7 +183,13 @@ export class DeviceEnrollmentService {
     const { publicId, code } = activateDeviceDto;
     const now = new Date();
 
-    const device = await manager.findOne(Device, { where: { publicId } });
+    // Bloqueada con el mismo lock que la desactivacion: una activacion y una
+    // desactivacion del mismo dispositivo no se cruzan, y `POST /remote-sessions`
+    // (FOR SHARE) espera a que termine la rotacion de credencial.
+    const device = await manager.findOne(Device, {
+      where: { publicId },
+      lock: { mode: 'for_no_key_update' },
+    });
 
     // El publicId es un identificador, no una credencial: conocerlo no alcanza.
     if (!device || !device.isActive) {

@@ -1,4 +1,4 @@
-import { Logger } from '@nestjs/common';
+import { Logger, OnModuleDestroy, UnauthorizedException } from '@nestjs/common';
 import {
   ConnectedSocket,
   MessageBody,
@@ -12,6 +12,10 @@ import type { DefaultEventsMap, Namespace, Socket } from 'socket.io';
 import { AuthService } from '../../auth/auth.service';
 import { User } from '../../auth/entities/user.entity';
 import { ValidRoles } from '../../auth/interfaces/valid-roles';
+import {
+  IdentityRevocationService,
+  RevocableIdentityKind,
+} from '../../revocation/identity-revocation.service';
 import {
   JoinRemoteSessionAck,
   joinRejected,
@@ -69,6 +73,12 @@ const UNAUTHORIZED_REASON = 'Unauthorized';
 export interface TechnicianSocketContext {
   userId: string;
   roles: ValidRoles[];
+  /**
+   * Sello de `IdentityRevocationService` tomado ANTES de leer el usuario de
+   * PostgreSQL. Si el tecnico se revoca despues, este socket deja de ser
+   * admisible aunque su lectura dijera `isActive = true`.
+   */
+  admittedAt: number;
 }
 
 interface TechnicianSocketData extends SignalingSocketData {
@@ -110,21 +120,32 @@ type TechnicianNamespace = Namespace<
  * la configuracion no va en este decorador sino en el adaptador que instala
  * `main.ts` (`SocketIoAdapter`), configurable por variables de entorno.
  *
- * LIMITACION CONOCIDA: el rol y el `isActive` se comprueban al abrir el socket.
- * Si al tecnico se le retira el acceso despues, su socket sigue abierto hasta
- * que se desconecte (sus peticiones HTTP si dejan de funcionar de inmediato, y
- * cerrar la `RemoteSession` corta el signaling al instante). Cerrar por las
- * bravas las conexiones de un tecnico exigiria un registro de presencia de
- * tecnicos, que este paso deja fuera a proposito.
+ * REVOCACION. El rol y el `isActive` se comprueban al abrir el socket y, de
+ * nuevo contra PostgreSQL, en cada `remote-session:join` y cada `webrtc:*`.
+ * Si esa revalidacion encuentra al usuario inactivo (o sin rol de tecnico), se
+ * revoca su identidad en `IdentityRevocationService`: este gateway cierra en
+ * el acto TODOS sus sockets (los de su room personal) y el cierre automatico
+ * termina su sesion viva con `endedBy: SYSTEM`. Un handshake o un join en vuelo
+ * que habian leido el estado anterior quedan rechazados por la barrera.
+ *
+ * LIMITACION: hoy no existe ninguna operacion del backend que desactive a un
+ * usuario (ni endpoint ni script), asi que nadie levanta la barrera en el
+ * momento de la desactivacion. Un tecnico desactivado por fuera (SQL) pierde
+ * REST de inmediato y realtime en su siguiente join o mensaje de signaling;
+ * mientras no envie nada, su socket sigue abierto y recibiendo los avisos de
+ * `technicians:all`. Ver `docs/REALTIME.md`, "Technician deactivation".
  */
 @WebSocketGateway({ namespace: TECHNICIANS_NAMESPACE })
 export class TechniciansGateway
   implements
     OnGatewayInit<TechnicianNamespace>,
     OnGatewayConnection<TechnicianSocket>,
-    OnGatewayDisconnect<TechnicianSocket>
+    OnGatewayDisconnect<TechnicianSocket>,
+    OnModuleDestroy
 {
   private readonly logger = new Logger(TechniciansGateway.name);
+
+  private unsubscribeRevocations: (() => void) | null = null;
 
   constructor(
     private readonly authService: AuthService,
@@ -132,6 +153,8 @@ export class TechniciansGateway
     private readonly signalingRealtimeService: SignalingRealtimeService,
 
     private readonly technicianRealtimeService: TechnicianRealtimeService,
+
+    private readonly identityRevocationService: IdentityRevocationService,
   ) {}
 
   /**
@@ -149,12 +172,41 @@ export class TechniciansGateway
     // tecnico concreto (`remote-session:closed`) sin conocer Socket.IO.
     this.technicianRealtimeService.bind(namespace);
 
+    // Revocar a un tecnico cierra TODOS sus sockets en el mismo tick en que se
+    // levanta la barrera. Todos estan en su room personal; uno que todavia no
+    // entro en ella lo rechaza `handleConnection` al comprobar la barrera.
+    this.unsubscribeRevocations = this.identityRevocationService.subscribe(
+      (kind, id) => {
+        if (kind !== RevocableIdentityKind.TECHNICIAN) return;
+
+        namespace.in(technicianRoom(id)).disconnectSockets(true);
+        this.logger.log(
+          `Technician ${id} is no longer authorized: realtime connections closed`,
+        );
+      },
+    );
+
     namespace.use((socket, next) => {
+      // El sello va ANTES de cualquier lectura de PostgreSQL.
+      const stamp = this.identityRevocationService.stamp();
+
       void this.authenticate(socket).then(
-        () => next(),
+        (context) => {
+          // Revocado mientras se autenticaba: lo leido ya no vale.
+          if (!this.isAdmissible(context.userId, stamp))
+            return next(new Error(UNAUTHORIZED_REASON));
+
+          socket.data.technician = { ...context, admittedAt: stamp };
+          next();
+        },
         () => next(new Error(UNAUTHORIZED_REASON)),
       );
     });
+  }
+
+  onModuleDestroy(): void {
+    this.unsubscribeRevocations?.();
+    this.unsubscribeRevocations = null;
   }
 
   async handleConnection(client: TechnicianSocket): Promise<void> {
@@ -177,6 +229,16 @@ export class TechniciansGateway
     // rechazo cualquier rol fuera de `TECHNICIAN_SOCKET_ROLES`: ni un usuario
     // con rol `user`, ni un dispositivo, ni un socket sin token entran en ella.
     await client.join(ALL_TECHNICIANS_ROOM);
+
+    // Si se revoco al tecnico mientras este socket entraba en sus rooms, el
+    // barrido de la revocacion pudo no encontrarlo todavia en su room personal:
+    // se cierra aqui. Sin `await` entre la comprobacion y el final.
+    if (client.disconnected) return;
+
+    if (!this.isAdmissible(context.userId, context.admittedAt)) {
+      client.disconnect(true);
+      return;
+    }
 
     this.logger.log(`Technician connected: ${context.userId}`);
   }
@@ -265,17 +327,68 @@ export class TechniciansGateway
     return {
       participant: SignalingParticipant.TECHNICIAN,
       id: context.userId,
+      revalidate: () => this.revalidate(context.userId),
+      isCurrent: () =>
+        !client.disconnected &&
+        this.isAdmissible(context.userId, context.admittedAt),
     };
   }
 
+  private isAdmissible(userId: string, stamp: number): boolean {
+    return this.identityRevocationService.isAdmissible(
+      RevocableIdentityKind.TECHNICIAN,
+      userId,
+      stamp,
+    );
+  }
+
   /**
-   * Valida el JWT de usuario del handshake y deja la identidad en el socket.
+   * Estado ACTUAL del tecnico en PostgreSQL, con las mismas reglas que el
+   * handshake: usuario existente, `isActive` y rol de tecnico.
+   *
+   * Si ya no cumple, se revoca su identidad: no basta con rechazar este
+   * mensaje, porque sus otros sockets y su sesion viva dependen de la misma
+   * autorizacion. Un fallo de la base de datos no es un rechazo y sale tal cual.
+   */
+  private async revalidate(userId: string): Promise<boolean> {
+    let user: User;
+
+    try {
+      user = await this.authService.validateJwtPayload({ id: userId });
+    } catch (error) {
+      if (!(error instanceof UnauthorizedException)) throw error;
+
+      this.revokeTechnician(userId);
+      return false;
+    }
+
+    if (this.isTechnician(user)) return true;
+
+    this.revokeTechnician(userId);
+    return false;
+  }
+
+  private revokeTechnician(userId: string): void {
+    this.logger.warn(
+      `Technician ${userId} failed realtime revalidation (inactive or without technician role): revoking access`,
+    );
+
+    this.identityRevocationService.revoke(
+      RevocableIdentityKind.TECHNICIAN,
+      userId,
+    );
+  }
+
+  /**
+   * Valida el JWT de usuario del handshake y devuelve la identidad del socket.
    *
    * Reutiliza `AuthService.authenticateToken`, el mismo camino que la estrategia
    * HTTP: firma y vencimiento del token, usuario existente y `isActive`. Aqui
    * solo se anade lo especifico del namespace, que es el rol.
    */
-  private async authenticate(socket: TechnicianSocket): Promise<void> {
+  private async authenticate(
+    socket: TechnicianSocket,
+  ): Promise<Omit<TechnicianSocketContext, 'admittedAt'>> {
     const token = this.extractToken(socket);
 
     if (!token) throw new Error(UNAUTHORIZED_REASON);
@@ -284,7 +397,7 @@ export class TechniciansGateway
 
     if (!this.isTechnician(user)) throw new Error(UNAUTHORIZED_REASON);
 
-    socket.data.technician = { userId: user.id, roles: user.roles };
+    return { userId: user.id, roles: user.roles };
   }
 
   /** Los roles se leen del usuario recien consultado, no del token. */

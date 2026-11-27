@@ -29,7 +29,14 @@ import {
   WEBRTC_OFFER_EVENT,
 } from '../../signaling/signaling.events';
 import { SignalingService } from '../../signaling/signaling.service';
-import { DeviceAuthService } from '../auth/device-auth.service';
+import {
+  IdentityRevocationService,
+  RevocableIdentityKind,
+} from '../../revocation/identity-revocation.service';
+import {
+  DeviceAuthorizationStatus,
+  DeviceAuthService,
+} from '../auth/device-auth.service';
 import { DevicePresenceService } from '../presence/device-presence.service';
 import {
   DeviceRealtimeService,
@@ -38,6 +45,7 @@ import {
 import {
   classifyHandshakeFailure,
   describeHandshakeFailure,
+  DeviceHandshakeError,
   DeviceHandshakeErrorCode,
 } from './device-handshake-error';
 
@@ -57,6 +65,13 @@ export interface DeviceSocketContext {
   deviceId: string;
   credentialId: string;
   publicId: string;
+  /**
+   * Sello de `IdentityRevocationService` tomado ANTES de leer el dispositivo y
+   * la credencial de PostgreSQL. Si el dispositivo se revoca despues
+   * (desactivacion o re-enrolamiento), este socket deja de ser admisible aunque
+   * su lectura dijera que estaba activo.
+   */
+  admittedAt: number;
 }
 
 interface DeviceSocketData extends SignalingSocketData {
@@ -104,6 +119,7 @@ export class DevicesGateway
     private readonly deviceRealtimeService: DeviceRealtimeService,
     private readonly signalingService: SignalingService,
     private readonly signalingRealtimeService: SignalingRealtimeService,
+    private readonly identityRevocationService: IdentityRevocationService,
   ) {}
 
   /**
@@ -116,6 +132,14 @@ export class DevicesGateway
    * el token fue comprobado y rechazado (`DEVICE_AUTH_UNAUTHORIZED`), o no se
    * pudo comprobar (`DEVICE_AUTH_UNAVAILABLE`). Los dos rechazan el handshake;
    * la identidad solo se asigna al socket cuando la autenticacion termino bien.
+   *
+   * REVOCACION (auditoria Prompt 44, C1). La autenticacion lee el dispositivo y
+   * su credencial con varios `await`; una desactivacion puede confirmar en
+   * medio. Por eso el middleware toma un sello de la barrera ANTES de leer nada
+   * y, al terminar, rechaza el handshake si el dispositivo se revoco despues de
+   * ese sello. `handleConnection` vuelve a comprobarlo justo antes de registrar
+   * la presencia, sin `await` entre ambas cosas. Ver
+   * `IdentityRevocationService`.
    */
   afterInit(namespace: DeviceNamespace): void {
     // A partir de aqui otros modulos pueden emitir eventos a un dispositivo sin
@@ -127,9 +151,16 @@ export class DevicesGateway
     this.signalingRealtimeService.bindDeviceNamespace(namespace);
 
     namespace.use((socket, next) => {
+      // El sello va ANTES de cualquier lectura de PostgreSQL.
+      const stamp = this.identityRevocationService.stamp();
+
       void this.authenticate(socket).then(
         (context) => {
-          socket.data.device = context;
+          // La lectura es anterior a una revocacion ya confirmada: no vale.
+          if (!this.isAdmissible(context.deviceId, stamp))
+            return next(DeviceHandshakeError.unauthorized());
+
+          socket.data.device = { ...context, admittedAt: stamp };
           next();
         },
         (error: unknown) => {
@@ -169,6 +200,15 @@ export class DevicesGateway
     // no anunciar a los tecnicos un ONLINE seguido de un OFFLINE que nunca fue
     // presencia real.
     if (client.disconnected) return;
+
+    // Revocado mientras entraba en su room: el barrido de la revocacion no lo
+    // encontro registrado y no lo cerro. Se cierra aqui, y la comprobacion y el
+    // registro de abajo ocurren sin ningun `await` entre medias, asi que una
+    // revocacion no puede colarse entre ambos.
+    if (!this.isAdmissible(context.deviceId, context.admittedAt)) {
+      client.disconnect(true);
+      return;
+    }
 
     // Registrar es lo que avisa `device:presence-updated` si era el primer
     // socket: la presencia ya esta actualizada cuando sale el aviso.
@@ -272,7 +312,58 @@ export class DevicesGateway
 
     if (!context) return null;
 
-    return { participant: SignalingParticipant.DEVICE, id: context.deviceId };
+    return {
+      participant: SignalingParticipant.DEVICE,
+      id: context.deviceId,
+      revalidate: () => this.revalidate(client, context),
+      isCurrent: () =>
+        !client.disconnected &&
+        this.isAdmissible(context.deviceId, context.admittedAt),
+    };
+  }
+
+  private isAdmissible(deviceId: string, stamp: number): boolean {
+    return this.identityRevocationService.isAdmissible(
+      RevocableIdentityKind.DEVICE,
+      deviceId,
+      stamp,
+    );
+  }
+
+  /**
+   * Estado ACTUAL del dispositivo y de la credencial del socket en PostgreSQL.
+   *
+   * - Dispositivo inactivo o inexistente: se revoca toda su identidad (cierra
+   *   todos sus sockets y el cierre automatico termina su sesion viva). Es lo que
+   *   ocurre si se desactivo sin pasar por `PATCH /devices/:id`.
+   * - Credencial que ya no es la vigente: solo pierde el acceso este socket. El
+   *   dispositivo puede tener otro, legitimo, con su credencial nueva.
+   *
+   * Un fallo de la base de datos no es un rechazo y sale tal cual.
+   */
+  private async revalidate(
+    client: DeviceSocket,
+    context: DeviceSocketContext,
+  ): Promise<boolean> {
+    const status = await this.deviceAuthService.checkAuthorization(
+      context.deviceId,
+      context.credentialId,
+    );
+
+    if (status === DeviceAuthorizationStatus.AUTHORIZED) return true;
+
+    this.logger.warn(
+      `Device ${context.publicId} failed realtime revalidation (${status}): access revoked`,
+    );
+
+    if (status === DeviceAuthorizationStatus.DEVICE_REVOKED)
+      this.identityRevocationService.revoke(
+        RevocableIdentityKind.DEVICE,
+        context.deviceId,
+      );
+    else client.disconnect(true);
+
+    return false;
   }
 
   /**
@@ -288,7 +379,7 @@ export class DevicesGateway
    */
   private async authenticate(
     socket: DeviceSocket,
-  ): Promise<DeviceSocketContext> {
+  ): Promise<Omit<DeviceSocketContext, 'admittedAt'>> {
     const token = this.extractToken(socket);
 
     if (!token) throw new UnauthorizedException();

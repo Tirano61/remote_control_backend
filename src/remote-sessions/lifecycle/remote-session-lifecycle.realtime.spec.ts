@@ -1,4 +1,5 @@
 import { INestApplication, Logger, ValidationPipe } from '@nestjs/common';
+import { IdentityRevocationService } from '../../revocation/identity-revocation.service';
 import { ConfigService } from '@nestjs/config';
 import { JwtModule, JwtService } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
@@ -220,6 +221,9 @@ describe('Cierre automatico de sesiones (Socket.IO + REST)', () => {
       entity: unknown,
       { where, relations }: { where: Where; relations?: object },
     ) => {
+      // La creacion bloquea el dispositivo (FOR SHARE) y comprueba isActive.
+      if (entity === Device) return Promise.resolve(device);
+
       const row = rowsOf(entity).find((candidate) => matches(candidate, where));
 
       if (!row) return Promise.resolve(null);
@@ -411,6 +415,7 @@ describe('Cierre automatico de sesiones (Socket.IO + REST)', () => {
       ],
       controllers: [RemoteSessionsController, DeviceRemoteSessionsController],
       providers: [
+        IdentityRevocationService,
         DevicesGateway,
         TechniciansGateway,
         SignalingService,
